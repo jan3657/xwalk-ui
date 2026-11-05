@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         default="off",
         choices=("off", "local", "api"),
         help="also index dense heads, matching `xwalk-ui --dense`: 'local' (the default "
-        "when given alone) the general and biomedical models (requires xwalk[dense]), "
+        "when given alone) the general and biomedical models (requires xwalk-match[dense]), "
         "'api' Qwen3-Embedding 8B through OpenRouter (needs OPENROUTER_API_KEY)",
     )
     parser.add_argument("--dense-device", help="dense encoder device, e.g. cpu or mps")

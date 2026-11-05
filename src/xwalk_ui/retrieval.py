@@ -1,7 +1,7 @@
 """Retrieval defaults for the explorer and its offline ontology builder.
 
 `xwalk-ui --dense` (or `--dense local`) adds two local sentence-transformers heads and
-needs xwalk[dense]. `--dense api` adds the default API encoder instead (Qwen3-Embedding
+needs xwalk-match[dense]. `--dense api` adds the default API encoder instead (Qwen3-Embedding
 8B through OpenRouter, chosen by the November 2026 embedding bake-off) with per-name
 vectors over each term's label and synonyms; it needs only an OPENROUTER_API_KEY.
 """

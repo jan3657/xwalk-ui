@@ -19,7 +19,7 @@ Vercel.
 | 1 | New top-level `ner-site/` with its own `vercel.json`, `requirements.txt`, `.python-version`; Vercel project Root Directory = `ner-site`. Nothing added to the `xwalk` package. **[amended]** The directory is not called `site/`: that is the name of a standard-library module and the plan puts the directory on `sys.path`. | Keeps the library light and the Vercel build from scanning the repo (the `web/` package.json would otherwise be picked up as a framework). |
 | 2 | Static page in `ner-site/public/` (plain HTML/CSS/JS, no build step) plus two file-based Python functions `ner-site/api/ner.py` and `ner-site/api/health.py`, each defining `handler(BaseHTTPRequestHandler)`. No web framework. | The `/api` form is supported and needs no extra dependency. |
 | 3 | Python 3.12 (`ner-site/.python-version`). | Vercel's default; tantivy 0.27.0 publishes a `cp311-abi3-manylinux_2_17_x86_64` wheel, so it installs without a compiler. |
-| 4 | xwalk installed from git in `ner-site/requirements.txt`: `xwalk @ git+https://github.com/jan3657/xwalk.git@<full sha>`, plus `numpy`. **[amended]** The repository is public (checked: github.com/jan3657/xwalk answers 200 without credentials), so this works on Vercel without a token. | Vercel installs only what the root directory declares; a pinned SHA is reproducible. |
+| 4 | xwalk installed from git in `ner-site/requirements.txt`: `xwalk-match @ git+https://github.com/jan3657/xwalk.git@<full sha>`, plus `numpy`. **[amended]** The repository is public (checked: github.com/jan3657/xwalk answers 200 without credentials), so this works on Vercel without a token. | Vercel installs only what the root directory declares; a pinned SHA is reproducible. |
 | 5 | NER = one chat completion through `xwalk.llm.openai_compat.OpenAICompatClient` against OpenRouter, wrapped in `BudgetedLLM`. | Reuses xwalk's retry/parse/usage code and its call cap. |
 | 6 | Mapping = retrieval only: BM25 + dense fused by reciprocal rank through `xwalk.retrieve.retrieve`, top-k shown with scores. No LLM in the mapping step in v1. | One LLM call per run keeps latency and cost low, and the user's prompt cannot influence which IDs are returned. An LLM-matcher mode is phase 2. |
 | 7 | BM25 indexes built at cold start into `/tmp` from the bundled JSONL. Dense indexes precomputed by `ner-site/tools/build_indexes.py` and committed under `ner-site/indexes/<slug>/dense/`. **[amended]** The orchestrating session holds the user's key and builds and commits them after WS-B; no subagent receives the key. | The function filesystem is read-only except `/tmp`; tantivy writes on build. A committed index is verifiable offline. |
@@ -43,7 +43,7 @@ Vercel.
 ```text
 ner-site/
   .python-version          3.12
-  requirements.txt         xwalk @ git+...@<sha>, numpy
+  requirements.txt         xwalk-match @ git+...@<sha>, numpy
   vercel.json              functions.maxDuration=120, includeFiles, security headers
   README.md                deploy and local-run instructions
   api/ner.py               POST /api/ner  -> ner_site.http.handle
