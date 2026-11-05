@@ -1,0 +1,35 @@
+name: UI checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: Engine branch or commit containing the UI extraction
+        default: main
+        required: true
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jan3657/xwalk
+          path: engine
+          ref: ${{ inputs.engine_ref || 'main' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e './engine[dev]' -e '.[dev]'
+      - run: python -m pytest -q -m 'not integration'
+      - run: ruff check src tests scripts ner-site
+      - run: ruff format --check src tests scripts ner-site
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm test && npm run build
+        working-directory: web
+      - run: git diff --exit-code -- src/xwalk_ui/static/app
