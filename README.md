@@ -28,10 +28,7 @@ See [workbench usage](docs/guide/ui.md), [hosting](docs/guide/hosting.md),
 and [NER deployment](ner-site/README.md). NER is a separate Vercel deployment
 with its own pinned engine dependency in `ner-site/requirements.txt`.
 
-The extracted workbench requires the engine revision accompanying this split,
-including `xwalk.llm.chatgpt_protocol`. Until that revision is released, install
-both sibling checkouts as above. Docker/release installs require that engine revision
-published or supplied as a wheel; do not deploy against an older engine wheel.
-
-CI checks out the engine main branch. Publish the accompanying engine split before
-enabling CI, or dispatch the workflow with `engine_ref` set to its published branch.
+The workbench and CI pin the matching engine extraction commit
+`ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912` from the backend repository.
+Installing from Git requires Git on the machine. NER deployment retains its separately
+tested engine pin in `ner-site/requirements.txt`.

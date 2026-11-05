@@ -6,7 +6,7 @@ on:
     inputs:
       engine_ref:
         description: Engine branch or commit containing the UI extraction
-        default: main
+        default: ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912
         required: true
 jobs:
   checks:
@@ -17,7 +17,7 @@ jobs:
         with:
           repository: jan3657/xwalk
           path: engine
-          ref: ${{ inputs.engine_ref || 'main' }}
+          ref: ${{ inputs.engine_ref || 'ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912' }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

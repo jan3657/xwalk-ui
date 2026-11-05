@@ -8,6 +8,8 @@
 # ChEBI is large and left out by default):
 #   docker build --build-arg ONTOLOGIES="hp mondo go-basic chebi" -t xwalk-explorer .
 FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG ONTOLOGIES="hp mondo doid go-basic uberon cl pato uo envo"
 ENV PYTHONDONTWRITEBYTECODE=1 \
