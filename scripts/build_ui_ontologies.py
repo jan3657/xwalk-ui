@@ -6,7 +6,7 @@ Writes `src/xwalk_ui/ontologies/<slug>.jsonl` (one term per line: `id`, `label`,
 UI ships these files, so `xwalk-ui` offers parsed ontologies without rdflib. Each is the
 small slice an example already carries, not the full ontology.
 
-Needs `xwalk[ontology]` (two samples are OWL). Run from the repository root:
+Needs `xwalk-match[ontology]` (two samples are OWL). Run from the repository root:
 
     python scripts/build_ui_ontologies.py
 """

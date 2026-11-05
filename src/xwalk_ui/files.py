@@ -10,7 +10,7 @@ name):
   columns, the same shape as the OBO and OWL loaders produce.
 
 Formats: CSV (delimiter sniffed), TSV, JSONL, plain text (one term per line), OBO and
-OWL/RDF (OWL needs `xwalk[ontology]`). Spreadsheets (.xlsx) are refused with a hint to
+OWL/RDF (OWL needs `xwalk-match[ontology]`). Spreadsheets (.xlsx) are refused with a hint to
 save them as CSV, since reading them would need another dependency.
 """
 

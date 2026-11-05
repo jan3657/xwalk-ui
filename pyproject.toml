@@ -9,12 +9,12 @@ description = "Browser workbench and demonstration sites for xwalk"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["xwalk @ git+https://github.com/jan3657/xwalk.git@ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912"]
+dependencies = ["xwalk-match @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cryptography>=42", "hatchling"]
-chatgpt = ["xwalk[chatgpt] @ git+https://github.com/jan3657/xwalk.git@ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912"]
-dense = ["xwalk[dense] @ git+https://github.com/jan3657/xwalk.git@ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912"]
+chatgpt = ["xwalk-match[chatgpt] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
+dense = ["xwalk-match[dense] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 
 [project.scripts]
 xwalk-ui = "xwalk_ui.cli:main"

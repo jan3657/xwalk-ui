@@ -1,6 +1,6 @@
 # Vercel installs only what this file declares (docs/ner-site/PLAN.md decision 4).
-# Pinned to a pushed commit of the library (it ships the four sample ontologies);
+# Pinned to a pushed commit of the xwalk-match library; ontology samples ship here.
 # the site code itself is deployed from this directory, not installed from git.
-xwalk @ git+https://github.com/jan3657/xwalk.git@cf11ecc189deff01fde838305be0cdf1452ed578
+xwalk-match @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856
 # DenseRetriever's exact search over the committed vectors; without it, pure Python.
 numpy
