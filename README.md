@@ -9,7 +9,9 @@ Install alongside the matching engine checkout during development:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '../xwalk[dev]' -e '.[dev]'
+pip install -e '.[dev]'
+# Optional: use your local engine checkout for development.
+pip install --no-deps -e ../xwalk
 xwalk-ui --root /path/to/workspace --offline-only
 ```
 
