@@ -845,7 +845,7 @@ def test_both_keys_and_the_salt_are_scrubbed_and_stay_out_of_repr() -> None:
 
 
 def test_the_database_url_is_read_for_the_limiter_on_any_backend() -> None:
-    s = Settings.from_env({"DATABASE_URL": DB_URL})
+    s = Settings.from_env({"DATABASE_URL": DB_URL, "ANTHROPIC_API_KEY": ANTHROPIC_KEY})
     assert s.backend == "bundled" and s.database_url == DB_URL
     assert DB_URL in s.secrets() and "npg_SENTINELpw0123" in s.secrets()
     assert "SENTINELpw" not in repr(s)
@@ -853,8 +853,29 @@ def test_the_database_url_is_read_for_the_limiter_on_any_backend() -> None:
     assert s.index_settings().database_url is None and s.index_settings().backend == "bundled"
     neon = Settings.from_env({"DATABASE_URL": DB_URL, "NER_SITE_BACKEND": "neon"})
     assert neon.index_settings().database_url == DB_URL
-    with pytest.raises(SettingsError, match="DATABASE_URL"):
-        Settings.from_env({"DATABASE_URL": "mysql://u:p@h/db"})
+    for needed in ({"ANTHROPIC_API_KEY": ANTHROPIC_KEY}, {"NER_SITE_BACKEND": "neon"}):
+        with pytest.raises(SettingsError, match="DATABASE_URL"):
+            Settings.from_env({"DATABASE_URL": "mysql://u:p@h/db", **needed})
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        # Offline never asks for Claude, so nothing would count visitors there.
+        {"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["bare", "openrouter_only", "offline_with_the_anthropic_key"],
+)
+def test_the_database_url_is_ignored_where_nothing_uses_it(env: dict[str, str]) -> None:
+    """A bundled deployment that offers no Claude has no use for a database, and a
+    platform integration may have put anything in ``DATABASE_URL``: as before Claude,
+    it is neither read nor validated."""
+    for value in ("mysql://u:p@h/db", "not a url", DB_URL):
+        s = Settings.from_env({**env, "DATABASE_URL": value})
+        assert s.backend == "bundled" and s.database_url is None
+        assert value not in s.secrets() and s.index_settings().database_url is None
 
 
 def test_every_new_variable_is_part_of_the_settings_cache_key() -> None:
@@ -1542,3 +1563,40 @@ def test_the_claude_key_check_is_remembered_per_key(tmp_path: Path) -> None:
     status = service.check_claude_key(s, client=SDK(refused))
     assert status == service.RetrieverStatus(status="unavailable", reason="key refused")
     assert service.check_claude_key(s, client=SDK()) == status and len(calls) == 2
+
+
+def test_a_claude_key_check_that_could_not_be_completed_is_not_an_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Like :func:`check_key` for OpenRouter: Anthropic being unreachable, or answering
+    5xx, says nothing about the key. It is ``ok`` with a reason, and asked again sooner
+    than a key that was accepted."""
+    import anthropic
+
+    request = httpx.Request("GET", "https://api.anthropic.com/v1/models/claude-opus-5-5")
+    down = anthropic.APIConnectionError(message=f"no route with {ANTHROPIC_KEY}", request=request)
+    broken = anthropic.InternalServerError(
+        f"boom {ANTHROPIC_KEY}", response=httpx.Response(503, request=request), body=None
+    )
+
+    class SDK:
+        def __init__(self, error: Exception | None) -> None:
+            self.models = self
+            self.error = error
+
+        def retrieve(self, model: str, **kw: Any) -> None:
+            if self.error is not None:
+                raise self.error
+
+    clock = [1000.0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock[0])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    for error, words in ((down, "unreachable"), (broken, "HTTP 503")):
+        service.reset_key_check()
+        status = service.check_claude_key(s, client=SDK(error))
+        assert status is not None and status.status == "ok"
+        assert status.reason is not None and "key not checked" in status.reason
+        assert words in status.reason and ANTHROPIC_KEY not in status.reason
+    # Remembered only as long as a refusal, so the next look asks Anthropic again.
+    clock[0] += service.KEY_REFUSED_TTL_S + 1
+    assert service.check_claude_key(s, client=SDK(None)) == service.RetrieverStatus(status="ok")

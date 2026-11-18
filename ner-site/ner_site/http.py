@@ -378,7 +378,9 @@ def _catalog(settings: Settings, indexes: Mapping[str, Any]) -> list[dict[str, A
 def _claude_health(settings: Settings) -> RetrieverStatus:
     """Whether a request can run on Claude now: the key is set, no request of this warm
     instance has met an exhausted balance or a refused key in the last minutes, and
-    Anthropic accepts the key (one free call, remembered)."""
+    Anthropic accepts the key (one free call, remembered). Only those three are
+    ``unavailable``; a key check that could not be completed is ``ok`` with a reason
+    saying the key was not checked."""
     if settings.anthropic_api_key is None:
         return RetrieverStatus(status="unavailable", reason="key not set")
     blocked = fallback.claude_block()

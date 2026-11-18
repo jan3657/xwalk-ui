@@ -208,7 +208,11 @@ class FallbackNote(BaseModel):
 class NerResponse(BaseModel):
     """``model`` is the model that produced the extraction; ``requested_model`` and
     ``requested_selector`` are what was asked for, defaults resolved (empty only in
-    responses written before those fields existed)."""
+    responses written before those fields existed).
+
+    ``selector`` is the selector the request asked for, the same value as
+    ``requested_selector``, kept for pages written before that field; the model that
+    made each pick is ``entities[].pick.selector``."""
 
     ok: Literal[True] = True
     model: str

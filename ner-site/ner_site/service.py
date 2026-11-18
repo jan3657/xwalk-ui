@@ -304,9 +304,15 @@ class Settings:
             raise SettingsError("NER_SITE_NEON_CATALOG must be samples or full")
         if catalog == "full" and backend != "neon":
             raise SettingsError("NER_SITE_NEON_CATALOG=full needs NER_SITE_BACKEND=neon")
-        # Read on every backend since the visitor allowance lives there too
-        # (ner_site.limits). Bundled indexes still never see it: index_settings().
-        database_url = get("DATABASE_URL") or None
+        # Read for the Neon backend, and on any backend where Claude is offered, since
+        # the visitor allowance lives there too (ner_site.limits; bundled indexes still
+        # never see it: index_settings()). Anywhere else it is ignored unread, as it
+        # was before Claude: a bundled deployment has no use for whatever a platform
+        # integration may have put in DATABASE_URL, and must not fail on it.
+        claude_offered = bool(get("ANTHROPIC_API_KEY")) and offline_raw not in _TRUE
+        database_url = (
+            (get("DATABASE_URL") or None) if backend == "neon" or claude_offered else None
+        )
         if database_url is not None and urlsplit(database_url).scheme not in {
             "postgres",
             "postgresql",
@@ -883,9 +889,12 @@ def check_key(
 
 def check_claude_key(settings: Settings, *, client: Any | None = None) -> RetrieverStatus | None:
     """Whether Anthropic accepts ``ANTHROPIC_API_KEY`` (None without a key): one free
-    Models API call (``claude.key_status``), remembered like :func:`check_key`. The
-    reason is a fixed phrase and never quotes the upstream. ``client`` is an SDK-shaped
-    object for tests."""
+    Models API call (``claude.key_status``), remembered like :func:`check_key`. Only a
+    refused key is ``unavailable``; a check that could not be completed (Anthropic
+    unreachable, or any other HTTP error) is ``ok`` with a "key not checked" reason,
+    never an outage, and is remembered only for ``KEY_REFUSED_TTL_S``. The reason is a
+    fixed phrase and never quotes the upstream. ``client`` is an SDK-shaped object for
+    tests."""
     if not settings.anthropic_api_key:
         return None
     slot = "claude:" + hashlib.sha256(settings.anthropic_api_key.encode()).hexdigest()
@@ -898,7 +907,8 @@ def check_claude_key(settings: Settings, *, client: Any | None = None) -> Retrie
         settings.anthropic_api_key, client=client, timeout=KEY_CHECK_TIMEOUT_S
     )
     status = RetrieverStatus(status="ok" if state == "ok" else "unavailable", reason=reason)
-    ttl = KEY_OK_TTL_S if status.status == "ok" else KEY_REFUSED_TTL_S
+    # Long only for a key that was accepted; refused or not checked is asked again soon.
+    ttl = KEY_OK_TTL_S if status.status == "ok" and reason is None else KEY_REFUSED_TTL_S
     with _KEY_LOCK:
         _KEY_CACHE[slot] = (now + ttl, status)
     return status

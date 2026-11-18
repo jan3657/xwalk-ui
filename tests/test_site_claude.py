@@ -674,20 +674,21 @@ def test_key_status_connection_failure() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         raise httpx2.ConnectError(f"cannot connect with {KEY}", request=request)
 
+    # The check could not be completed, which says nothing about the key: not an outage.
     state, reason = key_status(KEY, client=sync_sdk(handler))
-    assert state == "unavailable"
-    assert reason is not None and "unreachable" in reason
+    assert state == "ok"
+    assert reason is not None and "key not checked" in reason and "unreachable" in reason
     assert KEY not in reason
 
 
-def test_key_status_other_http_error_names_the_status_without_the_key() -> None:
+@pytest.mark.parametrize("status", [500, 503, 529, 429, 404])
+def test_key_status_other_http_error_names_the_status_without_the_key(status: int) -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(500, json=error_body("api_error", f"boom {KEY}"))
+        return httpx2.Response(status, json=error_body("api_error", f"boom {KEY}"))
 
     state, reason = key_status(KEY, client=sync_sdk(handler))
-    assert state == "unavailable"
-    assert reason is not None and "500" in reason
-    assert KEY not in reason
+    assert state == "ok"
+    assert reason == f"key not checked (Anthropic answered HTTP {status})"
 
 
 def test_key_status_without_a_key_makes_no_call() -> None:

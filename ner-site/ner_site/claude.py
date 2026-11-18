@@ -462,7 +462,11 @@ class ClaudeClient:
 def key_status(
     api_key: str, *, client: Any | None = None, timeout: float = 5.0
 ) -> tuple[str, str | None]:
-    """``("ok", None)`` or ``("unavailable", reason)``, for ``/api/health``.
+    """Whether Anthropic accepts the key, for ``/api/health``: ``("ok", None)``,
+    ``("unavailable", reason)`` for a key that is missing or was refused (401, 403), or
+    ``("ok", "key not checked (...)")`` when the check could not be completed, because
+    Anthropic was unreachable or answered with any other error. A failed probe says
+    nothing about the key, so it is never reported as an outage.
 
     One synchronous Models API call (free: no tokens are generated). The reason is a
     fixed phrase or names a status or an exception class; it never quotes the upstream
@@ -479,9 +483,9 @@ def key_status(
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
         return "unavailable", "key refused"
     except anthropic.APIStatusError as exc:
-        return "unavailable", f"Anthropic answered HTTP {exc.status_code}"
+        return "ok", f"key not checked (Anthropic answered HTTP {exc.status_code})"
     except anthropic.APIError as exc:
-        return "unavailable", f"Anthropic unreachable ({type(exc).__name__})"
+        return "ok", f"key not checked (Anthropic unreachable: {type(exc).__name__})"
     finally:
         if owned:
             sdk.close()

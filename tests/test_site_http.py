@@ -1786,6 +1786,11 @@ def test_health_says_why_claude_is_unavailable(
     monkeypatch.setattr(http_mod, "check_claude_key", lambda settings: refused)
     assert _health_of(s)["claude"] == {"status": "unavailable", "reason": "key refused"}
 
+    # A check that could not be completed is not an outage, and says so.
+    unchecked = RetrieverStatus(status="ok", reason="key not checked (Anthropic unreachable: X)")
+    monkeypatch.setattr(http_mod, "check_claude_key", lambda settings: unchecked)
+    assert _health_of(s)["claude"] == {"status": "ok", "reason": unchecked.reason}
+
     # What a request met is known without asking again, and wins while it is remembered.
     def never(settings: Settings) -> Any:
         pytest.fail("the key was checked while Claude is known to be unusable")
