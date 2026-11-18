@@ -13,6 +13,12 @@ is built. Site-key Claude deployments apply the hourly and daily allowances and
 refuse a request if the counters cannot be consulted. Own-key runs have separate
 flood limits and can proceed during a counter outage. The visitor is a
 keyed hash of the client address; neither it nor the address is ever logged or returned.
+
+With ``NER_SITE_STATS_PASSCODE`` set (site analytics design, sections 3 and 4), every
+``POST /api/ner`` that got past the passcode and body parsing is recorded as one row of
+``usage.SiteRuns`` once its response is built, and ``GET /api/stats`` (its own passcode,
+no other check) reads the rows back. Unset, neither exists: nothing is built or sent,
+and ``/api/stats`` is the 404 of any unknown path.
 """
 
 from __future__ import annotations
@@ -36,14 +42,14 @@ from dataclasses import asdict, dataclass, replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import ValidationError
 from xwalk.llm.base import LLMCapabilities, LLMClient, LLMRequest, LLMResponse, ParseError
 from xwalk.llm.parsing import parse_json_object
 from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
-from ner_site import fake, fallback, limits, providers
+from ner_site import fake, fallback, limits, providers, usage
 from ner_site.claude import OPUS, SONNET, is_claude
 from ner_site.indexes import OntologyIndex, get_indexes
 from ner_site.ontologies import catalog, full_catalog
@@ -87,7 +93,11 @@ LLMFactory = Callable[[Settings, str], LLMClient]
 
 HEALTH_PATH = "/api/health"
 NER_PATH = "/api/ner"
+STATS_PATH = "/api/stats"
 ALLOWED = {HEALTH_PATH: ("GET", "HEAD"), NER_PATH: ("POST",)}
+STATS_METHODS = ("GET",)
+STATS_PASSCODE_HEADER = "x-stats-passcode"
+COUNTRY_HEADER = "x-vercel-ip-country"
 REQUESTED_WITH = "xwalk-ner"
 KNOWN_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
 MAX_LENGTH_DIGITS = 18
@@ -97,6 +107,12 @@ REQUEST_WORKERS = 16  # threads per request for retriever searches (BM25 and emb
 # limiter's own bound on waiting for a visitor's lock (limits.LOCK_TIMEOUT_MS), so a
 # queue of one visitor's requests ends as a contended lock (429), not as this timeout.
 LIMITS_TIMEOUT_S = 3.0
+# Recording a run happens while the visitor waits for an answer that is already built:
+# one round trip, and never longer than this. Reading the statistics is the operator's
+# own request and may wait for a database that has to wake up.
+USAGE_TIMEOUT_S = 2.0
+STATS_TIMEOUT_S = 10.0
+STATS_UNAVAILABLE = "stats_unavailable"
 CONTENDED_RETRY_AFTER_S = 5
 LIMITS_UNAVAILABLE = "limits_unavailable"
 CLAUDE_UNAVAILABLE = "claude_unavailable"
@@ -187,11 +203,18 @@ _LIMITS_LOCK = threading.Lock()
 _LIMITS: dict[tuple[str, str, limits.Allowance], limits.VisitorLimits] = {}
 
 
-def make_limits_executor(database_url: str) -> SQLExecutor:
+def make_limits_executor(database_url: str, timeout: float = LIMITS_TIMEOUT_S) -> SQLExecutor:
     """The executor the visitor limiter queries with. Not the indexes' one
     (``indexes.make_executor``): that one retries, and the limiter's statement counts a
     visit, so a retried request could count one visit twice. Tests replace it."""
-    return NeonHTTPExecutor(database_url, timeout=LIMITS_TIMEOUT_S, max_retries=0)
+    return NeonHTTPExecutor(database_url, timeout=timeout, max_retries=0)
+
+
+def make_usage_executor(database_url: str, timeout: float) -> SQLExecutor:
+    """The executor the record of runs is written and read with: the limiter's kind
+    (an insert is no more idempotent than a counted visit) with a timeout of its own.
+    Tests replace it."""
+    return make_limits_executor(database_url, timeout)
 
 
 def _now() -> float:
@@ -225,6 +248,124 @@ def _visitor(settings: Settings, headers: Mapping[str, str]) -> str:
     """The calling visitor's id (``limits.visitor_id``). Never log or return it."""
     salt = settings.visitor_salt or limits.default_salt(settings.database_url or "")
     return limits.visitor_id(headers, salt)
+
+
+# --- the record of runs: one store per warm instance, database and timeout ----------
+
+_USAGE_LOCK = threading.Lock()
+_USAGE: dict[tuple[str, str, float], usage.SiteRuns] = {}
+
+
+def _usage_store(settings: Settings, timeout: float) -> usage.SiteRuns | None:
+    """Where runs are kept, or None when they are not: the stats passcode is unset, or
+    there is no database to keep them in. Raises ``ValueError`` for a connection string
+    or a schema that cannot be used."""
+    if settings.stats_passcode is None or settings.database_url is None:
+        return None
+    key = (settings.database_url, settings.neon_schema, timeout)
+    with _USAGE_LOCK:
+        found = _USAGE.get(key)
+        if found is None:
+            executor = make_usage_executor(settings.database_url, timeout)
+            found = _USAGE[key] = usage.SiteRuns(executor, settings.neon_schema, clock=_now)
+        return found
+
+
+def _allowed(path: str, settings: Settings) -> tuple[str, ...] | None:
+    """The methods of a path, None for a path that does not exist. ``/api/stats``
+    exists only on a deployment with the stats passcode set."""
+    if path == STATS_PATH:
+        return STATS_METHODS if settings.stats_passcode is not None else None
+    return ALLOWED.get(path)
+
+
+def _record(
+    settings: Settings,
+    log: dict[str, Any],
+    recorded: Mapping[str, Any],
+    country: str | None,
+) -> None:
+    """Keep one row for a finished run. Called with the response already built, and
+    nothing here can change it: every failure ends as ``log["usage"]``, the name of
+    what went wrong. The insert runs in a thread of its own so that the wait is bounded
+    by ``USAGE_TIMEOUT_S`` whatever the executor does; an insert that is abandoned
+    finishes, or fails, in the background of a warm instance."""
+    try:
+        store = _usage_store(settings, USAGE_TIMEOUT_S)
+        if store is None:
+            return
+        now = _now()
+        salt = settings.visitor_salt or limits.default_salt(settings.database_url or "")
+        row = usage.run_of(
+            log,
+            at=now,
+            visitor_day=usage.visitor_day(_visitor(settings, recorded["address"]), salt, now),
+            country=country,
+            selector_tokens=recorded.get("selector_tokens", (None, None)),
+        )
+        failed: list[str] = []
+
+        def send() -> None:
+            try:
+                store.record(row)
+            except Exception as exc:  # noqa: BLE001 - named in the log, never raised
+                failed.append(getattr(exc, "kind", None) or type(exc).__name__)
+
+        thread = threading.Thread(target=send, name="ner-site-usage", daemon=True)
+        thread.start()
+        thread.join(USAGE_TIMEOUT_S)
+        if thread.is_alive():
+            log["usage"] = TimeoutError.__name__
+        elif failed:
+            log["usage"] = failed[0]
+    except Exception as exc:  # noqa: BLE001 - recording never costs the visitor an answer
+        log["usage"] = type(exc).__name__
+
+
+def _stats(
+    settings: Settings, headers: Mapping[str, str], query: str, log: dict[str, Any]
+) -> Response:
+    """``GET /api/stats?days=N``: the stats passcode, then the bounds on ``days``, then
+    one read. The visitor passcode, ``X-Requested-With`` and the limiter play no part."""
+    assert settings.stats_passcode is not None
+    given = headers.get(STATS_PASSCODE_HEADER, "")
+    if not given:
+        raise ServiceError(
+            "stats_passcode_required", "the statistics need their passcode", status=401
+        )
+    if not hmac.compare_digest(given.encode("utf-8"), settings.stats_passcode.encode("utf-8")):
+        raise ServiceError(
+            "stats_passcode_invalid", "the stats passcode is not correct", status=401
+        )
+    days = usage.DEFAULT_DAYS
+    asked = parse_qs(query, keep_blank_values=True).get("days")
+    if asked is not None:
+        # ASCII digits without a sign, a space or a leading zero, and only once.
+        if len(asked) != 1 or not re.fullmatch(r"[1-9][0-9]{0,2}", asked[0], re.ASCII):
+            days = 0
+        else:
+            days = int(asked[0])
+        if not 1 <= days <= usage.MAX_DAYS:
+            raise ServiceError(
+                "bad_days",
+                f"'days' must be a whole number from 1 to {usage.MAX_DAYS}",
+                status=400,
+            )
+    log["days"] = days
+    try:
+        store = _usage_store(settings, STATS_TIMEOUT_S)
+        if store is None:
+            raise usage.UsageUnavailable("site runs have no database")
+        data = store.stats(days)
+    except (usage.UsageUnavailable, ValueError) as exc:
+        # The store exposes only the class and SQLSTATE; a ValueError may quote the URL.
+        log["stats"] = str(exc) if isinstance(exc, usage.UsageUnavailable) else type(exc).__name__
+        raise ServiceError(
+            STATS_UNAVAILABLE,
+            "the statistics cannot be read right now; try again shortly",
+            status=503,
+        ) from None
+    return 200, _headers(), _json_body(data, settings)
 
 
 @dataclass(frozen=True)
@@ -657,6 +798,7 @@ async def _ner(
     admitted: _Admitted | None = None,
     credential: providers.Credential | None = None,
     claude_factory: ClaudeFactory | None = None,
+    recorded: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the clients for a validated, admitted request and run it on `indexes`.
 
@@ -743,6 +885,11 @@ async def _ner(
         dense=response.retrieval["dense"].status if "dense" in response.retrieval else None,
         timing_ms=response.timing_ms,
     )
+    if recorded is not None:  # for the run's row only; the log line is as it was
+        recorded["selector_tokens"] = (
+            response.usage.selector_prompt_tokens,
+            response.usage.selector_completion_tokens,
+        )
     return response.model_dump(mode="json")
 
 
@@ -762,16 +909,20 @@ def handle(
     Claude clients (``service.make_claude``); both exist for tests."""
     started = time.monotonic()
     method = method.upper()
-    path = urlsplit(path).path or "/"
+    target = urlsplit(path)
+    path = target.path or "/"
     lowered = {}
     for name in headers:
         if name.lower() != "authorization":
             value = headers[name]
             lowered[name.lower()] = value if isinstance(value, str) else ", ".join(value)
     extra_secrets: list[str] = []
+    # What the row of a run needs and the log line must not hold (`_dispatch` fills it
+    # once a request has become a run; empty, the request is not recorded).
+    recorded: dict[str, Any] = {}
     log: dict[str, Any] = {
         "method": method if method in KNOWN_METHODS else "(unknown)",
-        "path": path if path in ALLOWED else "(unknown)",
+        "path": path if _allowed(path, settings) else "(unknown)",
         "mode": settings.mode,
         "body_bytes": len(body),
     }
@@ -787,12 +938,14 @@ def handle(
             claude_factory,
             headers,
             extra_secrets,
+            target.query,
+            recorded,
         )
     except ServiceError as exc:
         log["code"] = exc.code
         if exc.own_error is not None:
             log["own_error"] = exc.own_error
-        allow = ALLOWED.get(path) if exc.code == "method_not_allowed" else None
+        allow = _allowed(path, settings) if exc.code == "method_not_allowed" else None
         extra = {**exc.headers, **({"Allow": ", ".join(allow)} if allow else {})}
         result = _error(exc, settings, extra, extra_secrets)
     except Exception as exc:  # noqa: BLE001 - a 500 with no detail; type and place to the log
@@ -809,6 +962,8 @@ def handle(
         )
     log["status"] = result[0]
     log.setdefault("timing_ms", {})["handle"] = round((time.monotonic() - started) * 1000)
+    if recorded:  # after the response is built; whatever happens, `result` is returned
+        _record(settings, log, recorded, lowered.get(COUNTRY_HEADER))
     _log(log, settings, extra_secrets)
     return result
 
@@ -824,8 +979,10 @@ def _dispatch(
     claude_factory: ClaudeFactory | None,
     raw_headers: Mapping[str, str | Sequence[str]],
     extra_secrets: list[str],
+    query: str = "",
+    recorded: dict[str, Any] | None = None,
 ) -> Response:
-    allowed = ALLOWED.get(path)
+    allowed = _allowed(path, settings)
     if allowed is None:
         raise ServiceError("not_found", "no such endpoint", status=404)
     if method not in allowed:
@@ -836,6 +993,8 @@ def _dispatch(
         )
     if path == HEALTH_PATH:
         return 200, _headers(), _json_body(_health(settings, headers), settings)
+    if path == STATS_PATH:
+        return _stats(settings, headers, query, log)
 
     if len(body) > settings.limits.max_body_bytes:
         raise ServiceError(
@@ -851,6 +1010,10 @@ def _dispatch(
     if passcode is not None:
         raise passcode
     request = _check_encodable(_parse(body))
+    if recorded is not None and settings.stats_passcode is not None:
+        # From here on the request is a run and gets a row. Its visitor has no address
+        # until the credential step has looked at the headers (below).
+        recorded["address"] = {}
     # Record only a recognised mode, even when its credential is missing or refused.
     if request.provider in (None, providers.SITE):
         log.update(provider=providers.SITE, credential="site")
@@ -878,7 +1041,9 @@ def _dispatch(
             for name in limits.ADDRESS_HEADERS
             if name in headers and key not in headers[name]
         }
-    elif not settings.configured:
+    if recorded:
+        recorded["address"] = headers
+    if credential is None and not settings.configured:
         raise ServiceError(
             "not_configured",
             "the service has no ANTHROPIC_API_KEY and no OPENROUTER_API_KEY; the operator "
@@ -907,6 +1072,7 @@ def _dispatch(
             admitted=admitted,
             credential=credential,
             claude_factory=claude_factory,
+            recorded=recorded,
         )
     )
     return 200, _headers(), _json_body(data, settings, extra_secrets)
@@ -943,6 +1109,8 @@ def reset() -> None:
         _SETTINGS.clear()
     with _LIMITS_LOCK:
         _LIMITS.clear()
+    with _USAGE_LOCK:
+        _USAGE.clear()
 
 
 def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Response:
@@ -972,7 +1140,9 @@ def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Respo
         _log(
             {
                 "method": method if method in KNOWN_METHODS else "(unknown)",
-                "path": route if (route := urlsplit(request.path).path) in ALLOWED else "(unknown)",
+                "path": route
+                if _allowed(route := urlsplit(request.path).path, settings)
+                else "(unknown)",
                 "status": early.status,
                 "code": early.code,
                 "body_bytes": length,
@@ -1025,6 +1195,7 @@ __all__ = [
     "env_settings",
     "handle",
     "make_limits_executor",
+    "make_usage_executor",
     "reset",
     "serve",
 ]

@@ -671,7 +671,7 @@ def _shim(name: str) -> ModuleType:
     return module
 
 
-@pytest.fixture(params=["ner.py", "health.py"])
+@pytest.fixture(params=["ner.py", "health.py", "stats.py"])
 def shim_server(
     request: pytest.FixtureRequest,
     cache_dir: Path,
@@ -3145,3 +3145,784 @@ def test_a_fault_in_the_site_adapter_is_still_a_500(
     )
     assert _error(result) == (500, "internal")
     assert seen == [] and _last_log(capsys)["exception"] == "JSONDecodeError"
+
+
+# --- site analytics: one row per run, and GET /api/stats (design 2026-11-18) ----------
+
+STATS_PASSCODE = "stats-SENTINEL-passcode-7781"
+STATS_HEADERS = {"x-stats-passcode": STATS_PASSCODE}
+# 18 November 2026, 14:20:00 UTC.
+STATS_NOW = 1795011600.0
+STATS_KEYS = [
+    "ok",
+    "days",
+    "generated_at",
+    "totals",
+    "by_day",
+    "by_model",
+    "by_code",
+    "by_fallback",
+    "by_country",
+]
+REAL_USAGE_EXECUTOR = http_mod.make_usage_executor
+
+
+@pytest.fixture
+def runs(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The ``site_runs`` table, in memory (tests/test_site_usage.py), behind the seam
+    its real Neon executor is made by, and the clock at ``STATS_NOW``."""
+    from tests.test_site_usage import FakeRuns
+
+    fake = FakeRuns()
+    opened: list[tuple[str, float]] = []
+
+    def executor(database_url: str, timeout: float) -> Any:
+        opened.append((database_url, timeout))
+        return fake
+
+    monkeypatch.setattr(http_mod, "make_usage_executor", executor)
+    monkeypatch.setattr(http_mod, "_now", lambda: STATS_NOW)
+    fake.opened = opened
+    return fake
+
+
+def _stats_site(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """The open deployment with the record of runs and the stats page turned on."""
+    return _open_site(cache_dir, tmp_path, **{"NER_SITE_STATS_PASSCODE": STATS_PASSCODE, **env})
+
+
+def _stats(settings: Settings, query: str = "", headers: dict[str, str] | None = None) -> Handled:
+    return http_mod.handle(
+        "GET",
+        "/api/stats" + query,
+        dict(STATS_HEADERS if headers is None else headers),
+        b"",
+        settings=settings,
+    )
+
+
+def _recorded(fake: Any) -> list[dict[str, Any]]:
+    """The rows, and that each took one statement of its own."""
+    assert fake.tags().count("site_run") == len(fake.rows)
+    return list(fake.rows)
+
+
+def test_a_run_writes_one_row_from_what_the_handler_already_logs(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ner_site import limits, usage
+
+    s = _stats_site(cache_dir, tmp_path)
+    result = _ask(
+        s,
+        {"text": HALO_TEXT, "selector": OPUS},
+        claude=_Claude(HALO),
+        headers={**VISITOR_HEADERS, "X-Vercel-IP-Country": "SI"},
+    )
+    assert result[0] == 200, result[2]
+    out = NerResponse.model_validate_json(result[2])
+    (row,) = _recorded(runs)
+    assert runs.round_trips == 1 and runs.opened == [(DB_URL, http_mod.USAGE_TIMEOUT_S)]
+    salt = limits.default_salt(DB_URL)
+    visitor = limits.visitor_id({"x-real-ip": RAW_IP}, salt)
+    assert row["visitor_day"] == usage.visitor_day(visitor, salt, STATS_NOW)
+    assert row["at"].timestamp() == STATS_NOW
+    assert {k: row[k] for k in ("status", "code", "credential", "provider", "tier", "country")} == {
+        "status": 200,
+        "code": None,
+        "credential": "site",
+        "provider": "site",
+        "tier": "opus",
+        "country": "SI",
+    }
+    assert (row["requested_model"], row["model"], row["requested_selector"]) == (OPUS, OPUS, OPUS)
+    assert row["fallback_reasons"] == "" and row["custom_prompt"] is False
+    assert row["text_chars"] == len(HALO_TEXT)
+    assert (row["entities"], row["picks"]) == (1, 1)
+    assert row["matches"] == len(out.entities[0].matches) > 0
+    wire = out.usage
+    assert row["llm_calls"] == wire.llm_calls == 1
+    assert row["selector_calls"] == wire.selector_calls == 1
+    assert (row["prompt_tokens"], row["completion_tokens"]) == (
+        wire.prompt_tokens,
+        wire.completion_tokens,
+    )
+    assert (row["selector_prompt_tokens"], row["selector_completion_tokens"]) == (
+        wire.selector_prompt_tokens,
+        wire.selector_completion_tokens,
+    )
+    assert row["selector_cost_usd"] == wire.selector_cost_usd
+    assert row["embedding_requests"] == wire.embedding_requests
+    assert {k: row[k + "_ms"] for k in ("extract", "map", "select", "total")} == {
+        k: out.timing_ms.get(k) for k in ("extract", "map", "select", "total")
+    }
+    record = _last_log(capsys)
+    # The log line is what it was: no trace of recording unless recording failed.
+    assert "usage" not in record and "selector_prompt_tokens" not in record
+    assert not any("visitor" in key for key in record)
+
+
+def test_every_status_class_after_parsing_writes_exactly_one_row(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    runs: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xwalk.retrieval.postgres import PostgresError
+
+    s = _stats_site(cache_dir, tmp_path)
+    seen: list[tuple[int, str | None]] = []
+
+    def check(result: Handled, **expected: Any) -> dict[str, Any]:
+        rows = _recorded(runs)
+        seen.append((result[0], None if result[0] == 200 else _error(result)[1]))
+        assert len(rows) == len(seen)
+        assert [(row["status"], row["code"]) for row in rows] == seen
+        for name, value in expected.items():
+            assert rows[-1][name] == value, name
+        return rows[-1]
+
+    # 200 after a step-down: asked for Opus, answered by Sonnet.
+    limited = _claude_error("rate_limited")
+    stepped = _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO, opus_extract=[limited]))
+    assert stepped[0] == 200
+    check(
+        stepped,
+        requested_model=OPUS,
+        model=SONNET,
+        tier="opus",
+        fallback_reasons="rate_limited",
+        country=None,
+    )
+    # 400 from validation, after the body was parsed.
+    refused = _ask(s, {"top_k": 99})
+    assert refused[0] == 400
+    check(refused, requested_model=None, model=None, tier=None, text_chars=len("nothing"))
+    # 429 from admission.
+    used = _stats_site(
+        cache_dir, tmp_path, NER_SITE_OPUS_PER_HOUR="0", NER_SITE_SONNET_PER_HOUR="0"
+    )
+    limit = _ask(used, claude=_no_claude)
+    assert _error(limit) == (429, "visitor_limit_reached")
+    check(limit, requested_model=OPUS, model=None, tier=None, llm_calls=None)
+    # 503 from admission: the counters cannot be asked.
+    visits.fail = PostgresError("down", code="08006")
+    down = _ask(s, claude=_no_claude)
+    assert _error(down) == (503, "limits_unavailable")
+    check(down, requested_model=OPUS, tier=None)
+    visits.fail = None
+    # A provider failure after admission.
+    fatal = LLMFatalError("the provider said no")
+    failed = _ask(s, claude=_Claude(opus_extract=[fatal], sonnet_extract=[fatal]))
+    assert failed[0] >= 500
+    check(failed, requested_model=OPUS, model=None, tier="opus", entities=None)
+    # A 500.
+    with monkeypatch.context() as patch:
+
+        async def broken(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("boom")
+
+        patch.setattr(http_mod, "run", broken)
+        crashed = _ask(s)
+    assert _error(crashed) == (500, "internal")
+    check(crashed, requested_model=OPUS, tier="opus", total_ms=None)
+    assert runs.round_trips == len(seen) == 6
+
+
+def test_requests_that_never_became_a_run_write_nothing(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    good = {**VISITOR_HEADERS, "x-passcode": PASSCODE}
+    body = json.dumps({"text": "nothing"}).encode()
+
+    def ner(headers: dict[str, str], raw: bytes = body, method: str = "POST") -> Handled:
+        return http_mod.handle(method, "/api/ner", headers, raw, settings=s, llm_factory=_never)
+
+    refusals = [
+        (ner({k: v for k, v in good.items() if k != "x-requested-with"}), 400, "bad_header"),
+        (ner({**good, "x-passcode": "nope"}), 401, "passcode_invalid"),
+        (ner(VISITOR_HEADERS), 401, "passcode_required"),
+        (ner(good, b"{not json"), 400, "bad_json"),
+        (ner(good, b"[]"), 400, "bad_json"),
+        (ner(good, b'{"prompt": "no text"}'), 400, "missing_text"),
+        (ner(good, b" " * (s.limits.max_body_bytes + 1)), 413, "body_too_large"),
+        (ner(good, method="GET"), 405, "method_not_allowed"),
+        (http_mod.handle("POST", "/api/nope", good, body, settings=s), 404, "not_found"),
+        (_stats(s, headers={}), 401, "stats_passcode_required"),
+    ]
+    for result, status, code in refusals:
+        assert _error(result) == (status, code)
+    assert http_mod.handle("GET", "/api/health", good, b"", settings=s)[0] == 200
+    assert _stats(s)[0] == 200
+    assert runs.rows == [] and "site_run" not in runs.tags()
+    assert visits.rows == {}
+
+
+def test_a_run_row_holds_no_text_prompt_address_visitor_passcode_or_key(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ner_site import limits
+
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    headers = {
+        **VISITOR_HEADERS,
+        "x-passcode": PASSCODE,
+        "user-agent": "AGENTSENTINEL/1.0",
+        "x-vercel-ip-country": "SI",
+        "x-vercel-ip-city": "CITYSENTINEL",
+    }
+    capsys.readouterr()
+    results = [
+        _ask(
+            s,
+            {"text": SECRET_TEXT, "prompt": SECRET_PROMPT, "selector": OPUS},
+            claude=_Claude(_answer(("haloperidol", "chemical", 23, 34))),
+            headers=headers,
+        ),
+        _ask(s, {"text": SECRET_TEXT, "prompt": SECRET_PROMPT, "top_k": 99}, headers=headers),
+        _ask(
+            s,
+            {"text": SECRET_TEXT, "prompt": SECRET_PROMPT},
+            claude=_Claude(opus_extract=[_claude_error("rate_limited")] * 3, sonnet_extract=[]),
+            headers={**headers, "x-vercel-ip-country": SECRET_TEXT},
+        ),
+    ]
+    assert results[0][0] == 200 and results[1][0] == 400
+    assert len(_recorded(runs)) == 3 and runs.rows[2]["country"] is None
+    results.append(_stats(s))
+    assert results[-1][0] == 200 and _json(results[-1])["totals"]["runs"] == 3
+    visitor = limits.visitor_id({"x-real-ip": RAW_IP}, limits.default_salt(DB_URL))
+    stored = json.dumps([runs.sent, [str(row) for row in runs.rows]], default=str)
+    err = capsys.readouterr().err
+    for secret in (
+        SECRET_TEXT,
+        "Quokka",
+        SECRET_PROMPT,
+        "PROMPTSENT",
+        RAW_IP,
+        "10.0.0.1",
+        visitor,
+        PASSCODE,
+        STATS_PASSCODE,
+        ANTHROPIC_KEY,
+        SENTINEL_KEY,
+        DB_URL,
+        "SENTINELpw",
+        "AGENTSENTINEL",
+        "CITYSENTINEL",
+    ):
+        assert secret not in stored, secret
+        assert secret not in err, secret
+        for _, response_headers, body in results:
+            assert secret.encode() not in body and secret not in json.dumps(response_headers)
+
+
+def test_an_own_key_run_is_recorded_without_the_key(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    runs: Any,
+    own_clients: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ner_site import limits, usage
+
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=ALL_OWN)
+    capsys.readouterr()
+    ran = _ask(
+        s,
+        {"provider": "openai", "text": HALO_TEXT, "selector": "gpt-6-luna"},
+        # The key pasted where an address belongs must not be hashed into the row either.
+        headers={**OWN_HEADERS, "x-real-ip": OWN_KEY, "x-forwarded-for": OWN_KEY},
+    )
+    assert ran[0] == 200, ran[2]
+    # Refused before a credential was read: recorded, with the address left out.
+    missing = _ask(s, {"provider": "openai"}, headers={**VISITOR_HEADERS, "x-real-ip": OWN_KEY})
+    assert missing[0] in (400, 401)
+    first, second = _recorded(runs)
+    assert (first["credential"], first["provider"], first["tier"], first["status"]) == (
+        "visitor",
+        "openai",
+        "own",
+        200,
+    )
+    assert (first["requested_model"], first["model"]) == ("gpt-6-luna", "gpt-6-luna")
+    assert (second["credential"], second["provider"], second["status"]) == (
+        "visitor",
+        "openai",
+        missing[0],
+    )
+    salt = limits.default_salt(DB_URL)
+    nobody = usage.visitor_day(limits.visitor_id({}, salt), salt, STATS_NOW)
+    assert first["visitor_day"] == second["visitor_day"] == nobody
+    stats = _stats(s)
+    assert stats[0] == 200
+    assert _json(stats)["by_model"] == [
+        {
+            "model": "gpt-6-luna",
+            "credential": "visitor",
+            "runs": 1,
+            "prompt_tokens": first["prompt_tokens"] + first["selector_prompt_tokens"],
+            "completion_tokens": first["completion_tokens"] + first["selector_completion_tokens"],
+            "estimated_usd": 0.0,
+        },
+        {
+            "model": None,
+            "credential": "visitor",
+            "runs": 1,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
+    ]
+    stored = json.dumps([runs.sent, [str(row) for row in runs.rows]], default=str)
+    err = capsys.readouterr().err
+    for form in (OWN_KEY, json.dumps(OWN_KEY)[1:-1], "visitor-sentinel"):
+        assert form not in stored and form not in str(runs.sent), form
+        assert form not in err, form
+        for result in (ran, missing, stats):
+            assert form.encode() not in result[2] and form not in json.dumps(result[1])
+
+
+def test_a_failing_recorder_leaves_the_answer_untouched_and_is_named_in_the_log(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from xwalk.retrieval.postgres import PostgresError
+
+    s = _stats_site(cache_dir, tmp_path)
+
+    def ask() -> tuple[int, dict[str, str], dict[str, Any]]:
+        status, headers, body = _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))
+        data = json.loads(body)
+        data.pop("timing_ms")
+        return status, headers, data
+
+    healthy = ask()
+    assert healthy[0] == 200 and "usage" not in _last_log(capsys)
+    runs.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({DB_URL})", code="08006")
+    assert ask() == healthy
+    err = capsys.readouterr().err
+    record = json.loads(err.strip().splitlines()[-1])
+    assert record["usage"] == "PostgresError" and record["status"] == 200
+    assert "ep-x-pooler" not in err and "SENTINELpw" not in err
+    # A refusal keeps its status, code and headers too.
+    used = _stats_site(
+        cache_dir, tmp_path, NER_SITE_OPUS_PER_HOUR="0", NER_SITE_SONNET_PER_HOUR="0"
+    )
+    refused = _ask(used, claude=_no_claude)
+    assert _error(refused) == (429, "visitor_limit_reached") and "Retry-After" in refused[1]
+    assert _last_log(capsys)["usage"] == "PostgresError"
+    assert len(runs.rows) == 1
+
+
+def test_a_recorder_that_cannot_be_built_or_breaks_is_swallowed(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _stats_site(cache_dir, tmp_path)
+
+    def unusable(database_url: str, timeout: float) -> Any:
+        raise ValueError(f"cannot use {database_url}")
+
+    monkeypatch.setattr(http_mod, "make_usage_executor", unusable)
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))[0] == 200
+    err = capsys.readouterr().err
+    assert json.loads(err.strip().splitlines()[-1])["usage"] == "ValueError"
+    assert "SENTINELpw" not in err
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(DB_URL)
+
+    monkeypatch.setattr(http_mod.usage, "run_of", broken)
+    monkeypatch.setattr(http_mod, "make_usage_executor", lambda url, timeout: object())
+    http_mod.reset()
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))[0] == 200
+    err = capsys.readouterr().err
+    assert json.loads(err.strip().splitlines()[-1])["usage"] == "RuntimeError"
+    assert "SENTINELpw" not in err
+
+
+def test_a_slow_recorder_delays_the_answer_by_no_more_than_its_timeout(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    runs: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import time
+
+    release = threading.Event()
+    entered = threading.Event()
+    real = runs.transaction
+
+    def stuck(statements: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(30)
+        return real(statements, **kwargs)
+
+    monkeypatch.setattr(runs, "transaction", stuck)
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.2)
+    s = _stats_site(cache_dir, tmp_path)
+    try:
+        started = time.monotonic()
+        result = _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))
+        waited = time.monotonic() - started
+        assert result[0] == 200 and entered.is_set()
+        assert NerResponse.model_validate_json(result[2]).model == OPUS
+        assert waited < 10
+        assert _last_log(capsys)["usage"] == "TimeoutError"
+    finally:
+        release.set()
+    assert http_mod.USAGE_TIMEOUT_S == 0.2 and REAL_USAGE_TIMEOUT_S == 2.0
+
+
+REAL_USAGE_TIMEOUT_S = http_mod.USAGE_TIMEOUT_S
+
+
+def test_without_the_stats_passcode_nothing_is_recorded_and_stats_do_not_exist(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``runs`` fixture: building a usage executor here fails the test (conftest)."""
+    s = _open_site(cache_dir, tmp_path)
+    assert s.stats_passcode is None
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))[0] == 200
+    assert "usage" not in _last_log(capsys)
+    unknown = http_mod.handle("GET", "/api/nope", dict(STATS_HEADERS), b"", settings=s)
+    unknown_log = _last_log(capsys)
+    for method in ("GET", "HEAD", "POST", "OPTIONS"):
+        for headers in ({}, STATS_HEADERS, {"x-stats-passcode": "wrong"}, POST_HEADERS):
+            result = http_mod.handle(method, "/api/stats?days=7", dict(headers), b"", settings=s)
+            assert result == unknown
+            assert _error(result) == (404, "not_found")
+            record = _last_log(capsys)
+            assert record["path"] == "(unknown)"
+            record["method"] = "GET"
+            record["timing_ms"] = unknown_log["timing_ms"]
+            assert record == unknown_log
+    assert "stats" not in json.dumps(_health_of(s))
+
+
+def test_the_usage_executor_is_closed_off_unless_a_test_gives_one(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _stats_site(cache_dir, tmp_path)
+    with pytest.raises(pytest.fail.Exception, match="site_runs"):
+        _ask(s)
+
+
+def test_with_the_passcode_but_no_database_runs_are_skipped_and_stats_are_503(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``runs`` fixture again: nothing may be built for a database that is not there."""
+    s = _settings(
+        cache_dir, tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY, NER_SITE_STATS_PASSCODE=STATS_PASSCODE
+    )
+    assert s.database_url is None
+    assert _post(s, {"text": "x"}, llm_factory=_fake('{"entities": []}'))[0] == 200
+    assert "usage" not in _last_log(capsys)
+    result = _stats(s)
+    assert _error(result) == (503, "stats_unavailable")
+    record = _last_log(capsys)
+    assert (record["path"], record["status"], record["code"]) == (
+        "/api/stats",
+        503,
+        "stats_unavailable",
+    )
+    assert _error(_stats(s, headers={})) == (401, "stats_passcode_required")
+
+
+def test_the_settings_cache_reads_the_database_url_once_the_stats_passcode_is_set() -> None:
+    env = {"NER_SITE_STATS_PASSCODE": STATS_PASSCODE, "DATABASE_URL": DB_URL}
+    found = http_mod.env_settings(env)
+    assert isinstance(found, Settings) and found.database_url == DB_URL
+    off = http_mod.env_settings({"DATABASE_URL": DB_URL})
+    assert isinstance(off, Settings) and off.database_url is None and off is not found
+
+
+def test_stats_need_their_own_passcode_and_nothing_else(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[bytes, bytes]] = []
+    real = http_mod.hmac.compare_digest
+
+    def spy(a: bytes, b: bytes) -> bool:
+        seen.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(http_mod.hmac, "compare_digest", spy)
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    secret = STATS_PASSCODE.encode()
+    for headers in (
+        {},
+        {"x-stats-passcode": ""},
+        # Neither the visitor passcode nor a bearer token opens it.
+        {**POST_HEADERS, "x-passcode": PASSCODE},
+        {"Authorization": "Bearer " + STATS_PASSCODE},
+        {"x-passcode": STATS_PASSCODE},
+    ):
+        result = _stats(s, headers=headers)
+        assert _error(result) == (401, "stats_passcode_required")
+        _assert_common_headers(result[1])
+    assert seen == []
+    for wrong in (PASSCODE, STATS_PASSCODE + "x", STATS_PASSCODE[:-1], "x"):
+        result = _stats(s, headers={"x-stats-passcode": wrong})
+        assert _error(result) == (401, "stats_passcode_invalid")
+        assert seen[-1] == (wrong.encode(), secret)
+    assert runs.round_trips == 0 and runs.opened == []
+    # The stats passcode alone: no visitor passcode, no X-Requested-With.
+    result = _stats(s, headers={"X-Stats-Passcode": STATS_PASSCODE})
+    assert result[0] == 200 and seen[-1] == (secret, secret)
+    _assert_common_headers(result[1])
+    assert result[1]["Cache-Control"] == "no-store"
+    assert list(_json(result)) == STATS_KEYS
+    # It is not a way around the visitor passcode, and the limiter never hears of it.
+    assert _error(_ask(s, headers={**VISITOR_HEADERS, **STATS_HEADERS})) == (
+        401,
+        "passcode_required",
+    )
+    assert visits.round_trips == 0 and visits.rows == {}
+
+
+@pytest.mark.parametrize("method", ["POST", "HEAD", "PUT", "DELETE", "OPTIONS"])
+def test_stats_allow_only_get(cache_dir: Path, tmp_path: Path, runs: Any, method: str) -> None:
+    s = _stats_site(cache_dir, tmp_path)
+    result = http_mod.handle(method, "/api/stats", dict(STATS_HEADERS), b"", settings=s)
+    assert _error(result) == (405, "method_not_allowed")
+    assert result[1]["Allow"] == "GET" and runs.round_trips == 0
+    _assert_common_headers(result[1])
+
+
+@pytest.mark.parametrize(
+    ("query", "days"),
+    [("", 30), ("?days=1", 1), ("?days=7", 7), ("?days=365", 365), ("?other=1", 30)],
+)
+def test_stats_days_default_to_thirty_and_run_from_one_to_a_year(
+    cache_dir: Path,
+    tmp_path: Path,
+    runs: Any,
+    capsys: pytest.CaptureFixture[str],
+    query: str,
+    days: int,
+) -> None:
+    result = _stats(_stats_site(cache_dir, tmp_path), query)
+    assert result[0] == 200, result[2]
+    data = _json(result)
+    assert data["ok"] is True and data["days"] == days and len(data["by_day"]) == days
+    assert data["by_day"][-1]["day"] == "2026-11-18"
+    assert data["generated_at"] == "2026-11-18T14:20:00Z"
+    assert runs.round_trips == 1 and runs.opened == [(DB_URL, http_mod.STATS_TIMEOUT_S)]
+    record = _last_log(capsys)
+    assert (record["path"], record["status"], record["days"]) == ("/api/stats", 200, days)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?days=0",
+        "?days=366",
+        "?days=-1",
+        "?days=abc",
+        "?days=",
+        "?days=1.5",
+        "?days=7&days=30",
+        "?days=%C2%B2",
+        "?days=0007",
+        "?days=1e2",
+        "?days=+7",
+        "?days=%207",
+    ],
+)
+def test_stats_days_out_of_bounds_are_refused_before_the_database(
+    cache_dir: Path, tmp_path: Path, runs: Any, query: str
+) -> None:
+    s = _stats_site(cache_dir, tmp_path)
+    assert _error(_stats(s, query)) == (400, "bad_days")
+    # The passcode comes first: a stranger learns nothing about the query rules.
+    assert _error(_stats(s, query, headers={})) == (401, "stats_passcode_required")
+    assert runs.round_trips == 0
+
+
+def test_stats_summarise_the_recorded_runs(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_OPUS_PER_HOUR="1", NER_SITE_SONNET_PER_HOUR="1")
+    si = {**VISITOR_HEADERS, "x-vercel-ip-country": "SI"}
+    statuses = [
+        _ask(s, {"text": HALO_TEXT, "selector": OPUS}, claude=_Claude(HALO), headers=si)[0],
+        _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO), headers=si)[0],
+        _ask(s, claude=_Claude(HALO), headers={**si, "x-real-ip": "198.51.100.9"})[0],
+        _ask(s, claude=_no_claude, headers=si)[0],
+    ]
+    assert statuses == [200, 200, 200, 429]
+    data = _json(_stats(s, "?days=2"))
+    assert list(data) == STATS_KEYS
+    assert [day["day"] for day in data["by_day"]] == ["2026-11-17", "2026-11-18"]
+    today = data["by_day"][1]
+    assert (today["runs"], today["ok"], today["visitors"]) == (4, 3, 2)
+    assert (today["opus"], today["sonnet"], today["stepped_down"]) == (2, 1, 1)
+    assert data["totals"]["runs"] == 4 and data["totals"]["errors"] == 1
+    assert data["totals"]["visitors"] == 2 and data["totals"]["unpriced_runs"] == 0
+    assert data["by_code"] == [{"code": "visitor_limit_reached", "runs": 1}]
+    assert data["by_fallback"] == [{"reason": "opus_allowance_used", "runs": 1}]
+    assert data["by_country"] == [{"country": "SI", "runs": 4}]
+    assert {(row["model"], row["credential"], row["runs"]) for row in data["by_model"]} == {
+        (OPUS, "site", 2),
+        (SONNET, "site", 1),
+        (None, "site", 1),
+    }
+    # One store for recording and one for reading, each kept for the warm instance.
+    assert runs.opened == [(DB_URL, http_mod.USAGE_TIMEOUT_S), (DB_URL, http_mod.STATS_TIMEOUT_S)]
+    assert _stats(s)[0] == 200 and len(runs.opened) == 2
+    http_mod.reset()
+    assert _stats(s)[0] == 200 and len(runs.opened) == 3
+
+
+def test_stats_with_the_database_down_are_a_503_without_its_address(
+    cache_dir: Path, tmp_path: Path, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from xwalk.retrieval.postgres import PostgresError
+
+    runs.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({DB_URL})", code="08006")
+    result = _stats(_stats_site(cache_dir, tmp_path))
+    assert _error(result) == (503, "stats_unavailable")
+    _assert_common_headers(result[1])
+    err = capsys.readouterr().err
+    record = json.loads(err.strip().splitlines()[-1])
+    assert record["stats"] == "site runs could not be queried (PostgresError 08006)"
+    for secret in ("ep-x-pooler", "SENTINELpw", STATS_PASSCODE):
+        assert secret not in err and secret.encode() not in result[2]
+
+
+def test_a_stats_answer_that_echoed_a_secret_would_still_be_scrubbed(
+    cache_dir: Path, tmp_path: Path, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing puts one there; the last line of defence covers this route like any other."""
+    s = _stats_site(cache_dir, tmp_path)
+    assert _stats(s)[0] == 200
+    store = next(iter(http_mod._USAGE.values()))
+    leaky = {"ok": True, "note": f"{STATS_PASSCODE} {ANTHROPIC_KEY} {DB_URL}"}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "stats", lambda days: leaky)
+        result = _stats(s)
+    assert _json(result) == {"ok": True, "note": "[redacted] [redacted] [redacted]"}
+    assert STATS_PASSCODE not in capsys.readouterr().err
+
+
+def test_the_usage_executor_is_the_limiters_kind_with_its_own_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording a run is not idempotent either, and it runs while the visitor waits."""
+    built: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(http_mod, "NeonHTTPExecutor", lambda url, **kw: built.append((url, kw)))
+    monkeypatch.setattr(http_mod, "make_limits_executor", REAL_LIMITS_EXECUTOR)
+    REAL_USAGE_EXECUTOR(DB_URL, http_mod.USAGE_TIMEOUT_S)
+    REAL_USAGE_EXECUTOR(DB_URL, http_mod.STATS_TIMEOUT_S)
+    assert built == [
+        (DB_URL, {"timeout": 2.0, "max_retries": 0}),
+        (DB_URL, {"timeout": http_mod.STATS_TIMEOUT_S, "max_retries": 0}),
+    ]
+    assert http_mod.USAGE_TIMEOUT_S == 2.0 < http_mod.STATS_TIMEOUT_S <= 15
+    assert "make_usage_executor" in http_mod.__all__
+
+
+def test_the_stats_shim_serves_api_stats(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``api/stats.py`` is the function Vercel runs for ``/api/stats``; like the other
+    two it hands every request to ``handle``."""
+    for name in ("OPENROUTER_API_KEY", "NER_SITE_PASSCODE", "NER_SITE_MODELS", "DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("NER_SITE_STATS_PASSCODE", raising=False)
+    monkeypatch.setenv("NER_SITE_OFFLINE", "1")
+    monkeypatch.setenv("NER_SITE_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("NER_SITE_DENSE_DIR", str(tmp_path / "no-dense"))
+    handler = _shim("stats.py").handler
+    assert handler.__name__ == "handler"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        status, headers, body = _request(port, "GET", "/api/stats?days=7", headers=STATS_HEADERS)
+        assert status == 404 and json.loads(body)["error"]["code"] == "not_found"
+        monkeypatch.setenv("NER_SITE_STATS_PASSCODE", STATS_PASSCODE)
+        status, headers, body = _request(port, "GET", "/api/stats?days=7")
+        assert status == 401 and json.loads(body)["error"]["code"] == "stats_passcode_required"
+        assert headers["cache-control"] == "no-store"
+        status, _, body = _request(port, "GET", "/api/stats", headers={"X-Stats-Passcode": "no"})
+        assert status == 401 and json.loads(body)["error"]["code"] == "stats_passcode_invalid"
+        # Offline with no database: the passcode is right and there is nothing to read.
+        status, _, body = _request(port, "GET", "/api/stats?days=7", headers=STATS_HEADERS)
+        assert status == 503 and json.loads(body)["error"]["code"] == "stats_unavailable"
+        assert STATS_PASSCODE.encode() not in body
+        status, _, body = _request(port, "GET", "/api/health")
+        assert status == 200 and b"stats" not in body
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _json_shape(value: Any) -> Any:
+    """Names and JSON types, without the values: a list is the set of its items' shapes."""
+    if isinstance(value, dict):
+        return {key: _json_shape(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return sorted({json.dumps(_json_shape(item), sort_keys=True) for item in value})
+    if isinstance(value, bool):
+        return "boolean"
+    return "number" if isinstance(value, (int, float)) else type(value).__name__
+
+
+def test_the_stats_fixtures_have_the_shape_and_the_errors_the_server_sends(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    """The stats page is developed against ``tools/fixtures/stats*.json``: they must be
+    answers this server could give, field for field, and the refusals word for word."""
+    directory = PROJECT / "tools/fixtures"
+
+    def fixture(name: str) -> dict[str, Any]:
+        data: dict[str, Any] = json.loads((directory / name).read_text(encoding="utf-8"))
+        return data
+
+    s = _stats_site(cache_dir, tmp_path)
+    assert _json(_stats(s, headers={})) == fixture("stats-error-required.json")
+    assert _json(_stats(s, headers={"x-stats-passcode": "x"})) == fixture(
+        "stats-error-invalid.json"
+    )
+    off = _open_site(cache_dir, tmp_path)
+    assert _json(_stats(off)) == fixture("stats-nostats.json")
+    without = _stats_site(cache_dir, tmp_path, DATABASE_URL="", NER_SITE_PASSCODE=PASSCODE)
+    assert _json(_stats(without)) == fixture("stats-unavailable.json")
+
+    empty = _json(_stats(s, "?days=2"))
+    si = {**VISITOR_HEADERS, "x-vercel-ip-country": "SI"}
+    limited = _claude_error("rate_limited")
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO, opus_extract=[limited]), headers=si)
+    assert _ask(s, {"top_k": 99})[0] == 400  # no model, and no country
+    populated = _json(_stats(s, "?days=2"))
+    assert all(populated[name] for name in STATS_KEYS[4:])
+    for name, real in (
+        ("stats.json", populated),
+        ("stats-7.json", populated),
+        ("stats-90.json", populated),
+        ("stats-empty.json", empty),
+    ):
+        canned = fixture(name)
+        assert list(canned) == STATS_KEYS, name
+        assert _json_shape(canned) == _json_shape(real), name
+        assert len(canned["by_day"]) == canned["days"], name
+        days = [day["day"] for day in canned["by_day"]]
+        assert days == sorted(set(days)), name
+        for day in canned["by_day"]:
+            assert sum(day[tier] for tier in ("opus", "sonnet", "other", "own")) <= day["runs"]
+            assert day["ok"] <= day["runs"]
+        totals = canned["totals"]
+        assert totals["runs"] == sum(day["runs"] for day in canned["by_day"]), name
+        assert totals["errors"] == totals["runs"] - totals["ok"], name
+        assert totals["visitors"] == sum(day["visitors"] for day in canned["by_day"]), name
