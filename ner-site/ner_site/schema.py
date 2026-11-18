@@ -334,6 +334,9 @@ class ServiceError(Exception):
         self.status = status
         # Response headers that belong to the failure (``Retry-After`` on a 429).
         self.headers: dict[str, str] = dict(headers or {})
+        # For a failure on a visitor's own key: the class name of what failed, for the
+        # request's log line only (``providers.provider_error``). Never sent.
+        self.own_error: str | None = None
 
     def envelope(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message}}

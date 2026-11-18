@@ -2608,3 +2608,173 @@ def test_authorization_on_a_site_request_is_refused_while_own_keys_are_on(
     headers = {**POST_HEADERS, "x-passcode": PASSCODE, "Authorization": BASIC}
     result = _post(s, {"text": "x"}, headers=headers, llm_factory=_never)
     assert _error(result) == (400, "bad_credential")
+
+
+# --- own-key failures in the log, and a close that fails (final review, C1 and C2) -----
+
+
+def _own_build(monkeypatch: pytest.MonkeyPatch, complete: Any, close: Any = None) -> None:
+    """Own-key clients whose ``complete`` and ``aclose`` do what the test says."""
+    from ner_site import providers
+
+    class Client(FakeLLM):
+        async def complete(self, request: Any) -> Any:
+            return await complete(self, request)
+
+        async def aclose(self) -> None:
+            if close is not None:
+                await close(self)
+
+    def build(credential: Any, model: str, *, purpose: str, **options: Any) -> Any:
+        return Client([HALO if purpose == "extract" else PICK], model=model)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+
+
+def test_a_failure_building_an_own_client_is_named_in_the_log(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ner_site import providers
+
+    def build(credential: Any, model: str, **options: Any) -> Any:
+        raise RuntimeError("the client refused to be built for " + credential.token())
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    assert _error(result) == (502, "provider_error")
+    assert _json(result)["error"]["message"] == "OpenAI could not complete the request (error)."
+    record = _last_log(capsys)
+    assert record["own_error"] == "RuntimeError" and record["code"] == "provider_error"
+    assert "exception" not in record and "where" not in record
+    for text in (json.dumps(record), result[2].decode()):
+        assert OWN_KEY not in text and json.dumps(OWN_KEY)[1:-1] not in text
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "code", "named"),
+    [
+        (LLMFatalError("OpenAI request failed (http_5xx)"), 502, "provider_error", "LLMFatalError"),
+        (
+            LLMRetryableError("HTTP 429: slow down"),
+            429,
+            "provider_rate_limited",
+            "LLMRetryableError",
+        ),
+        (TimeoutError("took too long"), 502, "provider_error", "TimeoutError"),
+    ],
+)
+def test_a_provider_failure_on_an_own_key_is_named_in_the_log(
+    failure: Exception,
+    status: int,
+    code: str,
+    named: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import asyncio
+
+    async def fail(client: Any, request: Any) -> Any:
+        if isinstance(failure, TimeoutError):
+            raise asyncio.TimeoutError()
+        raise failure
+
+    _own_build(monkeypatch, fail)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    assert _error(result) == (status, code)
+    record = _last_log(capsys)
+    assert record["own_error"] == named and "exception" not in record
+
+
+@pytest.mark.parametrize("where", ["client", "stage"])
+def test_a_bug_on_the_own_path_is_a_500_with_its_type_and_frames_in_the_log(
+    where: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A ``KeyError`` is not the provider failing. It used to leave as 502
+    ``provider_error`` with nothing in the log to find it by."""
+    from ner_site import service
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise KeyError(OWN_KEY)
+
+    async def fine(client: Any, request: Any) -> Any:
+        return await FakeLLM.complete(client, request)
+
+    if where == "client":
+        _own_build(monkeypatch, broken)
+    else:
+        _own_build(monkeypatch, fine)
+        monkeypatch.setattr(service, "extract", broken)
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "openai", "text": HALO_TEXT},
+        headers=OWN_HEADERS,
+    )
+    assert _error(result) == (500, "internal")
+    record = _last_log(capsys)
+    assert record["exception"] == "KeyError" and record["code"] == "internal"
+    assert record["where"] and any(frame.startswith("service.py:") for frame in record["where"])
+    assert "own_error" not in record and "locals" not in record
+    assert (record["provider"], record["credential"]) == ("openai", "visitor")
+    for text in (json.dumps(record), result[2].decode()):
+        assert OWN_KEY not in text and json.dumps(OWN_KEY)[1:-1] not in text
+
+
+@pytest.mark.parametrize("selector", ["retrieval", "gpt-6-luna"])
+def test_a_close_that_fails_does_not_replace_the_result(
+    selector: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+
+    async def answer(client: Any, request: Any) -> Any:
+        return await FakeLLM.complete(client, request)
+
+    async def close(client: Any) -> None:
+        closed.append(client.model)
+        raise OSError("connection reset while closing, said " + OWN_KEY)
+
+    _own_build(monkeypatch, answer, close)
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "openai", "text": HALO_TEXT, "selector": selector},
+        headers=OWN_HEADERS,
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert out["credential_source"] == "visitor" and out["entities"][0]["text"] == "haloperidol"
+    assert len(closed) == (1 if selector == "retrieval" else 2)  # every stage was still closed
+    record = _last_log(capsys)
+    assert record["status"] == 200 and record["own_close_error"] == "OSError"
+    assert "own_error" not in record and "code" not in record
+    assert OWN_KEY not in json.dumps(record) and json.dumps(OWN_KEY)[1:-1] not in json.dumps(record)
+
+
+def test_a_close_that_fails_does_not_replace_the_runs_own_error(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail(client: Any, request: Any) -> Any:
+        raise LLMFatalError("HTTP 401: no")
+
+    async def close(client: Any) -> None:
+        raise RuntimeError("close failed")
+
+    _own_build(monkeypatch, fail, close)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    assert _error(result) == (401, "provider_key_refused")
+    record = _last_log(capsys)
+    assert (record["own_error"], record["own_close_error"]) == ("LLMFatalError", "RuntimeError")

@@ -390,7 +390,10 @@ def _name(provider: str) -> str:
 def provider_error(exc: BaseException, provider: str) -> ServiceError:
     """What the visitor is told when their provider failed: a fixed sentence with the
     provider's display name and, for a 502, the machine word. Nothing of ``exc`` but its
-    classification is used.
+    classification is used. The class name of ``exc`` goes with the error as
+    ``own_error``, for the log line: the visitor's sentence is the same for a provider
+    that is down and for a client that could not be built, and the operator has to be
+    able to tell them apart.
 
     - 401 ``provider_key_refused``: the key was refused (401, 403), or the account
       behind it cannot pay (402, a spent balance or quota).
@@ -400,21 +403,24 @@ def provider_error(exc: BaseException, provider: str) -> ServiceError:
     name = _name(provider)
     word = failure_word(exc)
     if word == KEY_REFUSED:
-        return ServiceError(
+        error = ServiceError(
             "provider_key_refused",
             f"{name} refused this key. It may be mistyped, revoked, out of credit, or not "
             "allowed to use this model.",
             status=401,
         )
-    if word == RATE_LIMITED:
-        return ServiceError(
+    elif word == RATE_LIMITED:
+        error = ServiceError(
             "provider_rate_limited",
             f"{name} is rate limiting this key; try again shortly.",
             status=429,
         )
-    return ServiceError(
-        "provider_error", f"{name} could not complete the request ({word}).", status=502
-    )
+    else:
+        error = ServiceError(
+            "provider_error", f"{name} could not complete the request ({word}).", status=502
+        )
+    error.own_error = type(exc).__name__
+    return error
 
 
 # --- clients ----------------------------------------------------------------------------

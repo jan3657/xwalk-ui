@@ -109,7 +109,8 @@ _JEV_STATUS: dict[MatchStatus, PickStatus] = {
 @dataclass
 class SelectStats:
     """Filled in by `select_entities`: the selector's calls, tokens and reported cost.
-    Tokens and cost are None once any call did not report them ("unknown", not 0).
+    Tokens and cost are None once any call did not report them ("unknown", not 0),
+    which includes a call that was sent and then cut off by the request deadline.
 
     ``served_elsewhere`` records the requested and serving model per pick when the
     adapter signals a server-side refusal fallback."""
@@ -137,6 +138,21 @@ class SelectStats:
         if self.calls == 0:
             return None
         return self.cost_usd if self.cost_reported else None
+
+
+def dispatched(client: object) -> int:
+    """How many requests `client` has sent so far, as its call budgets counted them
+    when each was dispatched: a budgeted client or decider (``budget.dispatched``,
+    also behind a wrapper that passes ``budget`` on), a staged step (the clients it
+    has ``built``) or a fallback chain (its ``steps``). 0 for a client with no budget."""
+    steps = getattr(client, "steps", None)
+    if steps is not None:
+        return sum(dispatched(step.client) for step in steps)
+    built = getattr(client, "built", None)
+    if built is not None:
+        return sum(dispatched(part) for part in built)
+    count = getattr(getattr(client, "budget", None), "dispatched", None)
+    return count if isinstance(count, int) else 0
 
 
 @cache
@@ -351,6 +367,8 @@ async def select_entities(
     if selector != JEV and llm is None:
         raise ValueError(f"selector {selector!r} needs an LLM client")
     stats.cost_reported = selector == JEV
+    client = decider if selector == JEV else llm
+    sent_before, counted_before = dispatched(client), stats.calls
     deadline_note = "timeout" if own_key else DEADLINE_NOTE
     deadline_at = None if deadline is None else time.monotonic() + deadline
     semaphore = asyncio.Semaphore(CONCURRENCY)
@@ -389,7 +407,14 @@ async def select_entities(
                 )
         return entity.model_copy(update={"pick": pick})
 
-    return list(await asyncio.gather(*(one(e) for e in results)))
+    picked = list(await asyncio.gather(*(one(e) for e in results)))
+    # A pick the deadline cancelled never reported its usage, but its request had left
+    # and may be billed. The budgets counted it at dispatch: what they saw beyond what
+    # the picks reported is booked as calls with unknown tokens and cost, never dropped.
+    missing = (dispatched(client) - sent_before) - (stats.calls - counted_before)
+    if missing > 0:
+        stats.add(XwalkUsage.unreported(missing))
+    return picked
 
 
 __all__ = [
@@ -400,5 +425,6 @@ __all__ = [
     "RETRIEVAL_ONLY",
     "SELECT_TEMPLATES",
     "SelectStats",
+    "dispatched",
     "select_entities",
 ]

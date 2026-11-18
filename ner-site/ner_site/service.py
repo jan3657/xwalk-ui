@@ -684,6 +684,12 @@ class StagedLLM:
         return tuple(self._makers)
 
     @property
+    def built(self) -> tuple[LLMClient, ...]:
+        """The clients built so far, of every stage (``select.dispatched`` counts the
+        requests they sent)."""
+        return tuple(self._clients.values())
+
+    @property
     def model(self) -> str:
         return self._model
 
@@ -1168,7 +1174,9 @@ async def run(
     this call (opening the indexes on a cold start); the mapping deadline counts from it.
 
     Raises :class:`ServiceError`: 400 codes from :func:`validate_request`, 422 from the
-    extraction, 429 ``call_budget_exhausted``, 502 ``provider_error``."""
+    extraction, 429 ``call_budget_exhausted``, 502 ``provider_error``. With visitor
+    credentials a failed call or a timeout is the provider's error
+    (``providers.provider_error``); any other exception is not converted."""
     req = validate_request(request, settings)
     assert req.prompt is not None and req.model is not None
     own = req.provider not in (None, providers.SITE)
@@ -1197,6 +1205,11 @@ async def run(
         failure = providers.provider_error(asyncio.TimeoutError(), req.provider)
     except Exception as exc:
         if own:
+            # Only what a provider (or the wait for it) did is the provider's failure.
+            # Anything else is a fault of this code and leaves as it is, so that the
+            # handler logs its type and where it was raised (a 500).
+            if not isinstance(exc, (LLMError, asyncio.TimeoutError)):
+                raise
             assert req.provider is not None
             failure = providers.provider_error(exc, req.provider)
         elif isinstance(exc, CallLimitExceeded):

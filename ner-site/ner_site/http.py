@@ -540,6 +540,12 @@ class _OwnJSONClient:
     def fingerprint(self) -> str:
         return self._client.fingerprint
 
+    @property
+    def budget(self) -> Any:
+        """The call budget of the client underneath, which counts every request it
+        sends (``select.dispatched`` reads it)."""
+        return getattr(self._client, "budget", None)
+
     async def complete(self, request: LLMRequest) -> LLMResponse:
         answer = await self._client.complete(request)
         key = self._token()
@@ -555,7 +561,8 @@ class _OwnJSONClient:
 
 @contextmanager
 def _provider_errors(provider: str) -> Iterator[None]:
-    """A failure building or closing an own client has the same envelope as a failed call."""
+    """A failure building an own client has the same envelope as a failed call; the
+    log line names its class (``own_error``)."""
     try:
         yield
         return
@@ -572,8 +579,11 @@ async def _run_own(
     settings: Settings,
     indexes: Mapping[str, OntologyIndex],
     started: float,
+    log: dict[str, Any],
 ) -> NerResponse:
-    """Each constructed stage is closed even if construction of the next stage fails."""
+    """Each constructed stage is closed even if construction of the next stage fails.
+    A stage that fails to close is named in `log` and nothing more: the request's
+    answer, or its own error, is what the visitor gets."""
     assert valid.model is not None and valid.selector is not None
     build = partial(
         providers.own_llm,
@@ -584,8 +594,10 @@ async def _run_own(
     )
 
     async def close(client: Any) -> None:
-        with _provider_errors(credential.provider):
+        try:
             await client.aclose()
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - see above
+            log.setdefault("own_close_error", type(exc).__name__)
 
     async with AsyncExitStack() as stack:
         with _provider_errors(credential.provider):
@@ -628,7 +640,7 @@ async def _ner(
     if credential is not None:
         token = _OWN_RUN.set(True)
         try:
-            response = await _run_own(credential, valid, settings, indexes, started)
+            response = await _run_own(credential, valid, settings, indexes, started, log)
         finally:
             _OWN_RUN.reset(token)
     else:
@@ -750,6 +762,8 @@ def handle(
         )
     except ServiceError as exc:
         log["code"] = exc.code
+        if exc.own_error is not None:
+            log["own_error"] = exc.own_error
         allow = ALLOWED.get(path) if exc.code == "method_not_allowed" else None
         extra = {**exc.headers, **({"Allow": ", ".join(allow)} if allow else {})}
         result = _error(exc, settings, extra, extra_secrets)
