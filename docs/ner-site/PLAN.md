@@ -134,9 +134,9 @@ Token counts are `null` when the provider did not report them, never 0. Errors:
 | 404 / 405 | unknown path / method (OPTIONS is 405 on purpose) |
 | 413 | `body_too_large` (> 64 KB) |
 | 422 | `extraction_unparseable` (model answer not a JSON object after xwalk's parsing), `extraction_schema` (object lacks `entities`) |
-| 429 | `call_budget_exhausted` |
+| 429 | `call_budget_exhausted`. **[amended 2026-11-18]** Also `visitor_limit_reached`, with `Retry-After` (section 14) |
 | 502 | `provider_error` (LLM or embeddings failure; message without the key or URL userinfo) |
-| 503 | `not_configured` (no `OPENROUTER_API_KEY` and not offline mode) |
+| 503 | `not_configured` (no `OPENROUTER_API_KEY` and not offline mode). **[amended 2026-11-18]** Now: neither `ANTHROPIC_API_KEY` nor `OPENROUTER_API_KEY` |
 | 500 | `internal` (generic message; details to the function log only) |
 
 Every response carries `Cache-Control: no-store`. No `Access-Control-*` headers are ever
@@ -225,7 +225,7 @@ sent.
 |---|---|---|
 | `OPENROUTER_API_KEY` | unset | the operator's key; used for the chat call and query embeddings |
 | `NER_SITE_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL. **[amended after review]** For the chat call only: query embeddings always go to OpenRouter (`https://openrouter.ai/api/v1/embeddings`) with `OPENROUTER_API_KEY`. The committed dense indexes record that embeddings base URL in their identity, so moving embeddings elsewhere means rebuilding them (`tools/build_indexes.py`) and changing the code |
-| `NER_SITE_MODELS` | `openai/gpt-4o-mini,google/gemini-2.5-flash-lite,qwen/qwen3-next-80b-a3b-instruct` | allowlist, first is default. **[amended]** All three ids exist on OpenRouter and list `structured_outputs` (checked 2026-11-03) |
+| `NER_SITE_MODELS` | `openai/gpt-4o-mini,google/gemini-2.5-flash-lite,qwen/qwen3-next-80b-a3b-instruct` | allowlist, first is default. **[amended]** All three ids exist on OpenRouter and list `structured_outputs` (checked 2026-11-03). **[amended 2026-11-18]** The default is now `claude-opus-5-5,claude-sonnet-5-5,google/gemini-3.1-flash-lite,openai/gpt-6-luna`, and only ids whose key is set are offered (section 14, which also lists the new variables) |
 | `NER_SITE_PASSCODE` | unset | when set, `X-Passcode` must equal it (`hmac.compare_digest`). **[amended after review]** ASCII only: `http.server` reads header values as Latin-1, so another value could never match; it is refused (503 `not_configured` naming the variable) |
 | `NER_SITE_MAX_CHARS` / `NER_SITE_MAX_ENTITIES` / `NER_SITE_MAX_PROMPT_CHARS` | 5000 / 25 / 4000 | limits. **[amended by WS-D]** Whole numbers in 1..20000 / 1..100 / 1..16000; anything else is refused (503 `not_configured` naming the variable), not clamped. Empty means unset. `NER_SITE_OFFLINE` accepts 1/0, true/false, yes/no, on/off |
 | `NER_SITE_OFFLINE` | unset | `1` swaps the LLM for `ner_site.fake.offline_llm`; `/api/health` reports `"mode": "offline"` |
@@ -461,7 +461,9 @@ and "Run", waits for results, and writes a PNG to a path given on the command li
   the embedding requests; `maxDuration` 120 s bounds everything else.
 - Optional passcode `NER_SITE_PASSCODE` (`hmac.compare_digest`); 401 otherwise.
   Recommended with an OpenRouter per-key spend limit (the only hard cap across function
-  instances).
+  instances). **[amended 2026-11-18]** With `ANTHROPIC_API_KEY` set the site is meant to
+  run without a passcode: a per-visitor hourly allowance bounds one address and the
+  prepaid Anthropic balance (auto-reload off) is the hard cap for Claude (section 14).
 - Cross-origin: require `X-Requested-With: xwalk-ner`; OPTIONS -> 405 with no CORS headers.
 - Prompt injection: the visitor's prompt only reaches the extraction call, inside a fixed
   system prompt; output validated against the schema and the text; mapping has no LLM;
@@ -537,6 +539,7 @@ smoke and all four gates, review the diff against sections 3 and 7, update
 4. Phase 2, LLM candidate selection ("match" mode) with `spec.build_matcher(...)`: out of v1.
 5. Shared per-IP rate limiting needs storage; v1 relies on passcode, caps and the
    OpenRouter spend limit (Vercel firewall rate limiting is an operator option).
+   **[amended 2026-11-18]** The storage is now Neon: section 14.
 
 ## 11. After deploying (operator)
 
@@ -580,7 +583,11 @@ contains `xwalk.retrieval.postgres` before `NER_SITE_BACKEND=neon` can work ther
 
 Retrieval ranks; a selector decides. Each request names one (`selector`, default
 `NER_SITE_SELECTOR`, `retrieval` unless set), from the list `/api/health` serves
-(`selectors`, `default_selector`):
+(`selectors`, `default_selector`). **[amended 2026-11-18]** With `NER_SITE_SELECTOR`
+unset the default is now the first selector that can run (Claude Opus 5.5 with the
+Anthropic key, Jev with only the OpenRouter key), and the default list in 13.3 is
+`claude-opus-5-5`, `claude-sonnet-5-5`, `jev`, `google/gemini-3.1-flash-lite`,
+`openai/gpt-6-luna` (section 14):
 
 | # | Decision | Why |
 |---|---|---|
@@ -596,3 +603,99 @@ Retrieval ranks; a selector decides. Each request names one (`selector`, default
 
 Tests: `tests/test_site_select.py` (FakeDecider with a scripted Jev, FakeLLM), and the
 selection cases in `tests/test_site_service.py`.
+
+## 14. Claude by default, and open access with a visitor allowance **[amendment, 2026-11-18]**
+
+Visitors use the operator's own Anthropic key without a passcode. Design:
+[the spec of 18 November 2026](../superpowers/specs/2026-11-18-claude-provider-open-access-design.md).
+This section records the decisions and the contract as implemented; where the code
+departs from the spec it says so (**[as built]**). Nothing was deployed and no live
+call was made by the implementing sessions: the rollout and its open checks are in
+`ner-site/README.md` ("Rollout: Claude by default and open access").
+
+| # | Decision | Why |
+|---|---|---|
+| 14.1 | Claude is reached with a direct Anthropic key (`ANTHROPIC_API_KEY`) through the official `anthropic` SDK (`ner_site/claude.py`), not through OpenRouter. OpenRouter stays for the other models, Jev and query embeddings. | The operator's prepaid Anthropic balance pays for it; the stale OpenRouter id `anthropic/claude-haiku-5.5` leaves the default lists. |
+| 14.2 | Claude is the default for extraction and for selection: `claude-opus-5-5`. A model id starting with `claude-` is an Anthropic model, anything else an OpenRouter model; the only Claude ids are `claude-opus-5-5` and `claude-sonnet-5-5`. | One rule tells the providers apart; an unknown `claude-` id is a settings error, not a request that fails later. |
+| 14.3 | The site is open: no passcode in production. `NER_SITE_PASSCODE` keeps working for private deployments. | The request of 18 November. |
+| 14.4 | Limits are counters in the existing Neon database (`<schema>.site_visits`). There is no dollar budget in the site: the prepaid balance, with auto-reload off, is the hard ceiling. | Serverless instances share no memory; the Console already shows spend. |
+| 14.5 | Chain: Opus 5.5, then Sonnet 5.5, then an OpenRouter model (`NER_SITE_FALLBACK_MODEL`, default `google/gemini-3.1-flash-lite`) as the last resort, for extraction and for selection. One chain serves a whole request; a step-down is sticky. Without an OpenRouter key the chain ends at Sonnet. | A rate limit met while extracting should not be met again by every pick. The last step is the fallback model as an LLM selector, not Jev, so the chain has one interface. |
+| 14.6 | Step down at once on `rate_limited`, `overloaded`, `balance_exhausted`, `key_refused`, `refused` and on the step's call cap (`call_limit`); once more on the same step and then down on `transient` (5xx, 408, 409, connection errors, timeouts). Never on a request the API rejects (`bad_request`) or an unreadable answer: those would fail on every step. `balance_exhausted` and `key_refused` are remembered for 300 s per warm instance. | A malformed request must surface, not be hidden by a fallback. |
+| 14.7 | Allowance per visitor and UTC clock hour: 10 requests starting on Opus, then 20 starting on Sonnet, then 429 until the hour rolls over (`NER_SITE_OPUS_PER_HOUR`, `NER_SITE_SONNET_PER_HOUR`, 0 to 1000). The sum is the hour's total for every kind of request. | Keeps one visitor from spending the balance. |
+| 14.8 | A visitor is `HMAC-SHA256(salt, ip)`, first 32 hex characters; `ip` from `x-real-ip`, `x-vercel-forwarded-for`, then the first entry of `x-forwarded-for`. The salt is `NER_SITE_VISITOR_SALT`, or the SHA-256 of `DATABASE_URL`. Raw addresses are never stored; neither they nor the visitor ids are logged or returned; rows older than a day are deleted. | The table and the logs hold nothing that identifies a visitor without the salt. |
+| 14.9 | Haiku 5.5 is not in the chain. | Unreliable for extraction on 4 November 2026. |
+| 14.10 | Claude requests carry no sampling parameters and no `thinking` parameter; depth is `output_config.effort` (`NER_SITE_CLAUDE_EFFORT`, default `low`); `max_tokens` is 16000 for extraction and 8000 for selection; the SDK does not retry (`max_retries=0`). | Opus 5.5 rejects sampling parameters, thinking counts against `max_tokens`, and retries belong to the chain so that none happens out of sight of the call cap. |
+| 14.11 | Schema-enforced output (`output_config.format`) together with the server-side refusal fallback (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). **[as built]** The schema sent is a normalised copy: all properties required and no others allowed, formerly optional properties nullable, list-valued `type` and `oneOf` as `anyOf`, unsupported keywords (numeric bounds, lengths, patterns) moved into `description`. The site still validates every answer. | Opus 5.5 has a `bio` classifier and the site is fed biomedical text. A keyword the API rejects would be a `bad_request` on every call. Not verified against the live API. |
+| 14.12 | **[as built]** The limiter runs only where Claude is offered (the Anthropic key is set, not offline), not wherever `DATABASE_URL` is set as the spec says. | Otherwise the production deployment of 4 November (OpenRouter key, passcode, Neon) would start refusing a visitor's 31st request before any Anthropic key exists. A passcode deployment with the key and a database is metered. |
+| 14.13 | **[as built]** Only ids whose key is set are offered, and the defaults are the first offered ones. With only an OpenRouter key and no `NER_SITE_SELECTOR` the default selector is therefore `jev` (it was `retrieval`). A configured `NER_SITE_SELECTOR` whose key is missing falls back the same way instead of failing. | The spec's "the defaults become the first remaining entries", applied to selectors. |
+| 14.14 | **[as built]** One visitor's concurrent requests are serialised: every `admit` first takes `pg_advisory_xact_lock` on a hash of the visitor id, as a statement of its own in the same transaction as the visit. The limiter has its own Neon executor (3 s timeout, no retries). `opus_left` and `sonnet_left` are capped by what remains of the hour's total. | Without the lock a parallel burst reads one snapshot and is granted N times; a retried increment could count a visit twice; `other` requests use up the total too. The guarantee depends on READ COMMITTED on Neon's batch endpoint, verified on a local Postgres only. |
+| 14.15 | When the limiter cannot be asked (unreachable, or no `DATABASE_URL` on a deployment without a passcode) a request for Opus starts on Sonnet and is not counted. With no `DATABASE_URL` and a passcode, Claude is unmetered and starts on Opus. | An outage of the limiter should not take the site down; the price is unmetered Sonnet for as long as it lasts. |
+| 14.16 | **[as built]** When the model and the selector are two different Claude ids, selection runs on the request's one chain, wherever extraction left it, and the response says so with a `fallbacks` entry of stage `select` and reason `follows_extraction` (a reason the spec does not list). A Claude selector with an OpenRouter extraction model gets a chain of its own, and decides the request's tier. | One chain per request (14.5), and nothing substitutes silently. |
+
+Variables added (defaults in `ner-site/README.md`): `ANTHROPIC_API_KEY`,
+`NER_SITE_CLAUDE_EFFORT`, `NER_SITE_FALLBACK_MODEL`, `NER_SITE_OPUS_PER_HOUR`,
+`NER_SITE_SONNET_PER_HOUR`, `NER_SITE_VISITOR_SALT`. `DATABASE_URL` is now read on every
+backend (the indexes still use it only with `NER_SITE_BACKEND=neon`). `configured` is
+true with either key.
+
+### Wire contract additions (section 14)
+
+`POST /api/ner`, 200 response, additions only:
+
+```json
+{"model": "claude-sonnet-5-5",
+ "requested_model": "claude-opus-5-5", "requested_selector": "claude-opus-5-5",
+ "fallbacks": [{"stage": "admit", "from": "claude-opus-5-5", "to": "claude-sonnet-5-5",
+                "reason": "opus_allowance_used"}],
+ "notices": ["Your Opus allowance for this hour is used; this ran on Claude Sonnet 5.5."]}
+```
+
+- `model` is the model that produced the extraction, as the provider names it; it may
+  differ from the request. `requested_model` and `requested_selector` are what was asked
+  for, defaults resolved.
+- `fallbacks` lists every departure in order, empty when there was none. `stage` is
+  `admit` (decided before any call), `extract` or `select`. Reasons: `opus_allowance_used`,
+  `limits_unavailable`, `claude_unavailable` (stage `admit`); `rate_limited`, `overloaded`,
+  `balance_exhausted`, `key_refused`, `refused`, `transient`, `call_limit` (from the
+  chain); `follows_extraction` (stage `select`, 14.16). **[as built]** `transient`,
+  `call_limit` and `follows_extraction` are not in the spec's list.
+- `notices` has one sentence for the visitor per distinct departure.
+- `entities[].pick.selector` is the model that made that pick (after a step-down during
+  selection, picks of one response name different models).
+- A request for an OpenRouter model with a non-Claude selector has no chain: `fallbacks`
+  and `notices` are empty and it behaves as before.
+
+New error: 429 `visitor_limit_reached`, message "you have used this hour's requests; try
+again in N minutes", with `Retry-After` in seconds to the next clock hour. Order of
+checks on `POST /api/ner`: as in 3.1, then admission last, so a refused request is never
+counted. 503 `not_configured` now means neither key is set.
+
+`GET /api/health`, additions only (neither is a `HealthResponse` field):
+
+```json
+{"claude": {"status": "ok"},
+ "visitor": {"limits": "on", "tier": "opus", "opus_left": 7, "sonnet_left": 20, "resets_in_s": 1380}}
+```
+
+- `claude`: `ok`, or `unavailable` with a reason ("key not set", "key refused", "balance
+  exhausted", "Anthropic answered HTTP n", "Anthropic unreachable (...)"). The key is
+  checked with a free Models API call, remembered like the OpenRouter check. Absent in
+  offline mode.
+- `visitor`: the caller's allowance, read without recording anything. `limits` is `on`,
+  `off` or `unavailable`; `tier` is where a request for Opus would start (`opus`,
+  `sonnet`, `blocked`). **[as built]** Present only where Claude is offered. With the
+  limiter off or unavailable there are no counts and the numbers say what admission
+  would do: `sonnet` with `opus_left` 0, or `opus` with the full allowance on a
+  passcode deployment without a database.
+- `llm` stays the OpenRouter key's status; without that key but with the Anthropic one
+  its reason reads "OPENROUTER_API_KEY is not set; only the Claude models are offered".
+  `passcode_required` is unchanged.
+
+The request log line gains `tier`, `fallbacks`, `ran` (the model that extracted) and,
+when the limiter could not be asked, `limits` (the error's class and SQLSTATE only).
+
+Tests: `tests/test_site_claude.py`, `tests/test_site_fallback.py`,
+`tests/test_site_limits.py` (offline with a fake executor; six `-m integration` cases
+run the real SQL on the Postgres in `NER_SITE_TEST_DATABASE_URL` through `psql`),
+`tests/test_site_claude_check.py`, and additions to the HTTP, service, select and schema
+tests. All offline; no test reaches Anthropic, OpenRouter or Neon.
