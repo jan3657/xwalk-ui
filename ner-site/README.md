@@ -866,9 +866,11 @@ with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). Off 
   request is checked as it leaves (the pinned host, the visitor's key once; for
   Anthropic every header and its value, and a `Content-Length` that is the body's)
   and is not sent otherwise. Of a response, the HTTP client is given the status, the
-  body and a header set the site writes itself: one of two fixed content types, and
-  `content-length`, `content-encoding`, `retry-after` and `retry-after-ms` only in
-  a strict form. A redirect's `Location`, a charset, a cookie and every other header
+  body and a header set the site writes itself: one of two fixed content types;
+  `content-length`, `retry-after` and `retry-after-ms` only in a strict form; and the
+  body's `content-encoding` rewritten in lower case, when every coding in it is one
+  the client offered to decode (an answer in any other coding is 502 `provider_error`
+  with `bad_answer`). A redirect's `Location`, a charset, a cookie and every other header
   stop there, so a provider that echoes the key in one (in any encoding) leaves it
   in no cache of the warm instance, and no cookie is stored or sent back. The text
   and the prompt go to that provider
@@ -934,15 +936,18 @@ credential was then refused. One of the three provider errors above also has
 for a provider's answer, `TimeoutError` for the deadline, `CallLimitExceeded`,
 `WireRefused` for a request the site did not send, or the class of whatever kept a
 client from being built). A call that fails during selection is a failed pick inside
-a 200, and the line of that request has `own_error` too (the first such class), so
-`"status": 200` with `"own_error": "WireRefused"` means picks the site itself did
-not send. Only a failure of the provider, the SDK, the HTTP client or a timeout is
-reported as the provider's error: any other exception is a fault of the site's code.
+a 200, and the line of that request has `own_error` too: the first class that
+failed, or `WireRefused` whenever a pick was refused, whatever else failed beside
+it. So `"status": 200` with `"own_error": "WireRefused"` means picks the site itself
+did not send. When picks failed for more than one reason, `own_errors` lists the
+classes (sorted, at most eight). Only a failure of the provider, the SDK, the HTTP
+client or a timeout is reported as the provider's error, and so is a 200 whose body
+cannot be decoded (`bad_answer`): any other exception is a fault of the site's code.
 During extraction it answers 500 `internal`, with `exception` and `where` in the log
 line as for any request; during selection it is a failed pick with the word `error`
 and its class in `own_error`. A client that fails to close after the run changes
-nothing for the visitor and adds `own_close_error` (a class name) to the line. No part of the key is in any
-of these.
+nothing for the visitor and adds `own_close_error` (a class name) to the line. No
+part of the key is in any of these.
 
 *The Anthropic SDK is pinned.* `anthropic==2.10.0`, in `requirements.txt` and in the
 `dev` extra. What keeps the operator's environment out of a visitor's Anthropic
@@ -1465,10 +1470,27 @@ A second review of these fixes found more, fixed the same day:
 - The tool resolves percent escapes before looking for a secret, and a burst in
   which nothing started is `INCONCLUSIVE`.
 
+And a third, of the second round's fixes:
+
+- The response header allowlist compared `Content-Encoding` by case, so an answer
+  sent as `GZip` reached the parser compressed. Codings are now lower-cased and
+  checked against what the client offered; one it cannot decode is `bad_answer`.
+- A 200 from Anthropic that is not JSON raised the decoder's own error, which the
+  narrowed sealing let through as a 500. It is `bad_answer` again; only the SDK
+  call is covered, so a fault of the site's code still is not.
+- The call budget of an own-key request keeps the class of a failed call, not its
+  message.
+- A refused pick is named in the log whatever failed beside it (`own_errors` lists
+  every class).
+- The tool looks for a secret at every layer of percent decoding, also in the
+  secret's own decoded forms, and a value escaped more deeply than it decodes
+  (eight rounds) is withheld and fails the echo check.
+
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1203 passed, 23
-  deselected (1000 before these fixes, 1153 after the first round).
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1299 passed, 23
+  deselected (1000 before these fixes, 1153 after the first round, 1203 after the
+  second).
   The fixes were written test first. Reproduced as failing tests before the code
   changed: for each of the three providers, a 302 with the key in a relative
   `Location` left it in the `urlsplit` cache of `urllib.parse` after the client was

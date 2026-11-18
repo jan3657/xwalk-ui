@@ -322,15 +322,20 @@ points marked "final review" were changed after two reviews of the whole branch.
   library reads it. Second round: searching the other headers for the key was not
   enough either (a charset can arrive encoded and is decoded by the library, and a
   `Set-Cookie` is stored and sent back), so every response gets a new header set:
-  one of two fixed content types, and `content-length`, `content-encoding`,
-  `retry-after` and `retry-after-ms` only in a strict form.
+  one of two fixed content types, `content-length`, `retry-after` and
+  `retry-after-ms` only in a strict form, and `content-encoding` rewritten in lower
+  case when the client can decode every coding in it (third round: otherwise the
+  answer is a `bad_answer` failure, not a body passed on still encoded).
 - **Own-path failures (section 5, final review).** Only a failure of the provider,
   the SDK, the HTTP library or a timeout is a provider error, also inside the
   clients themselves; any other exception is a fault of the site's code: 500
   `internal`, logged with its type and frames, during extraction, and a failed pick
-  during selection. The log line names the class of what failed in either stage
-  (`own_error`); a client that fails to close is logged (`own_close_error`) and
-  does not replace the result.
+  during selection. A 200 from a provider that cannot be decoded is the provider's
+  failure (`bad_answer`), for all three. The log line names the class of what failed
+  in either stage (`own_error`, with `WireRefused` taking precedence, and
+  `own_errors` when picks failed for different reasons); a client that fails to
+  close is logged (`own_close_error`) and does not replace the result. The call
+  budget of an own-key request remembers a failed call by its class only.
 - **Selector usage (section 6, final review).** `selector_calls` counts every call
   the request's call budgets dispatched during selection, also one the deadline
   cut off; the selector's tokens and cost are then null.
