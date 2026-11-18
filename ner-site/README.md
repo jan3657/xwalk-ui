@@ -681,7 +681,7 @@ has) and 60 s while selecting.
 | Claude declined the text, after the server-side refusal fallback | next step at once | `refused` |
 | No answer within the call's timeout | next step at once, with no second wait on the same model | `timeout` |
 | The step's call cap for the request was reached | next step at once | `call_limit` |
-| 5xx, 408, 409, connection error | the same step once more, then the next | `transient` |
+| 5xx, 408, 409, connection error, a 200 whose body cannot be decoded | the same step once more, then the next | `transient` |
 | A request the API rejects (other 4xx) | no step-down: extraction answers 502 `provider_error`, a pick is `failed` | none |
 | An answer that cannot be read as the JSON asked for | no step-down: extraction answers 422 (`extraction_unparseable`, or `extraction_schema` without an `entities` list), a pick is `failed` | none |
 
@@ -1477,7 +1477,10 @@ And a third, of the second round's fixes:
   checked against what the client offered; one it cannot decode is `bad_answer`.
 - A 200 from Anthropic that is not JSON raised the decoder's own error, which the
   narrowed sealing let through as a 500. It is `bad_answer` again; only the SDK
-  call is covered, so a fault of the site's code still is not.
+  call is covered, so a fault of the site's code still is not. On the site's own
+  key the same answer was a 500 all along: it is now a `transient` failure there,
+  so the chain tries the model once more and then steps down, with the usual
+  notice.
 - The call budget of an own-key request keeps the class of a failed call, not its
   message.
 - A refused pick is named in the log whatever failed beside it (`own_errors` lists
@@ -1488,7 +1491,7 @@ And a third, of the second round's fixes:
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1299 passed, 23
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1305 passed, 23
   deselected (1000 before these fixes, 1153 after the first round, 1203 after the
   second).
   The fixes were written test first. Reproduced as failing tests before the code
