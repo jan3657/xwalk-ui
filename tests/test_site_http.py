@@ -4073,30 +4073,105 @@ def test_concurrent_requests_against_a_hanging_database_are_capped_too(
     assert len(runs.rows) == cap
 
 
-def test_setting_up_the_store_is_under_the_same_deadline_as_the_write(
+def test_a_held_store_lock_costs_no_place_past_the_deadline_and_no_late_write(
     cache_dir: Path,
     tmp_path: Path,
     runs: Any,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The store is built behind a lock every request of the instance shares. A request
-    that finds it held (another one is building the executor) waits no longer for it
-    than for the write itself."""
+    """The store is found behind a lock every request of the instance shares. With the
+    lock held for longer than the deadline, four waiting writes kept their places past
+    it, and went ahead, long expired, once the lock was free. One deadline, taken
+    before anything else, now covers the wait for the lock too."""
     import time
 
-    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.15)
+    timeout, bound = 0.3, 1.0
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", timeout)
+    cap = http_mod.USAGE_MAX_IN_FLIGHT
     s = _plain_stats_site(cache_dir, tmp_path)
     capsys.readouterr()
+    answers: list[int] = []
+    threads = [
+        threading.Thread(target=lambda: answers.append(_plain_run(s)[0])) for _ in range(cap)
+    ]
+    with http_mod._USAGE_LOCK:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        # Still held: every place and every worker is gone within the bound.
+        assert _wait_for(
+            lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0, bound
+        )
+        assert answers == [200] * cap
+        assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"] * cap
+        # So the next run is not turned away: it waits its own deadline for the lock.
+        assert _plain_run(s)[0] == 200
+        assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"]
+        assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0, bound)
+    # The lock is free: nothing that waited for it starts now.
+    time.sleep(timeout * 2)
+    assert runs.round_trips == 0 and runs.rows == [] and runs.opened == []
+    assert _plain_run(s)[0] == 200
+    assert _usage_notes(capsys.readouterr().err) == [None] and len(runs.rows) == 1
+
+
+def test_a_write_is_given_only_the_time_that_is_left(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Setting up the store takes time out of the same deadline: the SQL call gets the
+    rest, not a fresh two seconds."""
+    import time
+
+    from tests.test_site_usage import FakeRuns
+
+    given: list[float] = []
+
+    class Timed(FakeRuns):
+        def within(self, seconds: float) -> Any:
+            given.append(seconds)
+            return self
+
+    fake = Timed()
+
+    def slow_setup(database_url: str, timeout: float) -> Any:
+        time.sleep(0.2)
+        return fake
+
+    monkeypatch.setattr(http_mod, "make_usage_executor", slow_setup)
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 1.0)
+    s = _plain_stats_site(cache_dir, tmp_path)
+    assert _plain_run(s)[0] == 200 and _plain_run(s)[0] == 200
+    assert len(fake.rows) == 2 and len(given) == 2
+    assert 0 < given[0] <= 0.8 < given[1] <= 1.0
+    # A setup that uses up the whole deadline: the write does not start at all.
+    http_mod.reset()
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.1)
+    capsys.readouterr()
+    assert _plain_run(s)[0] == 200
+    assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"]
+    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0, 1.0)
+    time.sleep(0.2)
+    assert len(fake.rows) == 2 and len(given) == 2
+
+
+def test_the_statistics_read_waits_for_the_store_lock_no_longer_than_its_own_deadline(
+    cache_dir: Path, tmp_path: Path, runs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    monkeypatch.setattr(http_mod, "STATS_TIMEOUT_S", 0.2)
+    s = _stats_site(cache_dir, tmp_path)
     with http_mod._USAGE_LOCK:
         started = time.monotonic()
-        result = _plain_run(s)
-        waited = time.monotonic() - started
-    assert result[0] == 200 and waited < 5
-    assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"]
-    # Once the lock is free the abandoned write goes through and the slot is given back.
-    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0)
-    assert len(runs.rows) == 1
+        result = _stats(s)
+        assert time.monotonic() - started < 2
+    assert _error(result) == (503, "stats_unavailable") and runs.round_trips == 0
+    assert _stats(s)[0] == 200
 
 
 @pytest.mark.parametrize(

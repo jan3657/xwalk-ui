@@ -743,6 +743,65 @@ def test_a_table_that_was_dropped_is_created_again_by_the_run_after_the_one_that
     assert runs.stats(1)["totals"]["runs"] == 0
 
 
+def test_a_late_answer_to_an_insert_sent_before_the_drop_does_not_bring_the_flag_back() -> None:
+    """Two writes of one instance. The first was sent while the table was there and is
+    acknowledged late; in between the table is dropped and the second finds out. The
+    late acknowledgement used to set "created" again, and the run after lost its row
+    as well."""
+    import threading
+
+    runs, fake = make()
+    runs.record(a_run())
+    sent, release = threading.Event(), threading.Event()
+    real = fake.execute
+
+    def slow(sql: str, params: Any = ()) -> Any:
+        rows = real(sql, params)  # reaches the table before the drop
+        sent.set()
+        release.wait(10)
+        return rows
+
+    fake.execute = slow  # type: ignore[method-assign]
+    early = threading.Thread(target=lambda: runs.record(a_run(status=201)))
+    early.start()
+    assert sent.wait(10)
+    fake.execute = real  # type: ignore[method-assign]
+    fake.created, fake.rows = False, []  # DROP TABLE
+    with pytest.raises(UsageUnavailable) as caught:
+        runs.record(a_run(status=202))
+    assert caught.value.code == "42P01"
+    release.set()
+    early.join(10)
+    # The next run provisions and is kept, whatever arrived in the meantime.
+    runs.record(a_run(status=203))
+    assert [row["status"] for row in fake.rows] == [203]
+    assert fake.tags()[-3:] == ["site_runs_table", "site_runs_index", "site_run"]
+    runs.record(a_run(status=204))
+    assert fake.tags()[-1] == "site_run" and fake.tags().count("site_runs_table") == 2
+
+
+def test_a_call_may_be_given_less_time_than_the_executor_has() -> None:
+    """``record(run, timeout=...)`` and ``stats`` hand the time that is left to an
+    executor that can be told (``within``); any other executor is used as it is."""
+    given: list[float] = []
+
+    class Timed(FakeRuns):
+        def within(self, seconds: float) -> Any:
+            given.append(seconds)
+            return self
+
+    fake = Timed()
+    runs = SiteRuns(fake, "xwalk", clock=lambda: NOW)
+    runs.record(a_run(), timeout=0.75)
+    runs.record(a_run())
+    runs.stats(1, timeout=3.5)
+    runs.create()
+    assert given == [0.75, 3.5] and len(fake.rows) == 2
+    plain, other = make()
+    plain.record(a_run(), timeout=0.75)
+    assert len(other.rows) == 1
+
+
 def test_a_failed_first_call_creates_the_table_on_the_next() -> None:
     runs, fake = make()
     fake.fail = PostgresError("down")

@@ -294,19 +294,34 @@ class _Flights:
 _USAGE_FLIGHTS = _Flights(USAGE_MAX_IN_FLIGHT)
 
 
-def _usage_store(settings: Settings, timeout: float) -> usage.SiteRuns | None:
+def _usage_store(settings: Settings, timeout: float, deadline: float) -> usage.SiteRuns | None:
     """Where runs are kept, or None when they are not: the stats passcode is unset, or
-    there is no database to keep them in. Raises ``ValueError`` for a connection string
-    or a schema that cannot be used."""
+    there is no database to keep them in. `deadline` (``time.monotonic()``) is the
+    caller's: the lock the instance's requests share is waited for no longer than to
+    it, and ``TimeoutError`` says that it was not had in time. Raises ``ValueError``
+    for a connection string or a schema that cannot be used."""
     if settings.stats_passcode is None or settings.database_url is None:
         return None
     key = (settings.database_url, settings.neon_schema, timeout)
-    with _USAGE_LOCK:
+    if not _USAGE_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise TimeoutError("the store of runs was not free in time")
+    try:
         found = _USAGE.get(key)
         if found is None:
             executor = make_usage_executor(settings.database_url, timeout)
             found = _USAGE[key] = usage.SiteRuns(executor, settings.neon_schema, clock=_now)
         return found
+    finally:
+        _USAGE_LOCK.release()
+
+
+def _time_left(deadline: float) -> float:
+    """The seconds to `deadline`; ``TimeoutError`` when there are none, so that what
+    has run out of time does not start."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("no time was left")
+    return left
 
 
 def _plain_address(headers: Mapping[str, str]) -> dict[str, str]:
@@ -378,15 +393,18 @@ def _record(
     nothing here can change it: every failure ends as ``log["usage"]``, the name of
     what went wrong.
 
-    Everything that can wait happens in a thread of its own, and this waits for that
-    thread no longer than ``USAGE_TIMEOUT_S``: finding or building the store (behind a
-    lock the instance's requests share) and the insert alike. The executor ends the
-    insert itself when the same number of seconds is up, on the clock, whatever the
-    database does (``make_usage_executor``), so the thread is over, and its place free,
-    when the wait is. A place is one of ``USAGE_MAX_IN_FLIGHT``; with all of them
+    One deadline covers the whole attempt: ``USAGE_TIMEOUT_S`` from the moment this is
+    called, on the monotonic clock. Everything that can wait happens in a thread of
+    its own, against that deadline: the lock the store is found behind is waited for
+    no longer than to it, a write that gets the lock after it does not start, and the
+    insert is given the time that is left and no more (``SiteRuns.record``), which the
+    executor keeps on the clock whatever the database does (``make_usage_executor``).
+    So the thread is over, and its place free, when the deadline is, and this waits
+    for it no longer. A place is one of ``USAGE_MAX_IN_FLIGHT``; with all of them
     taken a run is not recorded and does not wait (``usage: "saturated"``). That cap
     is what bounds an executor that does not keep a deadline (a test's, or a future
     one): it costs an instance four threads, not one per request."""
+    deadline = time.monotonic() + USAGE_TIMEOUT_S
     try:
         if settings.stats_passcode is None or settings.database_url is None:
             return
@@ -410,9 +428,9 @@ def _record(
 
         def send() -> None:
             try:
-                store = _usage_store(settings, USAGE_TIMEOUT_S)
+                store = _usage_store(settings, USAGE_TIMEOUT_S, deadline)
                 if store is not None:
-                    store.record(row)
+                    store.record(row, timeout=_time_left(deadline))
                 ended.append(None)
             except Exception as exc:  # noqa: BLE001 - named in the log, never raised
                 ended.append(getattr(exc, "kind", None) or type(exc).__name__)
@@ -427,7 +445,7 @@ def _record(
         except BaseException:
             _USAGE_FLIGHTS.leave()
             raise
-        thread.join(USAGE_TIMEOUT_S)
+        thread.join(max(0.0, deadline - time.monotonic()))
         outcome = ended[0] if ended else TimeoutError.__name__
         if isinstance(outcome, BaseException):
             raise outcome
@@ -467,12 +485,13 @@ def _stats(
                 status=400,
             )
     log["days"] = days
+    deadline = time.monotonic() + STATS_TIMEOUT_S  # for the store's lock and the read
     try:
-        store = _usage_store(settings, STATS_TIMEOUT_S)
+        store = _usage_store(settings, STATS_TIMEOUT_S, deadline)
         if store is None:
             raise usage.UsageUnavailable("site runs have no database")
-        data = store.stats(days, models=_known_models(settings))
-    except (usage.UsageUnavailable, ValueError) as exc:
+        data = store.stats(days, models=_known_models(settings), timeout=_time_left(deadline))
+    except (usage.UsageUnavailable, ValueError, TimeoutError) as exc:
         # The store exposes only the class and SQLSTATE; a ValueError may quote the URL.
         log["stats"] = str(exc) if isinstance(exc, usage.UsageUnavailable) else type(exc).__name__
         raise ServiceError(

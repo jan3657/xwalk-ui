@@ -696,24 +696,34 @@ class SiteRuns:
             raise _unavailable(exc) from None
         self._created = True
 
-    def record(self, run: Run) -> None:
-        """Store one run: one round trip. Raises ``UsageUnavailable`` when the database
-        cannot be asked; the caller must not let that reach the visitor."""
+    def record(self, run: Run, *, timeout: float | None = None) -> None:
+        """Store one run: one round trip. ``timeout`` is what the caller has left of
+        its own deadline, in seconds: an executor that can be told (``within``, as
+        ``deadline.DeadlineExecutor``) gets that and no more. Raises
+        ``UsageUnavailable`` when the database cannot be asked; the caller must not
+        let that reach the visitor."""
         document = json.dumps(asdict(run), ensure_ascii=False, allow_nan=False)
-        self._send((self._insert, (document,)))
+        self._send((self._insert, (document,)), timeout)
 
-    def stats(self, days: int = DEFAULT_DAYS, *, models: Collection[str] = ()) -> dict[str, Any]:
+    def stats(
+        self,
+        days: int = DEFAULT_DAYS,
+        *,
+        models: Collection[str] = (),
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         """The statistics of the last ``days`` UTC days, today included (1 to
         ``MAX_DAYS``, else ``ValueError``): one round trip. ``models`` are the ids the
         deployment lists (``run_of``): a model the table names that is none of them
-        is ``other`` in the answer. Raises ``UsageUnavailable`` when the database
-        cannot be asked or its answer cannot be read."""
+        is ``other`` in the answer. ``timeout`` as for ``record``. Raises
+        ``UsageUnavailable`` when the database cannot be asked or its answer cannot be
+        read."""
         if type(days) is not int or not 1 <= days <= MAX_DAYS:
             raise ValueError(f"days must be a whole number from 1 to {MAX_DAYS}")
         now = self._clock()
         last = datetime.fromtimestamp(now, tz=timezone.utc).date()
         first = last - timedelta(days=days - 1)
-        rows = self._send((self._stats, (first.isoformat(), last.isoformat())))
+        rows = self._send((self._stats, (first.isoformat(), last.isoformat())), timeout)
         try:
             answer = shape(rows[0]["stats"], days=days, generated_at=now, models=models)
             if len(answer["by_day"]) != days:
@@ -722,15 +732,20 @@ class SiteRuns:
             raise UsageUnavailable("site runs answered with an unreadable row") from None
         return answer
 
-    def _send(self, statement: Statement) -> list[dict[str, Any]]:
+    def _send(self, statement: Statement, timeout: float | None = None) -> list[dict[str, Any]]:
         """One round trip: the statement, behind the table's creation when this instance
         has not sent it yet. Returns the statement's rows."""
+        executor = self._executor
+        within = getattr(executor, "within", None)
+        if timeout is not None and callable(within):
+            executor = within(timeout)
+        provisioning = not self._created
         try:
-            if self._created:
-                rows = self._executor.execute(*statement)
-            else:
+            if provisioning:
                 lead: list[Statement] = [(self._create, ()), (self._index, ())]
-                rows = self._executor.transaction([*lead, statement])[-1]
+                rows = executor.transaction([*lead, statement])[-1]
+            else:
+                rows = executor.execute(*statement)
         except Exception as exc:
             failure = _unavailable(exc)
             if failure.code == _UNDEFINED_TABLE:
@@ -738,5 +753,9 @@ class SiteRuns:
                 # This statement is lost; the next one creates the table again.
                 self._created = False
             raise failure from None
-        self._created = True
+        if provisioning:
+            # Only a call that created the table says that it is there. A plain insert
+            # that succeeds says nothing: its answer may be late, from before a drop
+            # another call has found out about since.
+            self._created = True
         return rows
