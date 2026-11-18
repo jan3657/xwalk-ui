@@ -7,6 +7,7 @@ tmp_path and dense is always given an explicit directory (never the committed on
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -1814,13 +1815,19 @@ def test_the_stats_passcode_is_off_by_default_and_a_scrubbed_secret_when_set() -
     assert "NER_SITE_STATS_PASSCODE" in service.ENV_NAMES
 
 
-@pytest.mark.parametrize("value", ["short", "fifteen-chars-0", "x" * 15])
-def test_a_stats_passcode_shorter_than_sixteen_characters_is_refused(value: str) -> None:
+@pytest.mark.parametrize(
+    "value", ["short", "sixteen-chars-00", "twenty-three-chars-0000", "x" * 23]
+)
+def test_a_stats_passcode_shorter_than_twenty_four_characters_is_refused(value: str) -> None:
+    """Nothing limits guesses at ``/api/stats``, so the passcode has to be a generated
+    secret (``openssl rand -hex 24``), not a phrase."""
+    assert service.MIN_STATS_PASSCODE_CHARS == 24
     with pytest.raises(SettingsError) as exc:
         Settings.from_env({"NER_SITE_STATS_PASSCODE": value})
-    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "16" in str(exc.value)
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "24" in str(exc.value)
+    assert "openssl rand -hex 24" in str(exc.value)
     assert value not in str(exc.value)
-    assert Settings.from_env({"NER_SITE_STATS_PASSCODE": "x" * 16}).stats_passcode == "x" * 16
+    assert Settings.from_env({"NER_SITE_STATS_PASSCODE": "x" * 24}).stats_passcode == "x" * 24
 
 
 def test_a_stats_passcode_must_be_ascii_like_the_visitor_passcode() -> None:
@@ -1850,7 +1857,67 @@ def test_the_stats_passcode_makes_the_database_url_read(env: dict[str, str]) -> 
     assert s.database_url == DB_URL and DB_URL in s.secrets()
     # Bundled indexes still never see the database.
     assert s.index_settings().database_url is None
-    with pytest.raises(SettingsError, match="DATABASE_URL"):
-        Settings.from_env({**on, "DATABASE_URL": "mysql://u:p@h/db"})
     # Set without a database: the settings are still good; recording has nowhere to go.
     assert Settings.from_env({**on, "DATABASE_URL": ""}).database_url is None
+
+
+UNUSABLE_URLS = [
+    "mysql://u:p@h/db",
+    "https://ep-x.neon.tech/sql",
+    "postgresql://[half-a-bracket/db",
+    "postgresql://owner:pw@[::1/db",
+    "postgresql:///no-host",
+    "postgres://",
+    "ep-x-pooler.neon.tech",
+    "postgresql",
+]
+
+
+@pytest.mark.parametrize("url", UNUSABLE_URLS)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+        {
+            "NER_SITE_OFFLINE": "1",
+            "ANTHROPIC_API_KEY": "sk-ant-x",
+            "NER_SITE_OWN_PROVIDERS": "openai",
+        },
+    ],
+    ids=["bare", "openrouter_only", "offline", "offline_with_the_rest"],
+)
+def test_a_database_url_only_analytics_reads_cannot_break_the_settings(
+    env: dict[str, str], url: str
+) -> None:
+    """Where the stats passcode is the one reason ``DATABASE_URL`` is read, the site
+    ignored that variable until analytics was turned on. A value it cannot use must
+    then mean "no statistics", not a site that answers 503 everywhere."""
+    off = Settings.from_env({**env, "DATABASE_URL": url})
+    on = Settings.from_env({**env, "DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert on.database_url is None and on.stats_passcode == STATS_PASSCODE
+    assert dataclasses.replace(on, stats_passcode=None) == off
+    assert url not in on.secrets()
+
+
+@pytest.mark.parametrize(
+    "url", ["mysql://u:p@h/db", "https://ep-x.neon.tech/sql", "ep-x.neon.tech"]
+)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"NER_SITE_BACKEND": "neon"},
+        {"ANTHROPIC_API_KEY": "sk-ant-x"},
+        {"NER_SITE_OWN_PROVIDERS": "openai"},
+        {"NER_SITE_BACKEND": "neon", "NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["neon", "claude", "own_keys", "neon_offline"],
+)
+def test_a_database_url_the_site_needs_for_more_is_checked_as_strictly_as_before(
+    env: dict[str, str], url: str
+) -> None:
+    for extra in ({}, {"NER_SITE_STATS_PASSCODE": STATS_PASSCODE}):
+        with pytest.raises(SettingsError, match="DATABASE_URL") as exc:
+            Settings.from_env({**env, **extra, "DATABASE_URL": url})
+        assert url not in str(exc.value)

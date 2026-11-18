@@ -4138,3 +4138,49 @@ def test_the_executors_own_timeout_ends_an_abandoned_write(
         server.close()
         for connection in held:
             connection.close()
+
+
+@pytest.mark.parametrize(
+    "url", ["mysql://u:SENTINELpw@h/db", "postgresql://[half-a-bracket/db", "postgresql:///x"]
+)
+def test_an_unusable_database_url_for_analytics_alone_only_makes_stats_unavailable(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str
+) -> None:
+    """No ``runs`` fixture: building a usage executor here fails the test (conftest).
+    The deployment ignored ``DATABASE_URL`` until the stats passcode was set."""
+    base = {
+        "NER_SITE_CACHE_DIR": str(cache_dir),
+        "NER_SITE_DENSE_DIR": str(tmp_path / "no-dense"),
+        "NER_SITE_SELECTOR": "retrieval",
+        "OPENROUTER_API_KEY": SENTINEL_KEY,
+        "DATABASE_URL": url,
+    }
+    off = http_mod.env_settings(base)
+    on = http_mod.env_settings({**base, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert isinstance(off, Settings) and isinstance(on, Settings)
+    assert on.stats_passcode == STATS_PASSCODE and on.database_url is None
+
+    def run(settings: Settings) -> tuple[Any, dict[str, Any]]:
+        status, headers, body = _post(
+            settings, {"text": "x"}, llm_factory=_fake('{"entities": []}')
+        )
+        data = json.loads(body)
+        data.pop("timing_ms")
+        record = _last_log(capsys)
+        record.pop("timing_ms")
+        return (status, headers, data), record
+
+    before, before_log = run(off)
+    after, after_log = run(on)
+    assert before[0] == 200 and after == before
+    assert after_log == before_log and "usage" not in after_log
+    assert _health_of(on) == _health_of(off)
+    capsys.readouterr()
+    result = _stats(on)
+    assert _error(result) == (503, "stats_unavailable")
+    err = capsys.readouterr().err
+    assert json.loads(err.strip().splitlines()[-1])["stats"] == "site runs have no database"
+    assert "SENTINELpw" not in err and "half-a-bracket" not in err
+    assert _error(_stats(on, headers={})) == (401, "stats_passcode_required")
+    assert _error(_stats(on, headers={"x-stats-passcode": "no"})) == (401, "stats_passcode_invalid")
+    assert _error(_stats(off)) == (404, "not_found")

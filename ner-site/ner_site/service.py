@@ -134,9 +134,11 @@ MIN_SELECT_BUDGET_S = 5.0
 
 MAX_ERROR_DETAIL = 300
 MIN_SCRUBBED_CHARS = 8
-# The stats passcode guards the operator's numbers on a public site with no limiter in
-# front of it, so a short one is refused (site analytics design, section 3.1).
-MIN_STATS_PASSCODE_CHARS = 16
+# The stats passcode guards the operator's numbers on a public site, and nothing in
+# front of ``/api/stats`` limits how often it may be guessed: only a generated secret
+# will do, so anything shorter than ``openssl rand -hex 24`` at half its length is
+# refused (site analytics design, section 3.1 and "As built").
+MIN_STATS_PASSCODE_CHARS = 24
 
 # (env name, Limits field, lowest, highest). A value outside the range is a settings
 # error, not clamped: an operator who typed 500000 should learn that it was refused.
@@ -201,16 +203,30 @@ def _listed_own(env: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(p for p in (item.strip().lower() for item in raw.split(",")) if p))
 
 
-def uses_database(env: Mapping[str, str]) -> bool:
-    """The index backend, a live allowance or the record of runs (which the stats
-    passcode turns on) needs the URL, including in the settings cache."""
+def _site_uses_database(env: Mapping[str, str]) -> bool:
+    """Whether the index backend or a live allowance needs the URL: everything that
+    read it before there was a record of runs."""
     if env.get("NER_SITE_BACKEND", "").strip().lower() == "neon":
-        return True
-    if (env.get("NER_SITE_STATS_PASSCODE") or "").strip():
         return True
     if env.get("NER_SITE_OFFLINE", "").strip().lower() in _TRUE:
         return False
     return bool(env.get("ANTHROPIC_API_KEY", "").strip() or _listed_own(env))
+
+
+def uses_database(env: Mapping[str, str]) -> bool:
+    """The index backend, a live allowance or the record of runs (which the stats
+    passcode turns on) needs the URL, including in the settings cache."""
+    return _site_uses_database(env) or bool((env.get("NER_SITE_STATS_PASSCODE") or "").strip())
+
+
+def _usable_database_url(url: str) -> bool:
+    """Whether the executors can use `url`: a postgres:// or postgresql:// URL with a
+    host (``NeonHTTPExecutor``). Never raises, also for a URL that cannot be split."""
+    try:
+        parts = urlsplit(url)
+        return parts.scheme in {"postgres", "postgresql"} and bool(parts.hostname)
+    except ValueError:
+        return False
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:
@@ -351,7 +367,8 @@ class Settings:
             raise SettingsError("NER_SITE_STATS_PASSCODE must be ASCII (printable, no accents)")
         if stats_passcode is not None and len(stats_passcode) < MIN_STATS_PASSCODE_CHARS:
             raise SettingsError(
-                f"NER_SITE_STATS_PASSCODE must be at least {MIN_STATS_PASSCODE_CHARS} characters"
+                f"NER_SITE_STATS_PASSCODE must be at least {MIN_STATS_PASSCODE_CHARS} "
+                "characters; generate one, for example with: openssl rand -hex 24"
             )
 
         offline_raw = get("NER_SITE_OFFLINE").lower()
@@ -387,6 +404,17 @@ class Settings:
             raise SettingsError("NER_SITE_NEON_CATALOG=full needs NER_SITE_BACKEND=neon")
         own_providers = _own_providers(env)
         database_url = (get("DATABASE_URL") or None) if uses_database(env) else None
+        if (
+            database_url is not None
+            and not _site_uses_database(env)
+            and not _usable_database_url(database_url)
+        ):
+            # Read for the record of runs alone: until the stats passcode was set this
+            # deployment did not look at the variable, so a value that cannot be used
+            # must not become a settings error that answers 503 on every route. There
+            # are then no statistics (GET /api/stats says so, 503), and nothing else
+            # changes.
+            database_url = None
         if database_url is not None and urlsplit(database_url).scheme not in {
             "postgres",
             "postgresql",
