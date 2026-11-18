@@ -228,12 +228,24 @@ def uses_database(env: Mapping[str, str]) -> bool:
 
 def _usable_database_url(url: str) -> bool:
     """Whether the executors can use `url`: a postgres:// or postgresql:// URL with a
-    host (``NeonHTTPExecutor``). Never raises, also for a URL that cannot be split."""
+    plain host name (or a bracketed address) and, if it names a port, a port number in
+    range. Never raises: the URL parser leaves the port and the brackets to whoever
+    asks for them, and anything it stumbles on then means "not usable". A URL with a
+    space or a control character anywhere is not one either (the parser drops some of
+    them in silence, and the string is sent in a header as it is)."""
+    if any(ch.isspace() or not ch.isprintable() for ch in url):
+        return False
     try:
         parts = urlsplit(url)
-        return parts.scheme in {"postgres", "postgresql"} and bool(parts.hostname)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises for a port that is not a number in range
     except ValueError:
         return False
+    return (
+        parts.scheme in {"postgres", "postgresql"}
+        and bool(host)
+        and re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?|[0-9a-f:.]+", host or "") is not None
+    )
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:

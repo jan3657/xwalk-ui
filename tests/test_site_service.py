@@ -1870,6 +1870,13 @@ UNUSABLE_URLS = [
     "postgres://",
     "ep-x-pooler.neon.tech",
     "postgresql",
+    # A port the URL parser only looks at when it is asked for one.
+    "postgresql://owner:retrieval@ep-x.neon.tech:abc/db",
+    "postgresql://owner:pw@ep-x.neon.tech:99999/db",
+    "postgresql://owner:pw@ep-x.neon.tech:-1/db",
+    "postgresql://owner:pw@ep-x.neon.tech:54 32/db",
+    "postgresql://owner:pw@ep x.neon.tech/db",
+    "postgresql://owner:pw@ep-x.neon.tech\n/db",
 ]
 
 
@@ -1898,7 +1905,16 @@ def test_a_database_url_only_analytics_reads_cannot_break_the_settings(
     on = Settings.from_env({**env, "DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
     assert on.database_url is None and on.stats_passcode == STATS_PASSCODE
     assert dataclasses.replace(on, stats_passcode=None) == off
-    assert url not in on.secrets()
+    # Nothing of a URL that is not kept is a secret to scrub: a password that is also
+    # an ordinary word of the answers ("retrieval") would otherwise be redacted in them.
+    assert set(on.secrets()) - {STATS_PASSCODE} == set(off.secrets())
+    assert url not in on.secrets() and "retrieval" not in on.secrets()
+
+
+def test_a_usable_analytics_database_url_may_name_a_port() -> None:
+    url = "postgresql://owner:pw@ep-x.neon.tech:5432/db"
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url
 
 
 @pytest.mark.parametrize(
