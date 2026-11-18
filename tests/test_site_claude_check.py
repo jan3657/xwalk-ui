@@ -12,6 +12,7 @@ import json
 import socket
 import sys
 import threading
+import urllib.parse
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1677,3 +1678,119 @@ def test_ordinary_percent_signs_are_not_an_echo(
     assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 0
     out = capsys.readouterr().out
     assert ECHO_SAID not in out and "100% sure, 5%20 of the time, %zz" in out
+
+
+# --- re-review 3: the secret itself at the decoding limit ---------------------------------
+
+
+def nested(escape: str, times: int) -> str:
+    """`escape` (``%41``) with its percent sign escaped `times` - 1 times over: a value
+    that takes `times` rounds of decoding to come to rest."""
+    for _ in range(times - 1):
+        escape = escape.replace("%", "%25")
+    return escape
+
+
+# Astra's probe: a key that holds an escape nine layers deep. Decoding it eight times
+# (the tool's limit) does not reach its last form, the one a decoding server would echo.
+DEEP_KEY = f"sk-own-deepkey-{nested('%41', 9)}-0123456789"
+DEEP_KEY_DECODED = "sk-own-deepkey-A-0123456789"
+
+
+def test_the_probe_key_is_one_the_site_accepts_and_decodes_in_nine_rounds() -> None:
+    assert check._KEY.fullmatch(DEEP_KEY)
+    text = DEEP_KEY
+    for _ in range(9):
+        assert text != DEEP_KEY_DECODED
+        text = urllib.parse.unquote(text)
+    assert text == DEEP_KEY_DECODED
+    assert check._decodings(DEEP_KEY)[1] is False
+    # Eight rounds: seven that change the value and one that shows it has come to rest.
+    assert check.MAX_DECODINGS == 8
+    assert check._decodings(nested("%41", 7))[1] is True
+    assert check._decodings(nested("%41", 8))[1] is False
+
+
+@pytest.mark.parametrize("secret", ["key", "passcode"])
+def test_a_secret_escaped_more_deeply_than_the_tool_decodes_is_refused_and_nothing_is_sent(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    secret: str,
+) -> None:
+    """The response was checked against the decoding limit and the secret was not: with
+    this key the site's echo of its decoded form was printed and the run exited 0."""
+    stub.health["claude"] = {"status": "ok", "reason": f"saw {DEEP_KEY_DECODED}"}
+    stub.answer = lambda body: own_ok()
+    if secret == "key":
+        monkeypatch.setenv(KEY_ENV, DEEP_KEY)
+        argv = own_argv(stub)
+    else:
+        monkeypatch.setenv("CHECK_TEST_PASSCODE", DEEP_KEY)
+        argv = ["--url", stub.url, "--passcode-env", "CHECK_TEST_PASSCODE"]
+    with pytest.raises(SystemExit) as raised:
+        check.main([*argv, write(tmp_path, "a.txt", "a")])
+    assert raised.value.code == 2
+    assert stub.requests == []
+    captured = capsys.readouterr()
+    shown = captured.out + captured.err
+    assert "escapes nested more deeply" in shown and "nothing was sent" in shown
+    assert DEEP_KEY not in shown and DEEP_KEY_DECODED not in shown and "deepkey" not in shown
+
+
+def test_the_echo_search_itself_gives_no_verdict_for_such_a_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind the refusal at the start: asked about a secret it cannot decode to the
+    end, the search says "found" for every text, and nothing is printed as it is."""
+    monkeypatch.setattr(check, "_REDACTED", [DEEP_KEY])
+    monkeypatch.setattr(check, "_NO_VERDICT", [])
+    for text in (f"saw {DEEP_KEY_DECODED}", "nothing to see", ""):
+        assert check._holds(text) is True
+        assert check._redact(text) == "[redacted]"
+        assert check._scrub({"reason": text}) == ({"[redacted]": "[redacted]"}, True)
+    assert check._NO_VERDICT
+    # A key at the limit, not past it, is searched for as before.
+    edge = f"sk-own-edgekey-{nested('%41', 7)}-0123456789"
+    monkeypatch.setattr(check, "_REDACTED", [edge])
+    monkeypatch.setattr(check, "_NO_VERDICT", [])
+    assert check._holds("nothing to see") is False
+    assert check._holds("saw sk-own-edgekey-A-0123456789") is True
+    assert check._NO_VERDICT == []
+
+
+def test_a_value_too_deep_to_decode_fails_the_run_without_claiming_an_echo(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated value, escaped more deeply than the tool decodes, has no verdict.
+    The run fails, as it should, but the summary said the response contained the key."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    unrelated = f"trace {nested('%7E', 12)} end"
+    stub.health["claude"] = {"status": "ok", "reason": unrelated}
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 1
+    out = capsys.readouterr().out
+    summary = next(line for line in out.splitlines() if line.startswith("credential echo check"))
+    assert summary.startswith("credential echo check: FAILED, in 2 of 3 responses")
+    assert "was detected or could not be ruled out" in summary
+    assert "responses contained" not in summary and unrelated not in out
+
+
+def test_a_plain_echo_is_still_said_to_be_one(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.health["claude"] = {"status": "ok", "reason": f"saw {OWN_KEY}"}
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 1
+    out = capsys.readouterr().out
+    summary = next(line for line in out.splitlines() if line.startswith("credential echo check"))
+    assert "2 of 3 responses contained the API key or the passcode this run sent" in summary
+    assert "could not be ruled out" not in summary and OWN_KEY not in out

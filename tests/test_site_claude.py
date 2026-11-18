@@ -840,3 +840,74 @@ def test_key_status_without_a_key_makes_no_call() -> None:
         raise AssertionError("no request expected")
 
     assert key_status("", client=sync_sdk(handler)) == ("unavailable", "key not set")
+
+
+# --- a 200 that is not a message (re-review 3, item 6) ---------------------------------
+
+# An integer longer than Python's limit for converting digits: the decoder then raises a
+# plain ValueError, not a JSONDecodeError, before it reaches the end of the body.
+HUGE_INTEGER = b'{"id":"msg_1","n":' + b"9" * 4301 + b',"content":[{"type":"te'
+NOT_A_MESSAGE = {
+    "html": (b"<html><body>busy</body></html>", {"Content-Type": "text/html"}),
+    "html as json": (b"<html><body>busy</body></html>", {"Content-Type": "application/json"}),
+    "no content type, malformed": (b'{"id": "msg_1", "content": [', {}),
+    "no content type, empty": (b"", {}),
+    "huge integer": (HUGE_INTEGER, {"Content-Type": "application/json"}),
+    "huge integer, no content type": (HUGE_INTEGER, {}),
+    "echoing the key": (f"upstream says {KEY}".encode(), {"Content-Type": "text/plain"}),
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_A_MESSAGE), ids=list(NOT_A_MESSAGE))
+async def test_a_200_that_is_not_a_message_is_a_transient_failure(case: str) -> None:
+    """Without a JSON content type the SDK hands back the body as a string instead of
+    a message, which used to pass for an empty answer (a 422 after one call, with no
+    retry and no step-down); a body the decoder gives up on for another reason than
+    its syntax used to be a 500."""
+    content, headers = NOT_A_MESSAGE[case]
+    hits = 0
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal hits
+        hits += 1
+        return httpx2.Response(200, headers=headers, content=content)
+
+    client = make(real_sdk(handler))
+    with pytest.raises(LLMRetryableError) as caught:
+        await client.complete(LLMRequest(system="s", user="u"))
+    await client.aclose()
+    assert caught.value.reason == "transient"  # type: ignore[attr-defined]
+    assert str(caught.value) == "Anthropic answered 200 with a body that is not JSON"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert caught.value.usage == Usage.unreported()
+    assert hits == 1
+
+
+async def test_json_without_a_json_content_type_is_still_an_answer() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.dumps(wire_message(claude.OPUS)).encode()
+        return httpx2.Response(200, headers={"Content-Type": "text/plain"}, content=body)
+
+    client = make(real_sdk(handler))
+    response = await client.complete(LLMRequest(system="s", user="u"))
+    await client.aclose()
+    assert response.text == '{"entities": []}' and response.model == claude.OPUS
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("Streaming is required for operations that may take longer than 10 minutes"),
+        ValueError("Exceeds the limit (4300 digits) for integer string conversion"),
+        TypeError("create() got an unexpected keyword argument"),
+        KeyError("model"),
+    ],
+)
+async def test_an_error_that_is_not_the_decoders_still_propagates(error: Exception) -> None:
+    """Only what was raised while the body was being decoded is the provider's answer
+    being unreadable. The same class from anywhere else is a fault of this code or of
+    how the SDK was called, whatever its message says, and must stay one."""
+    client = make(FakeSDK(error))
+    with pytest.raises(type(error)) as caught:
+        await client.complete(LLMRequest(system="s", user="u"))
+    assert caught.value is error

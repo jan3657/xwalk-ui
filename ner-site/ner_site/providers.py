@@ -51,6 +51,7 @@ import dataclasses
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -698,6 +699,15 @@ class _Httpx2Wire(_Wire, httpx2.AsyncBaseTransport):
     _headers = httpx2.Headers
 
 
+# The dispatch the running task reserved from a ``_QuietBudget`` and has not reported
+# yet: (which budget, the dispatch's index). A client is shared by picks that run at
+# the same time, each in a task of its own, so this is kept per task, not on the
+# client. One variable for the module: a context variable is never collected.
+_OPEN_DISPATCH: ContextVar[tuple[int, int] | None] = ContextVar(
+    "ner_site_open_dispatch", default=None
+)
+
+
 class _QuietBudget:
     """What the engine's client reserves from and reports to: the real budget, told only
     the machine word of a failed request. A budget remembers the last failure and quotes
@@ -707,10 +717,24 @@ class _QuietBudget:
         self._budget = budget
 
     def acquire(self) -> int:
-        return self._budget.acquire()
+        index = self._budget.acquire()
+        _OPEN_DISPATCH.set((id(self), index))
+        return index
 
     def settle(self, index: int, error: str | None) -> None:
+        if _OPEN_DISPATCH.get() == (id(self), index):
+            _OPEN_DISPATCH.set(None)
         self._budget.settle(index, None if error is None else _from_text(error))
+
+    def settle_open(self, word: str) -> None:
+        """Report the dispatch the client reserved and never reported, as `word`. The
+        engine's client reports every request it gets an answer or an HTTP error for;
+        what the wire raises on its own (``_Unreadable``) passes through it unreported,
+        and the budget would go on saying the provider is well."""
+        found = _OPEN_DISPATCH.get()
+        if found is not None and found[0] == id(self):
+            _OPEN_DISPATCH.set(None)
+            self._budget.settle(found[1], word)
 
 
 class _Sealed:
@@ -767,6 +791,7 @@ class _Sealed:
             elif _raised_from(exc, _Unreadable):
                 # An answer arrived and could not be decoded; the libraries report
                 # that too as a dropped connection, or not at all.
+                self._unread()
                 failure = LLMRetryableError(
                     f"{_name(self._provider)} request failed (bad_answer)",
                     usage=getattr(failure, "usage", None),
@@ -778,6 +803,10 @@ class _Sealed:
         # new error's context nor kept alive by its traceback.
         raise failure
 
+    def _unread(self) -> None:
+        """An answer could not be decoded. Nothing to do here: the wrapper around this
+        client settles the call (``BudgetedLLM``). ``_SealedGated`` has to."""
+
     async def aclose(self) -> None:
         close = getattr(self._inner, "aclose", None)
         if callable(close):
@@ -788,8 +817,17 @@ class _SealedGated(_Sealed):
     """``_Sealed`` over the engine's OpenAI-compatible client, which reserves from the
     call budget itself, once per HTTP request (``BudgetedLLM`` looks for this hook)."""
 
+    _quiet: _QuietBudget | None = None
+
     def attach_call_budget(self, budget: CallBudget) -> None:
-        self._inner.attach_call_budget(_QuietBudget(budget))  # type: ignore[attr-defined]
+        self._quiet = _QuietBudget(budget)
+        self._inner.attach_call_budget(self._quiet)  # type: ignore[attr-defined]
+
+    def _unread(self) -> None:
+        # Before the failure leaves: the dispatch the engine's client reserved for the
+        # request is still open, because what the wire raised went straight through it.
+        if self._quiet is not None:
+            self._quiet.settle_open("bad_answer")
 
 
 class _NamesOnly(CallBudget):

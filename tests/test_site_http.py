@@ -3037,10 +3037,11 @@ def test_a_malformed_200_during_extraction_is_the_providers_bad_answer_not_a_500
 # --- an unreadable 200 on the site's own Anthropic key (after the third review round) ---
 
 
-def _site_claude(script: dict[str, list[bytes | None]], seen: list[str]) -> Any:
+def _site_claude(script: dict[str, list[Any]], seen: list[str]) -> Any:
     """The real adapter and SDK on the operator's key over a mock Anthropic. `script`
-    gives each model its answers in order: bytes are sent as the 200 body as they are,
-    None is a good answer; the last one repeats."""
+    gives each model its answers in order: bytes are sent as the 200 body as they are
+    (as JSON; a pair of bytes and headers under those headers), None is a good answer;
+    the last one repeats."""
     import anthropic
     import httpx2
     from ner_site.claude import ClaudeClient
@@ -3050,6 +3051,10 @@ def _site_claude(script: dict[str, list[bytes | None]], seen: list[str]) -> Any:
         seen.append(model)
         steps = script[model]
         step = steps.pop(0) if len(steps) > 1 else steps[0]
+        if isinstance(step, tuple):  # a body with the headers it is sent under
+            content, headers = step
+            typed = {"Content-Type": "application/json"} if headers is None else headers
+            return httpx2.Response(200, headers=typed, content=content)
         if step is not None:
             return httpx2.Response(200, headers={"Content-Type": "application/json"}, content=step)
         body = {
@@ -4344,3 +4349,91 @@ def test_an_own_key_run_that_failed_after_an_answer_records_its_tokens(
     (row,) = _recorded(runs)
     assert (row["credential"], row["model"], row["llm_calls"]) == ("visitor", "gpt-6-luna", 1)
     assert row["prompt_tokens"] > 0
+
+
+# --- own-key leftovers (re-review 3) ----------------------------------------------------
+
+
+@pytest.mark.parametrize("refused_at", [0, 4, 9])
+def test_own_errors_always_lists_the_class_named_in_own_error(refused_at: int) -> None:
+    """With nine other classes the list was cut to eight, sorted, and ``WireRefused``,
+    the one ``own_error`` names, fell off its end."""
+    from ner_site import providers
+
+    log: dict[str, Any] = {}
+    client = http_mod._OwnJSONClient(
+        None,  # type: ignore[arg-type]
+        SimpleNamespace(token=lambda: OWN_KEY, provider="openai"),  # type: ignore[arg-type]
+        log,
+    )
+    others = [f"Failure{n}" for n in range(9)]
+    names = [*others[:refused_at], providers.WireRefused.__name__, *others[refused_at:]]
+    for name in names:
+        client._failed(name)
+        assert log["own_error"] in log.get("own_errors", [log["own_error"]])
+    assert log["own_error"] == "WireRefused"
+    assert log["own_errors"] == sorted(names) and len(log["own_errors"]) == 10
+    # One class alone is named once, in own_error only.
+    alone: dict[str, Any] = {}
+    one = http_mod._OwnJSONClient(None, SimpleNamespace(token=lambda: OWN_KEY), alone)  # type: ignore[arg-type]
+    one._failed("LLMRetryableError")
+    one._failed("LLMRetryableError")
+    assert alone == {"own_error": "LLMRetryableError"}
+    assert not hasattr(http_mod._OwnJSONClient, "MAX_OWN_ERRORS")
+
+
+NOT_A_MESSAGE = [
+    (b"<html><body>busy</body></html>", {"Content-Type": "text/html"}),
+    (b'{"id": "msg_1", "content": [', {}),
+    (b'{"id":"msg_1","n":' + b"9" * 4301 + b',"content":[{"type":"te', None),
+    (b'{"id":"msg_1","n":' + b"9" * 4301 + b',"content":[{"type":"te', {}),
+]
+
+
+@pytest.mark.parametrize(
+    ("body", "headers"),
+    NOT_A_MESSAGE,
+    ids=["html", "no content type", "huge integer", "huge integer, no content type"],
+)
+def test_a_200_that_is_not_a_message_from_opus_twice_ends_on_sonnet(
+    body: bytes,
+    headers: dict[str, str] | None,
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Re-review 3: an HTML page or a body without a content type was read as an empty
+    answer (422 after one call), and a body the decoder gives up on with a plain
+    ``ValueError`` was a 500. Both are the provider failing, like any unreadable 200."""
+    seen: list[str] = []
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"text": HALO_TEXT},
+        claude=_site_claude({OPUS: [(body, headers)], SONNET: [None]}, seen),
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert seen == [OPUS, OPUS, SONNET]
+    assert (out["model"], out["requested_model"]) == (SONNET, OPUS)
+    assert out["fallbacks"] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": "transient"}
+    ]
+    assert out["entities"][0]["text"] == "haloperidol"
+    record = _last_log(capsys)
+    assert record["status"] == 200 and "exception" not in record
+
+
+def test_a_200_that_is_not_a_message_on_every_step_is_a_provider_error_not_a_422(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    seen: list[str] = []
+    page = (b"<html>busy</html>", {"Content-Type": "text/html"})
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"text": HALO_TEXT},
+        claude=_site_claude({OPUS: [page], SONNET: [page]}, seen),
+        llm_factory=_fake(LLMRetryableError("the last step is down too")),
+    )
+    assert _error(result) == (502, "provider_error")
+    assert seen[:3] == [OPUS, OPUS, SONNET]

@@ -31,7 +31,10 @@ neither is ever printed: should the site echo one, it is replaced by ``[redacted
 everything this tool prints, and because a redacted report cannot show that a response
 was clean, the tool says so itself: a response that contains the key or the passcode, in
 its body or a header, is marked ``CREDENTIAL ECHO``, fails the run, and the last line
-of a run that sent a secret says whether any response did.
+of a run that sent a secret says whether any response did. A value escaped more deeply
+than the tool decodes gets no verdict and is treated as an echo (withheld, the run
+fails, and the last line says an echo was detected or could not be ruled out); a key
+or passcode that is itself escaped that deeply is refused before anything is sent.
 
 Usage (standard library only; any Python 3.10 or later)::
 
@@ -136,6 +139,10 @@ ECHO = (
 # What must never be printed (the passcode and the API key of this run), whoever sent
 # it back.
 _REDACTED: list[str] = []
+# Filled when the search for a secret came to no verdict because a value was escaped
+# more deeply than this tool decodes (``_spelled_in``): the summary then says that an
+# echo could not be ruled out, instead of claiming one was seen.
+_NO_VERDICT: list[bool] = []
 # A secret shorter than this is still redacted, but a response is not said to echo it:
 # a passcode like "ok" is part of every answer (ner_site.service.MIN_SCRUBBED_CHARS).
 MIN_ECHO_CHARS = 8
@@ -177,12 +184,17 @@ def _spelled_in(text: str, shortest: int) -> bool:
     percent decoding. Every layer is looked at, not only the last: a secret that
     itself holds ``%20`` shows after one decoding and is gone after the next. A value
     that is still changing when the decoding stops gives no verdict, and no verdict
-    counts as a secret: it is withheld and reported, never passed."""
+    counts as a secret: it is withheld and reported, never passed. That holds for
+    either side: a secret whose own escapes go deeper than the tool decodes has forms
+    this search never reaches (the last one is what a decoding server would send
+    back), so with such a secret no text at all gets a verdict. (``main`` refuses to
+    run with one; this is what stands behind that.)"""
     secrets = [secret for secret in _REDACTED if len(secret) >= shortest]
     if not secrets:
         return False
     layers, settled = _decodings(text)
-    if not settled:
+    if not settled or not all(_decodings(secret)[1] for secret in secrets):
+        _NO_VERDICT.append(True)
         return True
     # A secret that holds escapes of its own may come back with only some characters
     # escaped, and then no layer of the value equals it: decoding the value resolves
@@ -946,8 +958,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             flag for flag, secret in (("--passcode-env", passcode), ("--key-env", key)) if secret
         )
         parser.error(f"{sent} sends a secret: --url must be https (or this machine)")
+    for flag, secret in (("--passcode-env", passcode), ("--key-env", key)):
+        if secret and not _decodings(secret)[1]:
+            # The echo check looks for a secret in every form its own escapes decode
+            # to, and stops after MAX_DECODINGS rounds. Past that it could not tell a
+            # response that echoes this value from one that does not, and would print
+            # the echo. No verdict is not a pass: the run is not made.
+            parser.error(
+                f"the value {flag} names holds percent escapes nested more deeply than "
+                f"this tool decodes ({MAX_DECODINGS} rounds), so a response that echoed "
+                "it could not be recognised; nothing was sent"
+            )
     # Longest first, so that one secret inside the other leaves no remainder behind.
     _REDACTED[:] = sorted((s for s in (passcode, key) if s), key=len, reverse=True)
+    _NO_VERDICT.clear()
     texts: list[tuple[str, str]] = []
     for file in args.files:
         try:
@@ -1019,7 +1043,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The report above is redacted, so it cannot itself show that nothing came back.
         responses = [before, *answers, after]
         echoes = sum(1 for answer in responses if answer.echoed)
-        if echoes:
+        if echoes and _NO_VERDICT:
+            # Not "contained": a value escaped more deeply than this tool decodes was
+            # withheld without a verdict, and may have nothing to do with a secret.
+            code = 1
+            say(
+                f"credential echo check: FAILED, in {echoes} of {len(responses)} responses "
+                "an echo of the API key or the passcode this run sent was detected or "
+                "could not be ruled out (a value escaped more deeply than "
+                f"{MAX_DECODINGS} rounds of percent decoding gets no verdict)"
+            )
+        elif echoes:
             code = 1
             say(
                 f"credential echo check: FAILED, {echoes} of {len(responses)} responses "

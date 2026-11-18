@@ -759,11 +759,10 @@ class _OwnJSONClient:
     Picks fail side by side and for different reasons. ``own_error`` is the first
     class seen, except that ``WireRefused`` (the site's own guard stopped a request)
     takes its place whenever it occurs: a provider failing is ordinary, that is not.
-    When there was more than one class, ``own_errors`` lists them all, sorted, at
-    most ``MAX_OWN_ERRORS``.
+    When there was more than one class, ``own_errors`` lists them all, sorted: every
+    one, so that the class ``own_error`` names is always among them (they are class
+    names of this code and its libraries, a handful at most).
     """
-
-    MAX_OWN_ERRORS = 8
 
     def __init__(
         self, client: LLMClient, credential: providers.Credential, log: dict[str, Any]
@@ -789,7 +788,7 @@ class _OwnJSONClient:
         first = log.get("own_error")
         seen = sorted({*log.get("own_errors", [first] if first else []), name})
         if len(seen) > 1:
-            log["own_errors"] = seen[: self.MAX_OWN_ERRORS]
+            log["own_errors"] = seen
         if first is None or name == providers.WireRefused.__name__:
             log["own_error"] = name
 
