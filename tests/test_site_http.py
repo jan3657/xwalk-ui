@@ -1312,6 +1312,7 @@ def test_the_eleventh_request_runs_on_sonnet_and_the_thirty_first_is_refused(
     unit = "minute" if minutes == 1 else "minutes"
     assert _json(refused)["error"]["message"] == (
         f"you have used this hour's requests; try again in {minutes} {unit}"
+        ", or use your own API key"
     )
     _assert_common_headers(refused[1])
     assert claude.made == {} and _tiers(visits) == {"opus": 10, "sonnet": 20}  # not recorded
@@ -1338,30 +1339,23 @@ def test_a_request_for_sonnet_is_counted_as_sonnet(
     assert (OPUS, "extract") not in claude.made  # the chain starts at the wanted model
 
 
-def test_an_unreachable_limiter_means_sonnet_uncounted_with_a_notice(
+def test_an_unreachable_limiter_refuses_every_site_model(
     cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from xwalk.retrieval.postgres import PostgresError
 
     visits.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({DB_URL})", code="08006")
     s = _open_site(cache_dir, tmp_path)
-    result = _ask(s)
-    assert result[0] == 200
-    out = _json(result)
-    assert out["model"] == SONNET
-    assert out["fallbacks"] == [
-        {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "limits_unavailable"}
-    ]
-    assert out["notices"] == ["Visitor limits are unavailable; this ran on Claude Sonnet 5.5."]
+    for model in (OPUS, SONNET, GEMINI):
+        result = _ask(s, {"model": model}, claude=_no_claude)
+        assert _error(result) == (503, "limits_unavailable")
+        assert _json(result)["error"]["message"] == (
+            "the site cannot count requests right now; try again shortly, or use your own API key"
+        )
+        assert result[1]["Retry-After"] == "30"
     assert visits.rows == {}
     err = capsys.readouterr().err
-    record = json.loads(err.strip().splitlines()[-1])
-    assert record["tier"] == "sonnet" and "PostgresError" in record["limits"]
-    assert "ep-x-pooler" not in err and "SENTINELpw" not in err
-    # A request for Sonnet or for an OpenRouter model runs as asked, uncounted.
-    assert _json(_ask(s, {"model": SONNET}))["fallbacks"] == []
-    plain = _ask(s, {"model": GEMINI}, llm_factory=_fake('{"entities": []}'), claude=_no_claude)
-    assert plain[0] == 200 and _json(plain)["fallbacks"] == [] and visits.rows == {}
+    assert "PostgresError" in err and "ep-x-pooler" not in err and "SENTINELpw" not in err
 
 
 def test_a_contended_visitor_lock_is_a_429_and_no_chain_is_built(
@@ -1388,10 +1382,9 @@ def test_a_contended_visitor_lock_is_a_429_and_no_chain_is_built(
     assert record["status"] == 429 and record["code"] == "visitor_limit_reached"
     assert "55P03" in record["limits"] and "tier" not in record
     assert "ep-x-pooler" not in err and "SENTINELpw" not in err
-    # Any other database failure keeps its meaning: Sonnet, uncounted, with the notice.
+    # Other database failures use the temporary outage response.
     visits.fail = PostgresError("could not serialize access", code="40001")
-    out = _json(_ask(s))
-    assert out["model"] == SONNET and out["fallbacks"][0]["reason"] == "limits_unavailable"
+    assert _error(_ask(s, claude=_no_claude)) == (503, "limits_unavailable")
     assert "40001" in _last_log(capsys)["limits"]
 
 
@@ -1455,13 +1448,13 @@ def test_an_index_failure_is_not_a_counted_visit(
     assert opened == [1] and _tiers(visits) == {"opus": 1}  # opened once, then passed on
 
 
-def test_without_a_database_an_open_site_starts_on_sonnet_and_a_private_one_on_opus(
+def test_without_a_database_an_open_site_is_blocked_and_a_private_one_unmetered(
     cache_dir: Path, tmp_path: Path
 ) -> None:
     open_site = _open_site(cache_dir, tmp_path, DATABASE_URL="")
-    out = _json(_ask(open_site))
-    assert out["model"] == SONNET
-    assert out["fallbacks"][0]["reason"] == "limits_unavailable" and len(out["notices"]) == 1
+    refused = _ask(open_site, claude=_no_claude)
+    assert _error(refused) == (503, "limits_unavailable")
+    assert _json(refused)["error"]["message"] == "visitor limits are not configured"
     private = _open_site(cache_dir, tmp_path, DATABASE_URL="", NER_SITE_PASSCODE=PASSCODE)
     headers = {**VISITOR_HEADERS, "x-passcode": PASSCODE}
     for _ in range(12):  # unmetered: Opus every time
@@ -1714,8 +1707,10 @@ def test_every_step_failing_is_a_502_whose_log_line_says_how_far_it_went(
     assert _tiers(visits) == {"opus": 1}  # admitted, so counted, though it failed later
 
 
-def test_only_the_anthropic_key_is_a_configured_site(cache_dir: Path, tmp_path: Path) -> None:
-    s = _open_site(cache_dir, tmp_path, OPENROUTER_API_KEY="", DATABASE_URL="")
+def test_only_the_anthropic_key_is_a_configured_site(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path, OPENROUTER_API_KEY="")
     limited = _claude_error("rate_limited")
     out = _json(_ask(s, {"model": SONNET}, claude=_Claude(sonnet_extract=[limited])))
     # The chain ends at Sonnet: its error is the provider error, scrubbed.
@@ -1751,7 +1746,9 @@ def test_health_reports_claude_and_the_calling_visitors_allowance(
     assert health["models"][:2] == [OPUS, SONNET] and health["passcode_required"] is False
     assert health["claude"] == {"status": "ok"} and health["llm"] == {"status": "ok"}
     visitor = health["visitor"]
-    assert set(visitor) == {"limits", "tier", "opus_left", "sonnet_left", "resets_in_s"}
+    assert visitor["window"] == "hour" and 1 <= visitor["day_resets_in_s"] <= 86400
+    assert (visitor["opus_left_today"], visitor["sonnet_left_today"]) == (20, 40)
+    assert (visitor["own_left"], visitor["own_left_today"]) == (30, 60)
     assert (visitor["limits"], visitor["tier"]) == ("on", "opus")
     assert (visitor["opus_left"], visitor["sonnet_left"]) == (10, 20)
     assert 1 <= visitor["resets_in_s"] <= 3600
@@ -1834,10 +1831,10 @@ def test_health_with_the_limiter_unreachable_or_off(
 
     visits.fail = PostgresError("could not reach Neon at ep-x-pooler", code="08006")
     down = _health_of(_open_site(cache_dir, tmp_path))["visitor"]
-    assert (down["limits"], down["tier"]) == ("unavailable", "sonnet")
-    assert (down["opus_left"], down["sonnet_left"]) == (0, 20) and down["resets_in_s"] >= 1
+    assert (down["limits"], down["tier"]) == ("unavailable", "blocked")
+    assert (down["opus_left"], down["sonnet_left"]) == (0, 0) and down["resets_in_s"] >= 1
     off = _health_of(_open_site(cache_dir, tmp_path, DATABASE_URL=""))["visitor"]
-    assert (off["limits"], off["tier"], off["opus_left"]) == ("off", "sonnet", 0)
+    assert (off["limits"], off["tier"], off["opus_left"]) == ("unavailable", "blocked", 0)
     private = _open_site(cache_dir, tmp_path, DATABASE_URL="", NER_SITE_PASSCODE=PASSCODE)
     unmetered = _health_of(private)["visitor"]
     assert (unmetered["limits"], unmetered["tier"]) == ("off", "opus")
@@ -1877,5 +1874,619 @@ def test_the_limiter_is_kept_per_warm_instance_and_reset_forgets_it(
     bad = _open_site(cache_dir, tmp_path, DATABASE_URL="postgresql:///nohost")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(http_mod, "make_limits_executor", REAL_LIMITS_EXECUTOR)
-        out = _json(_ask(bad))
-    assert out["fallbacks"][0]["reason"] == "limits_unavailable"
+        result = _ask(bad, claude=_no_claude)
+    assert _error(result) == (503, "limits_unavailable")
+
+
+OWN_KEY = 'visitor-sentinel-"quoted"-\\tail'
+OWN_HEADERS = {**VISITOR_HEADERS, "Authorization": "Bearer " + OWN_KEY}
+
+
+@pytest.fixture
+def own_clients(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    from ner_site import providers
+
+    made = []
+
+    class Client(FakeLLM):
+        async def aclose(self) -> None:
+            made.append(("closed", self.model, ""))
+
+    def build(credential: Any, model: str, *, purpose: str, **options: Any) -> Any:
+        assert credential.token() == OWN_KEY
+        made.append((credential.provider, model, purpose))
+        return Client([HALO if purpose == "extract" else PICK], model=model)
+
+    def never(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("an own-key run reached a site client, key probe or Claude block")
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    for name in ("make_chain", "make_select_llm", "make_decider", "check_key", "check_claude_key"):
+        monkeypatch.setattr(http_mod, name, never)
+    monkeypatch.setattr(http_mod.fallback, "claude_block", never)
+    return made
+
+
+@pytest.mark.parametrize(
+    "provider,model", [("anthropic", OPUS), ("openai", "gpt-6-luna"), ("openrouter", GEMINI)]
+)
+def test_own_stages_use_only_the_chosen_provider(
+    provider: str,
+    model: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    own_clients: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _settings(cache_dir, tmp_path, DATABASE_URL=DB_URL)
+    result = _ask(
+        s, {"provider": provider, "text": HALO_TEXT, "selector": model}, headers=OWN_HEADERS
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert (out["provider"], out["credential_source"], out["model"]) == (provider, "visitor", model)
+    assert out["fallbacks"] == out["notices"] == []
+    assert out["entities"][0]["pick"]["selector"] == model
+    assert own_clients[:2] == [(provider, model, "extract"), (provider, model, "select")]
+    assert own_clients.count(("closed", model, "")) == 2
+    assert _tiers(visits) == {"own": 1}
+    assert OWN_KEY not in str(visits.sent)
+    record = _last_log(capsys)
+    assert (record["provider"], record["credential"], record["tier"]) == (
+        provider,
+        "visitor",
+        "own",
+    )
+
+
+@pytest.mark.parametrize("database", ["", DB_URL])
+def test_own_runs_when_site_limits_unavailable(
+    database: str, cache_dir: Path, tmp_path: Path, visits: Any, own_clients: Any
+) -> None:
+    visits.fail = RuntimeError("database unavailable")
+    s = _open_site(cache_dir, tmp_path, DATABASE_URL=database)
+    result = _post(
+        s, {"text": HALO_TEXT, "provider": "anthropic"}, headers=OWN_HEADERS, llm_factory=_never
+    )
+    assert result[0] == 200 and _json(result)["selector"] == "retrieval"
+    assert own_clients == [("anthropic", OPUS, "extract"), ("closed", OPUS, "")]
+    assert visits.rows == {}
+
+
+def test_own_refusals_precede_admission_and_construction(
+    cache_dir: Path, tmp_path: Path, visits: Any, own_clients: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    payload = {"provider": "openai"}
+    headers = {**OWN_HEADERS, "X-Passcode": PASSCODE}
+    duplicate = {"authorization": OWN_HEADERS["Authorization"]}
+    for body, sent, error in [
+        (payload, {**OWN_HEADERS, **duplicate}, (401, "passcode_required")),
+        (payload, {**headers, **duplicate}, (400, "bad_credential")),
+        (payload, {**headers, "Authorization": ["Bearer " + OWN_KEY] * 2}, (400, "bad_credential")),
+        ({**payload, "prompt": 3}, headers, (400, "bad_json")),
+        ({**payload, "text": OWN_KEY}, headers, (400, "bad_credential")),
+        ({**payload, "model": OWN_KEY}, headers, (400, "unknown_model")),
+        ({**payload, "selector": "jev"}, headers, (400, "unknown_selector")),
+        ({"provider": "site"}, headers, (400, "bad_credential")),
+    ]:
+        result = _ask(s, body, headers=sent)
+        assert _error(result) == error
+        assert OWN_KEY not in _json(result)["error"]["message"]
+    assert not visits.sent and not own_clients
+
+
+def test_duplicate_authorization_survives_shim(
+    cache_dir: Path, tmp_path: Path, own_clients: Any
+) -> None:
+    from email.message import Message
+    from io import BytesIO
+    from types import SimpleNamespace
+
+    body = b'{"text":"x","provider":"openai"}'
+    headers = Message()
+    for k, v in {**OWN_HEADERS, "content-length": str(len(body))}.items():
+        headers[k] = v
+    headers["authorization"] = "Bearer " + OWN_KEY
+    request = SimpleNamespace(headers=headers, command="POST", path="/api/ner", rfile=BytesIO(body))
+    result = http_mod._shim_response(request, _settings(cache_dir, tmp_path))
+    assert _error(result) == (400, "bad_credential")
+    assert "exactly one" in _json(result)["error"]["message"]
+    assert not own_clients
+
+
+@pytest.mark.parametrize("window,own", [("day", False), ("hour", True), ("day", True)])
+def test_daily_and_own_flood_limit_wording(
+    window: str,
+    own: bool,
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(http_mod, "_now", lambda: 43200)
+    env = (
+        {"NER_SITE_OWN_PER_" + window.upper(): "0"}
+        if own
+        else {"NER_SITE_SONNET_PER_DAY": "0", "NER_SITE_OPUS_PER_DAY": "0"}
+    )
+    s = _open_site(cache_dir, tmp_path, **env)
+    result = _ask(
+        s, {"provider": "openai"} if own else {}, headers=OWN_HEADERS if own else VISITOR_HEADERS
+    )
+    assert _error(result) == (429, "visitor_limit_reached")
+    seconds = 3600 if window == "hour" else 43200
+    assert result[1]["Retry-After"] == str(seconds)
+    expected = (
+        f"too many requests with your own key; try again in {seconds // 60} minutes"
+        if own
+        else "you have used today's requests; they reset at midnight UTC, or use your own API key"
+    )
+    assert _json(result)["error"]["message"] == expected
+
+
+def test_health_lists_own_models_even_without_site_credentials(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    fixture = json.loads((PROJECT / "tools/fixtures/health.json").read_text())
+    assert _health_of(_settings(cache_dir, tmp_path))["own_keys"] == fixture["own_keys"]
+    health = _health_of(
+        _settings(
+            cache_dir,
+            tmp_path,
+            NER_SITE_OWN_PROVIDERS="openai",
+            NER_SITE_OWN_MODELS_OPENAI="custom,second",
+        )
+    )
+    assert health["own_keys"] == {
+        "enabled": True,
+        "providers": [
+            {
+                "id": "openai",
+                "name": "OpenAI",
+                "models": ["custom", "second"],
+                "default_model": "custom",
+            }
+        ],
+    }
+    assert _health_of(_settings(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=""))["own_keys"] == {
+        "enabled": False,
+        "providers": [],
+    }
+
+
+def test_concurrent_own_requests_keep_keys_local(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ner_site import providers
+
+    barrier = threading.Barrier(2)
+    keys = [OWN_KEY, 'other-sentinel-"-key-\\0002']
+    s = _open_site(cache_dir, tmp_path, DATABASE_URL="")
+
+    def build(credential: Any, model: str, **kwargs: Any) -> Any:
+        key = credential.token()
+
+        def reply(request: Any) -> str:
+            barrier.wait(timeout=5)
+            label = "first" if key == keys[0] else "second"
+            return _answer((label, "other", 0, len(label)), (key, "other", 0, 0))
+
+        class Client(FakeLLM):
+            async def aclose(self) -> None:
+                pass
+
+        return Client(handler=reply, model=model)
+
+    real_log = http_mod._log
+
+    def log(record: dict[str, Any], *args: Any) -> None:
+        record["nested"] = [keys[0 if record["text_chars"] == 5 else 1]]
+        real_log(record, *args)
+
+    monkeypatch.setattr(http_mod, "_log", log)
+    monkeypatch.setattr(providers, "own_llm", build)
+
+    def send(pair: tuple[str, str]) -> Handled:
+        key, label = pair
+        return _ask(
+            s,
+            {"provider": "openai", "text": label},
+            headers={**VISITOR_HEADERS, "Authorization": "Bearer " + key},
+            claude=_no_claude,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(send, zip(keys, ("first", "second"), strict=True)))
+    for result, label in zip(results, ("first", "second"), strict=True):
+        assert result[0] == 200, result[2]
+        out = _json(result)
+        assert [e["text"] for e in out["entities"]] == [label]
+        assert "[redacted]" in str(out["warnings"])
+        for key in keys:
+            assert json.dumps(key)[1:-1] not in result[2].decode() and key not in str(result[1])
+            assert all(key not in w for w in out["warnings"])
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        assert json.loads(line)["credential"] == "visitor"
+        assert json.loads(line)["nested"] == ["[redacted]"]
+        assert all(key not in line and json.dumps(key)[1:-1] not in line for key in keys)
+
+
+def test_own_fixture_errors_match_the_real_credential_reader(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    directory = PROJECT / "tools/fixtures"
+    s = _settings(cache_dir, tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "serve_local_own_test", PROJECT / "tools/serve_local.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    backend = module.canned_backend(directory, "")
+    for provider, value in [
+        ("openai", ""),
+        ("openai", "Bearer short"),
+        ("openai", "Token abc"),
+        ("site", "Bearer " + OWN_KEY),
+        ("disabled", "Bearer " + OWN_KEY),
+    ]:
+        headers = {**POST_HEADERS, **({"authorization": value} if value else {})}
+        body = {"provider": provider, "text": "sample"}
+        real = _post(s, body, headers=headers, llm_factory=_never)
+        canned = backend("POST", "/api/ner", headers, json.dumps(body).encode())
+        assert _json(canned) == _json(real)
+        if value == "Bearer short":
+            assert _json(real) == json.loads((directory / "error-own-bad.json").read_text())
+
+
+def test_disabled_own_health_fixture_matches_live_balances(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, visits: Any
+) -> None:
+    fixture = json.loads((PROJECT / "tools/fixtures/health-own-off.json").read_text())
+    now = 56220 - 3600
+    monkeypatch.setattr(http_mod, "_now", lambda: now)
+    s = _open_site(
+        cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS="", NER_SITE_DENSE_DIR=str(PROJECT / "indexes")
+    )
+    for _ in range(2):
+        assert _ask(s)[0] == 200
+    now += 3600
+    for _ in range(3):
+        assert _ask(s)[0] == 200
+    health = _health_of(s)
+    assert fixture == health
+
+
+def test_own_selector_construction_failure_closes_extractor(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ner_site import providers
+
+    closed = []
+
+    class Client:
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    def build(credential: Any, model: str, *, purpose: str, **options: Any) -> Any:
+        if purpose == "extract":
+            return Client()
+        raise RuntimeError("upstream echoed " + credential.token())
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    result = _ask(
+        _settings(cache_dir, tmp_path),
+        {"provider": "openai", "selector": "gpt-6-luna"},
+        headers=OWN_HEADERS,
+    )
+    assert _error(result) == (502, "provider_error")
+    assert _json(result)["error"]["message"] == "OpenAI could not complete the request (error)."
+    assert closed == [True]
+
+
+def test_bad_route_does_not_echo_a_bearer_in_the_path(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _settings(cache_dir, tmp_path)
+    result = http_mod.handle("POST", "/" + OWN_KEY, OWN_HEADERS, b"", settings=s)
+    assert _error(result) == (404, "not_found")
+    assert OWN_KEY not in _json(result)["error"]["message"]
+    assert OWN_KEY not in json.loads(capsys.readouterr().err)["path"]
+
+
+def test_daily_opus_stepdown_tells_the_visitor_which_allowance_was_used(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path, NER_SITE_OPUS_PER_DAY="0")
+    assert _json(_ask(s))["notices"] == [
+        "Your Opus allowance for today is used; this ran on Claude Sonnet 5.5."
+    ]
+
+
+def test_invalid_provider_type_is_bad_credential(cache_dir: Path, tmp_path: Path) -> None:
+    result = _post(
+        _settings(cache_dir, tmp_path), {"text": "ok", "provider": ["openai"]}, headers=OWN_HEADERS
+    )
+    assert _error(result) == (400, "bad_credential")
+
+
+def test_unexpected_own_mapping_failure_keeps_internal_envelope(
+    cache_dir: Path,
+    tmp_path: Path,
+    own_clients: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ner_site import service
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(OWN_KEY)
+
+    monkeypatch.setattr(service, "map_entities", broken)
+    result = _ask(
+        _settings(cache_dir, tmp_path),
+        {"provider": "openai", "text": HALO_TEXT},
+        headers=OWN_HEADERS,
+    )
+    assert _error(result) == (500, "internal")
+    record = _last_log(capsys)
+    assert record["exception"] == "RuntimeError"
+    assert OWN_KEY not in json.dumps(record) and "locals" not in record
+
+
+def test_an_own_key_is_redacted_before_pick_explanations_are_capped(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ner_site import providers
+
+    class Client(FakeLLM):
+        async def aclose(self) -> None:
+            pass
+
+    pick = json.loads(PICK)
+    pick["explanation"] = "x" * 280 + OWN_KEY
+
+    def build(credential: Any, model: str, *, purpose: str, **options: Any) -> Any:
+        return Client([HALO if purpose == "extract" else json.dumps(pick)], model=model)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    result = _ask(
+        _settings(cache_dir, tmp_path),
+        {"provider": "openai", "selector": "gpt-6-luna", "text": HALO_TEXT},
+        headers=OWN_HEADERS,
+    )
+    assert _json(result)["entities"][0]["pick"]["explanation"] == "x" * 280 + "[redacted]"
+
+
+def test_ignored_database_url_is_not_read_into_settings_cache() -> None:
+    class Env(dict):
+        def get(self, key: str, default: Any = None) -> Any:
+            assert key != "DATABASE_URL"
+            return super().get(key, default)
+
+    assert http_mod.env_settings(Env(NER_SITE_OWN_PROVIDERS="")).database_url is None
+    assert http_mod.env_settings(Env(NER_SITE_OFFLINE="1")).database_url is None
+
+
+def test_settings_error_cache_does_not_retain_the_first_request_frame() -> None:
+    error = http_mod.env_settings({"NER_SITE_OWN_PROVIDERS": "unknown"})
+    assert isinstance(error, Exception)
+    assert error.__traceback__ is None and error.__context__ is None
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "openrouter"])
+def test_provider_diagnostics_cannot_log_an_echoed_visitor_key(
+    provider: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import logging
+
+    import httpx2
+    from ner_site import providers
+
+    module = httpx2 if provider == "anthropic" else httpx
+
+    def refuse(request: Any) -> Any:
+        assert request.headers["Authorization"] == "Bearer " + OWN_KEY
+        return module.Response(
+            401,
+            headers={"request-id": OWN_KEY},
+            extensions={"reason_phrase": OWN_KEY.encode()},
+            json={"error": {"message": OWN_KEY}},
+        )
+
+    real = providers.own_llm
+
+    def build(*args: Any, **kwargs: Any) -> Any:
+        return real(*args, transport=module.MockTransport(refuse), backoff_base=0.0, **kwargs)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    caplog.set_level(logging.DEBUG)
+    result = _ask(_settings(cache_dir, tmp_path), {"provider": provider}, headers=OWN_HEADERS)
+    assert _error(result) == (401, "provider_key_refused")
+    assert OWN_KEY not in caplog.text
+    assert (
+        OWN_KEY not in _json(result)["error"]["message"] and OWN_KEY not in capsys.readouterr().err
+    )
+    logging.getLogger("httpx").info("diagnostics outside the own-key request")
+    assert "diagnostics outside the own-key request" in caplog.text
+
+
+def test_a_key_duplicated_in_address_headers_is_never_hashed(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, own_clients: Any, visits: Any
+) -> None:
+    original = http_mod.limits.visitor_id
+
+    def identify(headers: Any, salt: str) -> str:
+        assert all(OWN_KEY not in headers.get(k, "") for k in http_mod.limits.ADDRESS_HEADERS)
+        return original(headers, salt)
+
+    monkeypatch.setattr(http_mod.limits, "visitor_id", identify)
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"provider": "openai"},
+        headers={**OWN_HEADERS, "x-real-ip": OWN_KEY},
+    )
+    assert result[0] == 200 and _tiers(visits) == {"own": 1}
+
+
+def test_canned_backend_never_copies_a_key_from_request_fields() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "serve_local_fields", PROJECT / "tools/serve_local.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    backend = module.canned_backend(PROJECT / "tools/fixtures", "")
+    for field, code in [
+        ("text", "bad_credential"),
+        ("prompt", "bad_credential"),
+        ("model", "unknown_model"),
+        ("selector", "unknown_selector"),
+    ]:
+        body = json.dumps({"text": "sample", "provider": "openai", field: OWN_KEY}).encode()
+        result = backend(
+            "POST", "/api/ner", {**POST_HEADERS, "authorization": "Bearer " + OWN_KEY}, body
+        )
+        assert _error(result) == (400, code)
+        assert OWN_KEY not in _json(result)["error"]["message"]
+
+
+def test_duplicate_authorization_over_http(
+    shim_server: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NER_SITE_OFFLINE", "0")
+    body = b'{"text":"sample","provider":"openai"}'
+    first = b"Authorization: Bearer first-synthetic-key-0001\r\n"
+    second = b"aUThorization: Bearer second-synthetic-key-0002\r\n"
+    status, wire = _raw_exchange(
+        shim_server,
+        b"POST /api/ner HTTP/1.0\r\n"
+        + first
+        + second
+        + b"X-Requested-With: xwalk-ner\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\n\r\n"
+        + body,
+    )
+    assert b"400" in status and json.loads(wire)["error"]["code"] == "bad_credential"
+    assert "exactly one" in json.loads(wire)["error"]["message"]
+
+
+def test_health_never_reads_authorization(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ner_site import providers
+
+    class Headers(dict):
+        def __getitem__(self, key: str) -> Any:
+            assert key.lower() != "authorization"
+            return super().__getitem__(key)
+
+        def items(self) -> Any:
+            pytest.fail("health must not enumerate header values")
+
+    monkeypatch.setattr(
+        providers, "read_credential", lambda *a, **kw: pytest.fail("health read a credential")
+    )
+    result = http_mod.handle(
+        "GET", "/api/health", Headers(OWN_HEADERS), b"", settings=_settings(cache_dir, tmp_path)
+    )
+    assert result[0] == 200
+
+
+def test_offline_settings_never_offer_chat_on_visitor_keys(cache_dir: Path, tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    offline = replace(_open_site(cache_dir, tmp_path), offline=True)
+    assert _health_of(offline)["own_keys"] == {"enabled": False, "providers": []}
+    assert _error(_ask(offline, {"provider": "openai"}, headers=OWN_HEADERS)) == (
+        400,
+        "bad_credential",
+    )
+
+
+@pytest.mark.parametrize("window", ["hour", "day"])
+def test_used_site_allowance_with_own_keys_off(
+    window: str, cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    env = {f"NER_SITE_{model}_PER_{window.upper()}": "0" for model in ("OPUS", "SONNET")}
+    s = _open_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS="", **env)
+    result = _ask(s, claude=_no_claude)
+    assert _error(result) == (429, "visitor_limit_reached")
+    assert "use your own" not in _json(result)["error"]["message"]
+
+
+def test_outage_health_fixture_reports_uncounted_own_runs(
+    cache_dir: Path, tmp_path: Path, visits: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(http_mod, "_now", lambda: 56220)
+    visits.fail = RuntimeError("unavailable")
+    fixture = json.loads((PROJECT / "tools/fixtures/health-unavailable.json").read_text())
+    assert _health_of(_open_site(cache_dir, tmp_path))["visitor"] == fixture["visitor"]
+
+
+def test_own_error_scrubber_covers_response_headers_and_body(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, own_clients: Any
+) -> None:
+    from ner_site.schema import ServiceError
+
+    async def failed(*args: Any, **kwargs: Any) -> Any:
+        raise ServiceError("provider_error", OWN_KEY, status=502, headers={"X-Echo": OWN_KEY})
+
+    monkeypatch.setattr(http_mod, "run", failed)
+    result = _ask(_settings(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    assert _json(result)["error"]["message"] == result[1]["X-Echo"] == "[redacted]"
+
+
+def test_log_identifies_requested_provider_even_on_a_missing_credential(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _settings(cache_dir, tmp_path)
+    assert _error(_ask(s, {"provider": "openai"})) == (400, "bad_credential")
+    record = _last_log(capsys)
+    assert (record["provider"], record["credential"]) == ("openai", "visitor")
+    assert _error(_ask(s)) == (503, "not_configured")
+    record = _last_log(capsys)
+    assert (record["provider"], record["credential"]) == ("site", "site")
+
+
+def test_json_escaped_provider_echo_cannot_enter_the_mention_regex_cache(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ner_site import extract as extraction
+    from ner_site import providers
+
+    original = extraction.locate
+    seen = []
+
+    def locate(text: str, mention: str, *args: Any, **kwargs: Any) -> Any:
+        seen.append(mention)
+        return original(text, mention, *args, **kwargs)
+
+    monkeypatch.setattr(extraction, "locate", locate)
+
+    class Client(FakeLLM):
+        async def aclose(self) -> None:
+            pass
+
+    def build(credential: Any, model: str, **options: Any) -> Any:
+        return Client([_answer((credential.token(), "other", 0, 1))], model=model)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    result = _ask(_settings(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    assert result[0] == 200
+    assert seen and set(seen) == {"[redacted]"}

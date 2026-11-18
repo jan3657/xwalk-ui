@@ -48,6 +48,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -79,6 +80,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -110,6 +112,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -141,6 +144,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -171,6 +175,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -184,6 +189,7 @@
       "notes": [
         "no ontology for type 'other'"
       ],
+      "pick": null,
       "more": []
     },
     {
@@ -206,6 +212,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -228,6 +235,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -259,6 +267,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -281,6 +290,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     },
     {
@@ -313,6 +323,7 @@
         }
       ],
       "notes": [],
+      "pick": null,
       "more": []
     }
   ],

@@ -56,8 +56,9 @@ carries what was asked for and every departure from it::
     "notices": ["Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5."]
 
 ``model`` is then the model that produced the extraction and each ``pick.selector`` the
-model that made that pick. ``/api/health`` gains ``claude`` and ``visitor`` beside
-``llm`` (added by ``ner_site.http``, not part of :class:`HealthResponse`).
+model that made that pick. ``provider`` and ``credential_source`` identify who paid for
+the model calls. Health advertises own providers and reports balances in ``visitor``
+where the site meters Claude. ``ner_site.http`` adds the operator key probes.
 
 Token counts are ``null`` when the provider did not report them, never 0.
 
@@ -179,6 +180,7 @@ class NerRequest(BaseModel):
     model: str | None = None
     top_k: int = 5
     selector: str | None = None
+    provider: str | None = None
 
 
 class FallbackNote(BaseModel):
@@ -227,6 +229,8 @@ class NerResponse(BaseModel):
     requested_selector: str = ""
     fallbacks: list[FallbackNote] = []
     notices: list[str] = []
+    provider: str = "site"
+    credential_source: Literal["site", "visitor"] = "site"
 
 
 class OntologySummary(BaseModel):
@@ -234,6 +238,36 @@ class OntologySummary(BaseModel):
     name: str
     type: EntityType
     count: int
+
+
+class OwnProvider(BaseModel):
+    """The models a visitor's key may use, in the operator's configured order."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    models: list[str]
+    default_model: str
+
+
+class OwnKeys(BaseModel):
+    enabled: bool
+    providers: list[OwnProvider]
+
+
+class VisitorStatus(BaseModel):
+    limits: Literal["on", "off", "unavailable"]
+    tier: Literal["opus", "sonnet", "blocked"]
+    opus_left: int | None = None
+    sonnet_left: int | None = None
+    resets_in_s: int | None = None
+    opus_left_today: int | None = None
+    sonnet_left_today: int | None = None
+    own_left: int | None = None
+    own_left_today: int | None = None
+    day_resets_in_s: int | None = None
+    window: Literal["hour", "day"] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -248,6 +282,16 @@ class HealthResponse(BaseModel):
     retrieval: dict[str, RetrieverStatus]
     selectors: list[str] = ["retrieval"]
     default_selector: str = "retrieval"
+    own_keys: OwnKeys | None = None
+    visitor: VisitorStatus | None = None
+
+    @model_serializer(mode="wrap")
+    def _optional_sections(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        for name in ("own_keys", "visitor"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
 
 @dataclass(frozen=True)

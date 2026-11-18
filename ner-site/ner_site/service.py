@@ -37,11 +37,13 @@ from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
+from ner_site import providers
 from ner_site.claude import (
     CLAUDE_MODELS,
     DISPLAY_NAMES,
     EFFORTS,
     EXTRACT_MAX_TOKENS,
+    HAIKU,
     OPUS,
     SELECT_MAX_TOKENS,
     SONNET,
@@ -50,7 +52,7 @@ from ner_site.claude import (
     key_status,
 )
 from ner_site.extract import MAX_TOKENS, TEMPERATURE, extract, render_default_prompt
-from ner_site.fallback import FallbackLLM, Step
+from ner_site.fallback import ChainView, FallbackLLM, Step
 from ner_site.indexes import (
     NEON_DIMENSIONS,
     NEON_SCHEMA,
@@ -141,12 +143,20 @@ _LIMIT_ENV: tuple[tuple[str, str, int, int], ...] = (
     ("NER_SITE_MAX_ENTITIES", "max_entities", 1, 100),
     ("NER_SITE_MAX_PROMPT_CHARS", "max_prompt_chars", 1, 16000),
 )
-# (env name, Allowance field): whole numbers 0..1000, refused outside like the limits.
-_ALLOWANCE_ENV: tuple[tuple[str, str], ...] = (
-    ("NER_SITE_OPUS_PER_HOUR", "opus_per_hour"),
-    ("NER_SITE_SONNET_PER_HOUR", "sonnet_per_hour"),
+# The two original hourly limits keep their upper bound. New allowances allow 10000.
+_ALLOWANCE_ENV = (
+    ("NER_SITE_OPUS_PER_HOUR", "opus_per_hour", 1000),
+    ("NER_SITE_SONNET_PER_HOUR", "sonnet_per_hour", 1000),
+    ("NER_SITE_OPUS_PER_DAY", "opus_per_day", 10000),
+    ("NER_SITE_SONNET_PER_DAY", "sonnet_per_day", 10000),
+    ("NER_SITE_OWN_PER_HOUR", "own_per_hour", 10000),
+    ("NER_SITE_OWN_PER_DAY", "own_per_day", 10000),
 )
-ALLOWANCE_MAX = 1000
+_OWN_MODELS = {
+    "anthropic": (*CLAUDE_MODELS, HAIKU),
+    "openai": ("gpt-6-luna",),
+    "openrouter": (DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna"),
+}
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 ENV_NAMES = (
@@ -168,13 +178,47 @@ ENV_NAMES = (
     "ANTHROPIC_API_KEY",
     "NER_SITE_CLAUDE_EFFORT",
     "NER_SITE_FALLBACK_MODEL",
-    *(name for name, _ in _ALLOWANCE_ENV),
+    *(name for name, _, _ in _ALLOWANCE_ENV),
+    "NER_SITE_OWN_PROVIDERS",
+    *(f"NER_SITE_OWN_MODELS_{p.upper()}" for p in providers.OWN_PROVIDERS),
     "NER_SITE_VISITOR_SALT",
 )
 
 
 class SettingsError(ValueError):
     """A bad environment value. The message names the variable, never a secret."""
+
+
+def uses_database(env: Mapping[str, str]) -> bool:
+    """The index backend or a live allowance needs the URL, including in the settings cache."""
+    if env.get("NER_SITE_BACKEND", "").strip().lower() == "neon":
+        return True
+    if env.get("NER_SITE_OFFLINE", "").strip().lower() in _TRUE:
+        return False
+    return bool(
+        env.get("ANTHROPIC_API_KEY", "").strip() or env.get("NER_SITE_OWN_PROVIDERS", "all").strip()
+    )
+
+
+def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:
+    raw = env.get("NER_SITE_OWN_PROVIDERS", ",".join(providers.OWN_PROVIDERS)).strip()
+    enabled = tuple(dict.fromkeys(p.strip() for p in raw.split(","))) if raw else ()
+    if any(p not in providers.OWN_PROVIDERS for p in enabled):
+        raise SettingsError("NER_SITE_OWN_PROVIDERS must list anthropic, openai or openrouter")
+    infos = {}
+    for provider, defaults in _OWN_MODELS.items():
+        name = f"NER_SITE_OWN_MODELS_{provider.upper()}"
+        ids = tuple(dict.fromkeys(m.strip() for m in env.get(name, ",".join(defaults)).split(",")))
+        if any(not m or m in (JEV, RETRIEVAL_ONLY) for m in ids):
+            raise SettingsError(
+                f"{name} must list non-empty model ids distinct from jev and retrieval"
+            )
+        if provider == "anthropic" and any(m not in defaults for m in ids):
+            raise SettingsError(f"{name} must list models from {', '.join(defaults)}")
+        infos[provider] = providers.ProviderInfo(
+            provider, providers.PROVIDER_NAMES[provider], ids, ids[0]
+        )
+    return tuple(infos[p] for p in enabled)
 
 
 @dataclass(frozen=True)
@@ -216,6 +260,14 @@ class Settings:
     fallback_model: str = DEFAULT_FALLBACK_MODEL
     allowance: Allowance = field(default_factory=Allowance)
     visitor_salt: str | None = field(default=None, repr=False)
+
+    own_providers: tuple[providers.ProviderInfo, ...] = field(
+        default_factory=lambda: _own_providers({})
+    )
+
+    def __post_init__(self) -> None:
+        if self.offline:
+            object.__setattr__(self, "own_providers", ())
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -259,12 +311,16 @@ class Settings:
                 f"{DEFAULT_FALLBACK_MODEL}"
             )
         allowance: dict[str, int] = {}
-        for name, attr in _ALLOWANCE_ENV:
+        for name, attr, maximum in _ALLOWANCE_ENV:
             raw = get(name)
             if not raw:
                 continue
-            if not re.fullmatch(r"[0-9]{1,4}", raw) or int(raw) > ALLOWANCE_MAX:
-                raise SettingsError(f"{name} must be a whole number from 0 to {ALLOWANCE_MAX}")
+            if (
+                len(raw) > len(str(maximum))
+                or not re.fullmatch(r"[0-9]+", raw)
+                or int(raw) > maximum
+            ):
+                raise SettingsError(f"{name} must be a whole number from 0 to {maximum}")
             allowance[attr] = int(raw)
 
         passcode = get("NER_SITE_PASSCODE") or None
@@ -304,15 +360,8 @@ class Settings:
             raise SettingsError("NER_SITE_NEON_CATALOG must be samples or full")
         if catalog == "full" and backend != "neon":
             raise SettingsError("NER_SITE_NEON_CATALOG=full needs NER_SITE_BACKEND=neon")
-        # Read for the Neon backend, and on any backend where Claude is offered, since
-        # the visitor allowance lives there too (ner_site.limits; bundled indexes still
-        # never see it: index_settings()). Anywhere else it is ignored unread, as it
-        # was before Claude: a bundled deployment has no use for whatever a platform
-        # integration may have put in DATABASE_URL, and must not fail on it.
-        claude_offered = bool(get("ANTHROPIC_API_KEY")) and offline_raw not in _TRUE
-        database_url = (
-            (get("DATABASE_URL") or None) if backend == "neon" or claude_offered else None
-        )
+        own_providers = _own_providers(env)
+        database_url = (get("DATABASE_URL") or None) if uses_database(env) else None
         if database_url is not None and urlsplit(database_url).scheme not in {
             "postgres",
             "postgresql",
@@ -358,6 +407,7 @@ class Settings:
             claude_effort=effort,
             fallback_model=fallback_model,
             allowance=Allowance(**allowance),
+            own_providers=own_providers,
             visitor_salt=get("NER_SITE_VISITOR_SALT") or None,
         )
         if not settings.offered_models:
@@ -429,7 +479,7 @@ class Settings:
 
     @property
     def claude_offered(self) -> bool:
-        """Whether a request can ask for Claude at all (the allowance applies only then)."""
+        """Whether Claude can run on the site's keys and the site allowance applies."""
         return not self.offline and self.anthropic_api_key is not None
 
     def index_settings(self) -> IndexView:
@@ -465,9 +515,9 @@ class Settings:
         return tuple(dict.fromkeys(s for s in values if s and len(s) >= MIN_SCRUBBED_CHARS))
 
 
-def scrub(message: str, settings: Settings) -> str:
+def scrub(message: str, settings: Settings, extra_secrets: Sequence[str] = ()) -> str:
     """``message`` with the key and passcode removed and every URL redacted."""
-    for secret in settings.secrets():
+    for secret in (*extra_secrets, *settings.secrets()):
         message = message.replace(secret, "[redacted]")
     return re.sub(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>]+", lambda m: redact_url(m[0]), message)
 
@@ -735,7 +785,14 @@ _WHY = {
 }
 
 
-def notice(note: FallbackNote, *, last: bool = True, claude_blocked: str | None = None) -> str:
+def notice(
+    note: FallbackNote,
+    *,
+    last: bool = True,
+    picks: Sequence[str] = (),
+    allowance_window: str = "hour",
+    claude_blocked: str | None = None,
+) -> str:
     """The sentence a visitor reads about one departure from the model they asked for.
 
     ``last`` is whether the request went no further in that part of it. Only then does
@@ -745,7 +802,10 @@ def notice(note: FallbackNote, *, last: bool = True, claude_blocked: str | None 
     the caller read it then), for a ``claude_unavailable`` departure; this function
     does not read the process's block itself, which may have changed since."""
     target = display_name(note.to)
-    if not last:
+    if picks:
+        which = "the pick" if len(picks) == 1 else "the picks"
+        then = f"{which} for {', '.join(picks)} ran on {target}"
+    elif not last:
         then = f"moved on to {target}"
     elif note.reason == FOLLOWS_EXTRACTION:
         then = f"the picks ran on {target}"
@@ -765,6 +825,8 @@ def notice(note: FallbackNote, *, last: bool = True, claude_blocked: str | None 
         who = display_name(note.from_) if is_claude(note.to) else "Claude"
         return f"{who} is unavailable ({BLOCK_TEXT.get(blocked, blocked)}); {then}."
     why = _WHY.get(note.reason, "{model} could not be used")
+    if note.reason == "opus_allowance_used" and allowance_window == "day":
+        why = "Your Opus allowance for today is used"
     return f"{why.format(model=display_name(note.from_))}; {then}."
 
 
@@ -772,6 +834,8 @@ def _notices(
     departures: Sequence[FallbackNote],
     *,
     extracted_on_chain: bool,
+    server_picks: Mapping[int, list[str]],
+    allowance_window: str,
     claude_blocked: str | None = None,
 ) -> list[str]:
     """A sentence per departure, in order. The departures fall into two parts, those
@@ -785,7 +849,13 @@ def _notices(
 
     final = {part(note): position for position, note in enumerate(departures)}
     return [
-        notice(note, last=final[part(note)] == position, claude_blocked=claude_blocked)
+        notice(
+            note,
+            last=final[part(note)] == position,
+            picks=server_picks.get(position, ()),
+            allowance_window=allowance_window,
+            claude_blocked=claude_blocked,
+        )
         for position, note in enumerate(departures)
     ]
 
@@ -797,19 +867,11 @@ def _notes(chain: FallbackLLM, since: int = 0) -> list[FallbackNote]:
     ]
 
 
-def _served_elsewhere(
-    stage: str, asked: str | None, answered: str | None, chain: FallbackLLM
-) -> FallbackNote | None:
-    """The departure nobody decided here: the Claude step `asked` was sent the request
-    and the answer names `answered`, a model that is no step of the chain. The adapter
-    asks for Anthropic's server-side refusal fallback (``fallbacks="default"``), so that
-    is a model the API moved to when the one asked for declined. An OpenRouter step is
-    left alone: the name its provider reports may be spelt differently from the id."""
-    if not asked or not answered or not is_claude(asked):
-        return None
-    if answered in {step.client.model for step in chain.steps}:
-        return None
-    return FallbackNote(stage=stage, from_=asked, to=answered, reason="refused")
+def _served_elsewhere(view: ChainView) -> FallbackNote | None:
+    """Only the SDK's signal distinguishes a refusal fallback from an echoed model id."""
+    if view.served_by_fallback and view.asked and view.answered_by:
+        return FallbackNote(stage=EXTRACT, from_=view.asked, to=view.answered_by, reason="refused")
+    return None
 
 
 # /api/health asks OpenRouter whether the key still works (GET /api/v1/key: free, no
@@ -944,22 +1006,35 @@ def validate_request(request: NerRequest, settings: Settings) -> NerRequest:
         )
     if not 1 <= request.top_k <= limits.top_k_max:
         raise _bad("bad_top_k", f"top_k must be from 1 to {limits.top_k_max}")
-    model = request.model if request.model is not None else settings.default_model
-    if model not in settings.offered_models:
+    own = request.provider not in (None, providers.SITE)
+    if own:
+        info = next((p for p in settings.own_providers if p.id == request.provider), None)
+        if info is None:
+            raise _bad(
+                "bad_credential", "own API keys are not available for that provider on this site"
+            )
+        models, selectors = info.models, (RETRIEVAL_ONLY, *info.models)
+        default_model, default_selector = info.default_model, RETRIEVAL_ONLY
+    else:
+        models, selectors = settings.offered_models, settings.offered_selectors
+        default_model, default_selector = settings.default_model, settings.default_selector
+    model = request.model if request.model is not None else default_model
+    if model not in models:
+        label = "model" if own else f"model {_shown(model)}"
+        raise _bad("unknown_model", f"{label} is not offered; choose one of {', '.join(models)}")
+    selector = request.selector if request.selector is not None else default_selector
+    if selector not in selectors:
+        label = "selector" if own else f"selector {_shown(selector)}"
         raise _bad(
-            "unknown_model",
-            f"model {_shown(model)} is not offered; choose one of "
-            f"{', '.join(settings.offered_models)}",
-        )
-    selector = request.selector if request.selector is not None else settings.default_selector
-    if selector not in settings.offered_selectors:
-        raise _bad(
-            "unknown_selector",
-            f"selector {_shown(selector)} is not offered; choose one of "
-            f"{', '.join(settings.offered_selectors)}",
+            "unknown_selector", f"{label} is not offered; choose one of {', '.join(selectors)}"
         )
     return NerRequest(
-        text=request.text, prompt=prompt, model=model, top_k=request.top_k, selector=selector
+        text=request.text,
+        prompt=prompt,
+        model=model,
+        top_k=request.top_k,
+        selector=selector,
+        provider=request.provider,
     )
 
 
@@ -1014,9 +1089,9 @@ def retrieval_status(
     return summary
 
 
-def _clean(note: str, settings: Settings) -> str:
+def _clean(note: str, settings: Settings, extra_secrets: Sequence[str] = ()) -> str:
     """A retriever note fit for a response: secrets and URL userinfo removed, capped."""
-    note = scrub(note, settings)
+    note = scrub(note, settings, extra_secrets)
     return note if len(note) <= MAX_ERROR_DETAIL else note[: MAX_ERROR_DETAIL - 3] + "..."
 
 
@@ -1051,12 +1126,14 @@ async def run(
     request: NerRequest,
     *,
     settings: Settings,
+    extra_secrets: Sequence[str] = (),
     llm: LLMClient,
     indexes: Mapping[str, OntologyIndex],
     started_at: float | None = None,
     decider: DecisionClient | None = None,
     select_llm: LLMClient | None = None,
     admitted: Sequence[FallbackNote] = (),
+    allowance_window: str = "hour",
     claude_blocked: str | None = None,
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
@@ -1070,9 +1147,9 @@ async def run(
     extraction used, ``fallbacks`` lists ``admitted`` (the step-downs decided before any
     call) and then the chain's own, and ``notices`` has a sentence for each
     (``claude_blocked`` is the block reason the caller read when it admitted the
-    request, which a ``claude_unavailable`` sentence names). An answer
-    that Anthropic served from a model outside the chain (its server-side refusal
-    fallback) is listed too, once per stage and model, with the reason ``refused``.
+    request, which a ``claude_unavailable`` sentence names). The adapter signals
+    server-side refusal fallbacks, which are listed with the reason ``refused``.
+    With visitor credentials both stages run on the chosen provider without a chain.
 
     Calls and tokens are read from one place, the usage each answer carries: a chain's
     answer already includes its failed attempts, and the steps' own ``BudgetedLLM``
@@ -1085,7 +1162,8 @@ async def run(
     extraction, 429 ``call_budget_exhausted``, 502 ``provider_error``."""
     req = validate_request(request, settings)
     assert req.prompt is not None and req.model is not None
-    chain = llm if isinstance(llm, FallbackLLM) else None
+    own = req.provider not in (None, providers.SITE)
+    chain = llm if not own and isinstance(llm, FallbackLLM) else None
     enter_stage(chain, EXTRACT)
     # A view remembers which model its answer came from; the chain may move on later.
     reader = llm if chain is None else chain.view()
@@ -1103,24 +1181,39 @@ async def run(
         )
     except ServiceError:
         raise
-    except CallLimitExceeded:
-        raise ServiceError(
-            "call_budget_exhausted",
-            f"the limit of {settings.limits.llm_call_cap} model calls per request was "
-            "reached before the model answered; try again later",
-            status=429,
-        ) from None
-    except LLMError as exc:
-        detail = scrub(f"{type(exc).__name__}: {exc}", settings)[:MAX_ERROR_DETAIL]
-        raise ServiceError(
-            "provider_error", f"the model provider failed ({detail})", status=502
-        ) from None
-    except asyncio.TimeoutError:  # builtins.TimeoutError from 3.11; distinct on 3.10
-        raise ServiceError(
-            "provider_error",
-            f"the model did not answer within {EXTRACT_TIMEOUT_S:g} seconds",
-            status=502,
-        ) from None
+    except asyncio.CancelledError:
+        if not own:
+            raise
+        assert req.provider is not None
+        failure = providers.provider_error(asyncio.TimeoutError(), req.provider)
+    except Exception as exc:
+        if own:
+            assert req.provider is not None
+            failure = providers.provider_error(exc, req.provider)
+        elif isinstance(exc, CallLimitExceeded):
+            failure = ServiceError(
+                "call_budget_exhausted",
+                f"the limit of {settings.limits.llm_call_cap} model calls per request was "
+                "reached before the model answered; try again later",
+                status=429,
+            )
+        elif isinstance(exc, LLMError):
+            detail = scrub(f"{type(exc).__name__}: {exc}", settings)[:MAX_ERROR_DETAIL]
+            failure = ServiceError(
+                "provider_error", f"the model provider failed ({detail})", status=502
+            )
+        elif isinstance(exc, asyncio.TimeoutError):
+            failure = ServiceError(
+                "provider_error",
+                f"the model did not answer within {EXTRACT_TIMEOUT_S:g} seconds",
+                status=502,
+            )
+        else:
+            raise
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
     extracted = time.monotonic()
 
     stats = MapStats()
@@ -1133,7 +1226,7 @@ async def run(
         timeout=min(MAP_RETRIEVER_TIMEOUT_S, budget),
         deadline=budget,
         stats=stats,
-        clean=lambda note: _clean(note, settings),
+        clean=lambda note: _clean(note, settings, extra_secrets),
         routes=settings.routes,
     )
     mapped = time.monotonic()
@@ -1143,11 +1236,10 @@ async def run(
     taken = 0 if chain is None else len(chain.fallbacks)  # while extracting
     departures = [*admitted, *(_notes(chain) if chain is not None else ())]
     if chain is not None:
-        elsewhere = _served_elsewhere(
-            EXTRACT, getattr(reader, "asked", None), getattr(reader, "answered_by", None), chain
-        )
-        departures += [] if elsewhere is None else [elsewhere]
-    select_chain = select_llm if isinstance(select_llm, FallbackLLM) else None
+        elsewhere = _served_elsewhere(reader)
+        if elsewhere is not None:
+            departures.append(elsewhere)
+    select_chain = select_llm if not own and isinstance(select_llm, FallbackLLM) else None
     if selector != RETRIEVAL_ONLY:
         if (selector == JEV and decider is None) or (selector != JEV and select_llm is None):
             raise ServiceError("not_configured", f"selector {selector!r} has no client", status=503)
@@ -1174,13 +1266,14 @@ async def run(
             stats=picked,
             decider=decider,
             llm=select_llm,
+            own_key=own,
             deadline=max(MIN_SELECT_BUDGET_S, REQUEST_DEADLINE_S - (mapped - began)),
         )
         results = [
             r.model_copy(
                 update={
                     "pick": r.pick.model_copy(
-                        update={"explanation": _clean(r.pick.explanation, settings)}
+                        update={"explanation": _clean(r.pick.explanation, settings, extra_secrets)}
                     )
                 }
             )
@@ -1193,10 +1286,19 @@ async def run(
         departures += _notes(chain, taken)
     if select_chain is not None and select_chain is not chain:
         departures += _notes(select_chain)
+    server_picks: dict[int, list[str]] = {}
     if select_chain is not None and picked is not None:
-        for answered, asked in picked.served_elsewhere.items():
-            elsewhere = _served_elsewhere(SELECT, asked, answered, select_chain)
-            departures += [] if elsewhere is None else [elsewhere]
+        # Iterate in wire order, independent of the order concurrent picks finished.
+        groups: dict[tuple[str, str], list[str]] = {}
+        for result in results:
+            pair = picked.served_elsewhere.get(result.id)
+            if pair:
+                groups.setdefault(pair, []).append(result.id)
+        for (asked, answered), ids in groups.items():
+            server_picks[len(departures)] = ids
+            departures.append(
+                FallbackNote(stage=SELECT, from_=asked, to=answered, reason="refused")
+            )
 
     retrieval = retrieval_status(indexes, settings)
     notes: list[str] = list(warnings) + stats.warnings
@@ -1211,14 +1313,16 @@ async def run(
     if picked is not None:
         timing["select"] = _ms(selected - mapped)
     timing["total"] = _ms(selected - started)
+    answered_by = None if own else getattr(reader, "answered_by", None)
     return NerResponse(
-        # The model the answer names; after a step-down it is not the one asked for.
-        model=getattr(reader, "answered_by", None) or req.model,
+        model=answered_by or req.model,
+        provider=req.provider or providers.SITE,
+        credential_source="visitor" if own else "site",
         mode=settings.mode,
         selector=selector,
         entities=results,
         retrieval=retrieval,
-        warnings=[scrub(n, settings) for n in notes],
+        warnings=[scrub(n, settings, extra_secrets) for n in notes],
         usage=wire_usage(usage, stats.embedding_requests, picked),
         timing_ms=timing,
         requested_model=req.model,
@@ -1228,7 +1332,11 @@ async def run(
             dict.fromkeys(
                 scrub(sentence, settings)
                 for sentence in _notices(
-                    departures, extracted_on_chain=chain is not None, claude_blocked=claude_blocked
+                    departures,
+                    extracted_on_chain=chain is not None,
+                    server_picks=server_picks,
+                    allowance_window=allowance_window,
+                    claude_blocked=claude_blocked,
                 )
             )
         ),
@@ -1261,6 +1369,7 @@ __all__ = [
     "retrieval_status",
     "run",
     "scrub",
+    "uses_database",
     "validate_request",
     "wire_usage",
 ]

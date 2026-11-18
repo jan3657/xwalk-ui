@@ -1,5 +1,7 @@
 {
   "ok": true,
+  "provider": "site",
+  "credential_source": "site",
   "model": "claude-opus-5-5",
   "requested_model": "claude-opus-5-5",
   "mode": "live",

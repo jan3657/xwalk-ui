@@ -298,3 +298,38 @@ def test_a_failed_llm_pick_still_counts_its_call() -> None:
     assert result.pick is not None and result.pick.status == "failed"
     assert result.pick.selector == "openai/gpt-6-luna" and "HTTP 500" in result.pick.explanation
     assert stats.calls == 1 and stats.prompt_tokens is None
+
+
+@pytest.mark.parametrize(
+    "answer,word",
+    [
+        ("not-json", "bad_answer"),
+        ('{"chosen_key":"FAKE"}', "bad_answer"),
+        (TimeoutError("unsafe"), "timeout"),
+        (RuntimeError("unsafe"), "error"),
+    ],
+)
+def test_own_failed_pick_uses_only_a_machine_word(answer: Any, word: str) -> None:
+    (result,), _ = _run("gpt-6-luna", own_key=True, llm=FakeLLM([answer]))
+    assert result.pick and (result.pick.status, result.pick.explanation) == ("failed", word)
+
+
+def test_cancelled_own_call_becomes_a_failed_pick() -> None:
+    class Cancelled(FakeLLM):
+        async def complete(self, request: LLMRequest) -> Any:
+            raise asyncio.CancelledError("unsafe provider detail")
+
+    (result,), _ = _run("gpt-6-luna", own_key=True, llm=Cancelled([]))
+    assert result.pick and (result.pick.status, result.pick.explanation) == ("failed", "timeout")
+
+
+def test_a_site_selector_can_still_supply_its_own_view() -> None:
+    class Client(FakeLLM):
+        def view(self) -> FakeLLM:
+            view = FakeLLM(handler=_pick_reply)
+            view.answered_by = "reported-model"
+            return view
+
+    (result,), stats = _run("requested-model", llm=Client([]))
+    assert result.pick and result.pick.selector == "reported-model"
+    assert not stats.served_elsewhere

@@ -29,6 +29,19 @@ def _site_process_state(
 
     monkeypatch.setattr(site_http, "make_limits_executor", no_database)
 
+    if request.module.__name__.rsplit(".", 1)[-1] == "test_site_http":
+        # Even a regression admitting a refused request cannot send a chat to a real host.
+        import httpx
+        import httpx2
+
+        async def no_chat_transport(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("an HTTP test reached a live async HTTP transport")
+
+        for library in (httpx, httpx2):
+            monkeypatch.setattr(
+                library.AsyncHTTPTransport, "handle_async_request", no_chat_transport
+            )
+
     def clear() -> None:
         fallback.reset()
         service.reset_key_check()

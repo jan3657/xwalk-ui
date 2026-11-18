@@ -7,18 +7,11 @@ JSON body, ``Cache-Control: no-store`` and no ``Access-Control-*`` header.
 
 Order of checks for ``POST /api/ner``: path (404), method (405; ``OPTIONS`` too, on
 purpose, so no preflight ever succeeds), body size (413), ``X-Requested-With:
-xwalk-ner`` (400 ``bad_header``), passcode (401), configuration (503), JSON (400), field
-limits (400), the indexes (opened once per warm instance), the visitor's allowance (429
-``visitor_limit_reached``), then the run (422/429/502). An unexpected exception is a 500
-``internal`` whose log line names only the exception type and where it was raised: its
-message could carry the visitor's text.
-
-Admission (docs/superpowers/specs/2026-11-18-claude-provider-open-access-design.md
-sections 3.3 and 5) comes after every check that can refuse a request and after the
-indexes are open, so a request that is refused or cannot run is never counted. It
-applies where Claude is offered (an Anthropic key, not offline): the visitor's hourly
-allowance decides whether a request for Opus starts on Opus or on Sonnet, and a Claude
-that is known to be unusable moves the start to the OpenRouter step. The visitor is a
+xwalk-ner`` (400 ``bad_header``), passcode, JSON, credential, site configuration,
+provider-specific validation, indexes and finally admission before any chat client
+is built. Site-key Claude deployments apply the hourly and daily allowances and
+refuse a request if the counters cannot be consulted. Own-key runs have separate
+flood limits and can proceed during a counter outage. The visitor is a
 keyed hash of the client address; neither it nor the address is ever logged or returned.
 """
 
@@ -27,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -34,18 +28,22 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import AsyncExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, replace
+from functools import partial
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
-from xwalk.llm.base import LLMClient
+from xwalk.llm.base import LLMCapabilities, LLMClient, LLMRequest, LLMResponse, ParseError
+from xwalk.llm.parsing import parse_json_object
 from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
-from ner_site import fake, fallback, limits
+from ner_site import fake, fallback, limits, providers
 from ner_site.claude import OPUS, SONNET, is_claude
 from ner_site.indexes import OntologyIndex, get_indexes
 from ner_site.ontologies import catalog, full_catalog
@@ -53,9 +51,13 @@ from ner_site.schema import (
     FallbackNote,
     HealthResponse,
     NerRequest,
+    NerResponse,
     OntologySummary,
+    OwnKeys,
+    OwnProvider,
     RetrieverStatus,
     ServiceError,
+    VisitorStatus,
 )
 from ner_site.select import JEV, RETRIEVAL_ONLY
 from ner_site.service import (
@@ -75,6 +77,7 @@ from ner_site.service import (
     make_select_llm,
     retrieval_status,
     run,
+    uses_database,
     validate_request,
 )
 
@@ -86,17 +89,41 @@ HEALTH_PATH = "/api/health"
 NER_PATH = "/api/ner"
 ALLOWED = {HEALTH_PATH: ("GET", "HEAD"), NER_PATH: ("POST",)}
 REQUESTED_WITH = "xwalk-ner"
-MAX_LOGGED_PATH = 80
+KNOWN_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
 MAX_LENGTH_DIGITS = 18
 REQUEST_WORKERS = 16  # threads per request for retriever searches (BM25 and embeddings)
 # One round trip to Neon before the request may run: short, so a slow database becomes
-# "limits unavailable" (Sonnet, uncounted) and not a slow request. It is twice the
+# a prompt refusal on site keys, or an uncounted own-key run. It is twice the
 # limiter's own bound on waiting for a visitor's lock (limits.LOCK_TIMEOUT_MS), so a
 # queue of one visitor's requests ends as a contended lock (429), not as this timeout.
 LIMITS_TIMEOUT_S = 3.0
 CONTENDED_RETRY_AFTER_S = 5
 LIMITS_UNAVAILABLE = "limits_unavailable"
 CLAUDE_UNAVAILABLE = "claude_unavailable"
+
+
+# The SDK logs response headers and both HTTP clients log the reason phrase, even
+# when a provider echoes credentials there. Filters on the emitting loggers run
+# before any handler can format an exception. The context carries only a boolean.
+_OWN_RUN = ContextVar("ner_site_own_run", default=False)
+
+
+def _outside_own_run(record: logging.LogRecord) -> bool:
+    return not _OWN_RUN.get()
+
+
+for _logger in (
+    "anthropic._base_client",
+    "anthropic._response",
+    "httpx",
+    "httpx2",
+    *(
+        f"{core}.{part}"
+        for core in ("httpcore", "httpcore2")
+        for part in ("connection", "http11", "http2")
+    ),
+):
+    logging.getLogger(_logger).addFilter(_outside_own_run)
 
 
 def _headers(extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -108,25 +135,42 @@ def _headers(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
-def _json_body(data: object, settings: Settings | None) -> bytes:
-    text = json.dumps(data, ensure_ascii=False)
-    if settings is not None:  # last line of defence: no secret ever leaves
-        for secret in settings.secrets():
-            text = text.replace(secret, "[redacted]")
-    return text.encode("utf-8")
+def _redact(data: Any, secrets: Sequence[str]) -> Any:
+    """Scrub strings before JSON escaping can split a quoted or backslashed secret."""
+    if isinstance(data, str):
+        for secret in secrets:
+            data = data.replace(secret, "[redacted]")
+    elif isinstance(data, dict):
+        return {_redact(k, secrets): _redact(v, secrets) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [_redact(item, secrets) for item in data]
+    return data
+
+
+def _json_body(data: object, settings: Settings | None, extra_secrets: Sequence[str] = ()) -> bytes:
+    secrets = (*extra_secrets, *(settings.secrets() if settings else ()))
+    return json.dumps(_redact(data, secrets), ensure_ascii=False).encode("utf-8")
 
 
 def _error(
-    exc: ServiceError, settings: Settings | None, extra: Mapping[str, str] | None = None
+    exc: ServiceError,
+    settings: Settings | None,
+    extra: Mapping[str, str] | None = None,
+    extra_secrets: Sequence[str] = (),
 ) -> Response:
-    return exc.status, _headers(extra), _json_body(exc.envelope(), settings)
+    secrets = (*extra_secrets, *(settings.secrets() if settings else ()))
+    return (
+        exc.status,
+        _redact(_headers(extra), secrets),
+        _json_body(exc.envelope(), settings, extra_secrets),
+    )
 
 
-def _log(record: dict[str, Any], settings: Settings | None) -> None:
-    line = json.dumps({"event": "ner_site.request", **record}, ensure_ascii=True)
-    if settings is not None:
-        for secret in settings.secrets():
-            line = line.replace(secret, "[redacted]")
+def _log(
+    record: dict[str, Any], settings: Settings | None, extra_secrets: Sequence[str] = ()
+) -> None:
+    secrets = (*extra_secrets, *(settings.secrets() if settings else ()))
+    line = json.dumps(_redact({"event": "ner_site.request", **record}, secrets), ensure_ascii=True)
     print(line, file=sys.stderr, flush=True)
 
 
@@ -155,11 +199,10 @@ def _now() -> float:
 
 
 def _visitor_limits(settings: Settings) -> limits.VisitorLimits | None:
-    """The limiter, or None where it is off: Claude is not offered (nothing to meter),
-    or there is no ``DATABASE_URL``. Kept per database, schema and allowance, so a warm
-    instance creates the table once. Raises ``LimitsUnavailable`` when it cannot be set
-    up, which is handled like a database that cannot be reached."""
-    if not settings.claude_offered or settings.database_url is None:
+    """The limiter, or None offline or without a database. A warm instance reuses
+    the limiter for each database, schema and allowance. A setup failure is handled
+    like a database that cannot be reached."""
+    if settings.offline or settings.database_url is None:
         return None
     key = (settings.database_url, settings.neon_schema, settings.allowance)
     with _LIMITS_LOCK:
@@ -195,70 +238,69 @@ class _Admitted:
     start: int = 0
     notes: tuple[FallbackNote, ...] = ()
     blocked: str | None = None
+    window: str = "hour"
 
 
 def _admit(
     settings: Settings, request: NerRequest, headers: Mapping[str, str], log: dict[str, Any]
 ) -> _Admitted | None:
-    """Count the visit and decide where the request starts (spec sections 3.3 and 5).
-
-    None where Claude is not offered: no allowance, no chain, the request runs as it
-    always did. Otherwise the wanted tier comes from the model, or from the selector
-    when only the selector is Claude, and:
-
-    - limiter on: ``limits.admit`` grants Opus or Sonnet and records the visit, or the
-      hour is used (429 ``visitor_limit_reached`` with ``Retry-After``);
-    - the visitor's lock contended (too many of the visitor's requests at once, SQLSTATE
-      55P03): 429 ``visitor_limit_reached`` too, with a short ``Retry-After``; nothing
-      was recorded;
-    - limiter unreachable for any other reason: the request is not counted and a
-      request for Opus starts on Sonnet;
-    - limiter off (no ``DATABASE_URL``): with a passcode Claude is unmetered, without
-      one a request for Opus starts on Sonnet, as for unreachable.
-
-    Then a Claude that is known to be unusable (``fallback.claude_block``, read once
-    here and carried with the result) moves the start to the OpenRouter step, when the
-    chain has one."""
-    if not settings.claude_offered:
+    """Count own-key visits independently. Only site-key Claude deployments fail closed."""
+    own = request.provider not in (None, providers.SITE)
+    if not own and not settings.claude_offered:
         return None
     assert request.model is not None
     lead = next((m for m in (request.model, request.selector) if m and is_claude(m)), None)
-    wanted: limits.Tier = "opus" if lead == OPUS else "sonnet" if lead == SONNET else "other"
+    wanted: limits.Tier = "other"
+    if own:
+        wanted = "own"
+    elif lead == OPUS:
+        wanted = "opus"
+    elif lead == SONNET:
+        wanted = "sonnet"
     tier: str = wanted
     reason: str | None = None
-    unmetered = False
+    window = "hour"
+    own_clause = ", or use your own API key" if settings.own_providers else ""
     try:
         limiter = _visitor_limits(settings)
-        if limiter is None:
-            unmetered = settings.passcode is None
-        else:
+        if limiter is not None:
             admission = limiter.admit(_visitor(settings, headers), wanted)
-            tier, reason = admission.tier, admission.reason
+            tier, reason, window = admission.tier, admission.reason, admission.window
+        elif not own and settings.passcode is None:
+            raise ServiceError(LIMITS_UNAVAILABLE, "visitor limits are not configured", status=503)
     except limits.VisitorLimitReached as exc:
         minutes = max(1, math.ceil(exc.resets_in_s / 60))
+        wait = f"try again in {minutes} minute{'' if minutes == 1 else 's'}"
+        if own:
+            message = f"too many requests with your own key; {wait}"
+        elif exc.window == "day":
+            message = f"you have used today's requests; they reset at midnight UTC{own_clause}"
+        else:
+            message = f"you have used this hour's requests; {wait}{own_clause}"
         raise ServiceError(
             "visitor_limit_reached",
-            "you have used this hour's requests; try again in "
-            f"{minutes} minute{'' if minutes == 1 else 's'}",
+            message,
             status=429,
             headers={"Retry-After": str(exc.resets_in_s)},
         ) from None
     except limits.LimitsUnavailable as exc:
-        log["limits"] = str(exc)  # the error's class and SQLSTATE, nothing else
+        log["limits"] = str(exc)  # the limiter exposes only the class and SQLSTATE
         if exc.code == limits.LOCK_NOT_AVAILABLE:
-            # The visitor's own parallel requests held the lock: letting this one run
-            # uncounted would hand a scripted burst unmetered Sonnet.
             raise ServiceError(
                 "visitor_limit_reached",
                 "too many requests at once; try again in a few seconds",
                 status=429,
                 headers={"Retry-After": str(CONTENDED_RETRY_AFTER_S)},
             ) from None
-        unmetered = True
-    if unmetered and wanted == "opus":
-        tier, reason = "sonnet", LIMITS_UNAVAILABLE
+        if not own:
+            raise ServiceError(
+                LIMITS_UNAVAILABLE,
+                "the site cannot count requests right now; try again shortly" + own_clause,
+                status=503,
+                headers={"Retry-After": "30"},
+            ) from None
     log["tier"] = tier
-    if lead is None:
+    if own or lead is None:
         return _Admitted(tier)
 
     models = chain_models(settings, lead)
@@ -278,7 +320,7 @@ def _admit(
             )
         )
         start = last
-    return _Admitted(tier, start, tuple(notes), blocked)
+    return _Admitted(tier, start, tuple(notes), blocked, window)
 
 
 def _passcode_error(settings: Settings, headers: Mapping[str, str]) -> ServiceError | None:
@@ -310,10 +352,18 @@ def _parse(body: bytes) -> NerRequest:
             raise ServiceError(
                 "missing_text", "'text' is required and must be a string", status=400
             ) from None
+        if field == "provider":
+            raise ServiceError(
+                "bad_credential",
+                "own API keys are not available for that provider on this site",
+                status=400,
+            ) from None
         if field == "top_k":
             raise ServiceError("bad_top_k", "'top_k' must be an integer", status=400) from None
         if first["type"] == "extra_forbidden":
-            message = f"unknown field {field[:40]!r}; send text, prompt, model and top_k"
+            message = (
+                "unknown request field; send text, prompt, model, selector, top_k and provider"
+            )
         else:
             message = f"'{field}' must be a string or null"
         raise ServiceError("bad_json", message, status=400) from None
@@ -390,33 +440,31 @@ def _claude_health(settings: Settings) -> RetrieverStatus:
 
 
 def _visitor_health(settings: Settings, headers: Mapping[str, str]) -> dict[str, Any]:
-    """The calling visitor's allowance as ``limits.peek`` reads it (nothing is
-    recorded): ``tier`` is where a request for Opus would start now. With the limiter
-    unreachable or off there are no counts: the numbers then say what `_admit` would
-    do, Sonnet uncounted, or the whole allowance on a private (passcode) deployment."""
+    """Report the read-only peek, or how admission behaves without usable counters."""
     allowance = settings.allowance
-    state = "off"
     try:
         limiter = _visitor_limits(settings)
         if limiter is not None:
             seen = limiter.peek(_visitor(settings, headers))
-            return {
-                "limits": "on",
-                "tier": seen.tier,
-                "opus_left": seen.opus_left,
-                "sonnet_left": seen.sonnet_left,
-                "resets_in_s": seen.resets_in_s,
-            }
+            balances = asdict(seen)
+            del balances["reason"]
+            return {"limits": "on", **balances}
+        unmetered = settings.passcode is not None
     except limits.LimitsUnavailable:
-        state = "unavailable"
-    unmetered = state == "off" and settings.passcode is not None
+        unmetered = False
     now = _now()
     return {
-        "limits": state,
-        "tier": "opus" if unmetered else "sonnet",
+        "limits": "off" if unmetered else "unavailable",
+        "tier": "opus" if unmetered else "blocked",
         "opus_left": allowance.opus_per_hour if unmetered else 0,
-        "sonnet_left": allowance.sonnet_per_hour,
-        "resets_in_s": max(1, math.ceil(limits.HOUR_S - now % limits.HOUR_S)),
+        "sonnet_left": allowance.sonnet_per_hour if unmetered else 0,
+        "opus_left_today": allowance.opus_per_day if unmetered else 0,
+        "sonnet_left_today": allowance.sonnet_per_day if unmetered else 0,
+        "own_left": None,
+        "own_left_today": None,
+        "day_resets_in_s": math.ceil(limits.DAY_S - now % limits.DAY_S),
+        "resets_in_s": math.ceil(limits.HOUR_S - now % limits.HOUR_S),
+        "window": "hour",
     }
 
 
@@ -433,6 +481,13 @@ def _health(settings: Settings, headers: Mapping[str, str]) -> dict[str, Any]:
         retrieval=retrieval_status(indexes, settings),
         selectors=list(settings.offered_selectors),
         default_selector=settings.default_selector,
+        own_keys=OwnKeys(
+            enabled=bool(settings.own_providers),
+            providers=[OwnProvider.model_validate(info) for info in settings.own_providers],
+        ),
+        visitor=VisitorStatus.model_validate(_visitor_health(settings, headers))
+        if settings.claude_offered
+        else None,
     )
     data: dict[str, Any] = health.model_dump(mode="json")
     # Not in HealthResponse: what an operator needs to see when /api/ner would be 503.
@@ -445,24 +500,110 @@ def _health(settings: Settings, headers: Mapping[str, str]) -> dict[str, Any]:
             + (
                 "only the Claude models are offered"
                 if settings.configured
-                else "POST /api/ner answers 503 not_configured"
+                else "POST /api/ner on the site's keys answers 503 not_configured"
             ),
         )
     else:
         llm = check_key(settings) or RetrieverStatus(status="ok")
     data["llm"] = llm.model_dump(mode="json")
-    # Not in HealthResponse either (spec 2026-11-18 section 6): the Anthropic key's
-    # status, and where Claude is offered the calling visitor's allowance. Offline mode
-    # spends no key and counts no visitor, so it reports neither.
+    # Offline mode spends no key, so it reports no operator Claude probe.
     if not settings.offline:
         data["claude"] = _claude_health(settings).model_dump(mode="json")
-    if settings.claude_offered:
-        data["visitor"] = _visitor_health(settings, headers)
     # Not in HealthResponse either: where the terms and indexes come from.
     data["backend"] = settings.backend
     if settings.backend == "neon":
         data["neon"] = {"schema": settings.neon_schema, "catalog": settings.catalog}
     return data
+
+
+class _OwnJSONClient:
+    """Clean decoded model strings before stages can use them in regex caches or diagnostics.
+
+    The adapter removes literal echoes. JSON escapes can hide the token until the
+    stage parses its answer. Use the stage parser so fenced and repaired JSON go
+    through the same check. Leave unreadable answers to the usual stage errors.
+    """
+
+    def __init__(self, client: LLMClient, credential: providers.Credential) -> None:
+        self._client = client
+        self._token = credential.token
+
+    @property
+    def model(self) -> str:
+        return self._client.model
+
+    @property
+    def capabilities(self) -> LLMCapabilities:
+        return self._client.capabilities
+
+    @property
+    def fingerprint(self) -> str:
+        return self._client.fingerprint
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        answer = await self._client.complete(request)
+        key = self._token()
+        if "\\" not in answer.text and key not in answer.text:
+            return answer
+        try:
+            data = parse_json_object(answer.text)
+        except ParseError:
+            return answer
+        safe = _redact(data, (key,))
+        return answer if safe == data else replace(answer, text=json.dumps(safe))
+
+
+@contextmanager
+def _provider_errors(provider: str) -> Iterator[None]:
+    """A failure building or closing an own client has the same envelope as a failed call."""
+    try:
+        yield
+        return
+    except asyncio.CancelledError:
+        error = providers.provider_error(asyncio.TimeoutError(), provider)
+    except Exception as exc:
+        error = providers.provider_error(exc, provider)
+    raise error
+
+
+async def _run_own(
+    credential: providers.Credential,
+    valid: NerRequest,
+    settings: Settings,
+    indexes: Mapping[str, OntologyIndex],
+    started: float,
+) -> NerResponse:
+    """Each constructed stage is closed even if construction of the next stage fails."""
+    assert valid.model is not None and valid.selector is not None
+    build = partial(
+        providers.own_llm,
+        credential,
+        effort=settings.claude_effort,
+        max_entities=settings.limits.max_entities,
+        call_cap=settings.limits.llm_call_cap,
+    )
+
+    async def close(client: Any) -> None:
+        with _provider_errors(credential.provider):
+            await client.aclose()
+
+    async with AsyncExitStack() as stack:
+        with _provider_errors(credential.provider):
+            llm = build(valid.model, purpose="extract")
+            stack.push_async_callback(close, llm)
+            selector = None
+            if valid.selector != RETRIEVAL_ONLY:
+                selector = build(valid.selector, purpose="select")
+                stack.push_async_callback(close, selector)
+        return await run(
+            valid,
+            settings=settings,
+            indexes=indexes,
+            started_at=started,
+            llm=_OwnJSONClient(llm, credential),
+            select_llm=_OwnJSONClient(selector, credential) if selector is not None else None,
+            extra_secrets=(credential.token(),),
+        )
 
 
 async def _ner(
@@ -474,6 +615,7 @@ async def _ner(
     started: float,
     indexes: Mapping[str, OntologyIndex],
     admitted: _Admitted | None = None,
+    credential: providers.Credential | None = None,
     claude_factory: ClaudeFactory | None = None,
 ) -> dict[str, Any]:
     """Build the clients for a validated, admitted request and run it on `indexes`.
@@ -483,59 +625,67 @@ async def _ner(
     the extraction model is an OpenRouter model. Everything else is built as before."""
     assert valid.model is not None
     model, selector = valid.model, valid.selector or RETRIEVAL_ONLY
-    start = 0 if admitted is None else admitted.start
-    chain: LLMClient | None = None
-    if admitted is not None and is_claude(model):
-        chain = make_chain(
-            settings,
-            model,
-            start=start,
-            purposes=(EXTRACT, SELECT) if is_claude(selector) else (EXTRACT,),
-            claude_factory=claude_factory,
-            llm_factory=factory,
-            select_factory=make_select_llm,
-        )
-    llm = chain if chain is not None else factory(settings, model)
-    decider = make_decider(settings) if selector == JEV else None
-    select_llm: LLMClient | None = None
-    if admitted is not None and is_claude(selector):
-        select_llm = chain or make_chain(
-            settings,
-            selector,
-            start=start,
-            purposes=(SELECT,),
-            claude_factory=claude_factory,
-            select_factory=make_select_llm,
-        )
-    elif selector not in (JEV, RETRIEVAL_ONLY):
-        select_llm = make_select_llm(settings, selector)
-    try:
-        response = await run(
-            valid,
-            settings=settings,
-            llm=llm,
-            indexes=indexes,
-            started_at=started,
-            decider=decider,
-            select_llm=select_llm,
-            admitted=() if admitted is None else admitted.notes,
-            claude_blocked=None if admitted is None else admitted.blocked,
-        )
-    except BaseException:
-        if admitted is not None:  # a failed request still says how far down it went
-            log["fallbacks"] = [note.model_dump(mode="json") for note in admitted.notes] + [
-                {"stage": f.stage, "from": f.from_model, "to": f.to_model, "reason": f.reason}
-                for client in dict.fromkeys(c for c in (llm, select_llm) if c is not None)
-                for f in getattr(client, "fallbacks", ())
-            ]
-        raise
-    finally:
-        closed: list[object] = []
-        for client in (llm, decider, select_llm):
-            close = getattr(client, "aclose", None)
-            if callable(close) and not any(client is seen for seen in closed):
-                closed.append(client)
-                await close()
+    if credential is not None:
+        token = _OWN_RUN.set(True)
+        try:
+            response = await _run_own(credential, valid, settings, indexes, started)
+        finally:
+            _OWN_RUN.reset(token)
+    else:
+        start = 0 if admitted is None else admitted.start
+        chain: LLMClient | None = None
+        if admitted is not None and is_claude(model):
+            chain = make_chain(
+                settings,
+                model,
+                start=start,
+                purposes=(EXTRACT, SELECT) if is_claude(selector) else (EXTRACT,),
+                claude_factory=claude_factory,
+                llm_factory=factory,
+                select_factory=make_select_llm,
+            )
+        llm = chain if chain is not None else factory(settings, model)
+        decider = make_decider(settings) if selector == JEV else None
+        select_llm: LLMClient | None = None
+        if admitted is not None and is_claude(selector):
+            select_llm = chain or make_chain(
+                settings,
+                selector,
+                start=start,
+                purposes=(SELECT,),
+                claude_factory=claude_factory,
+                select_factory=make_select_llm,
+            )
+        elif selector not in (JEV, RETRIEVAL_ONLY):
+            select_llm = make_select_llm(settings, selector)
+        try:
+            response = await run(
+                valid,
+                settings=settings,
+                llm=llm,
+                indexes=indexes,
+                started_at=started,
+                decider=decider,
+                select_llm=select_llm,
+                admitted=() if admitted is None else admitted.notes,
+                claude_blocked=None if admitted is None else admitted.blocked,
+                allowance_window="hour" if admitted is None else admitted.window,
+            )
+        except BaseException:
+            if admitted is not None:  # a failed request still says how far down it went
+                log["fallbacks"] = [note.model_dump(mode="json") for note in admitted.notes] + [
+                    {"stage": f.stage, "from": f.from_model, "to": f.to_model, "reason": f.reason}
+                    for client in dict.fromkeys(c for c in (llm, select_llm) if c is not None)
+                    for f in getattr(client, "fallbacks", ())
+                ]
+            raise
+        finally:
+            closed: list[object] = []
+            for client in (llm, decider, select_llm):
+                close = getattr(client, "aclose", None)
+                if callable(close) and not any(client is seen for seen in closed):
+                    closed.append(client)
+                    await close()
     if admitted is not None:
         log["fallbacks"] = [note.model_dump(mode="json") for note in response.fallbacks]
         log["ran"] = response.model
@@ -559,7 +709,7 @@ async def _ner(
 def handle(
     method: str,
     path: str,
-    headers: Mapping[str, str],
+    headers: Mapping[str, str | Sequence[str]],
     body: bytes,
     *,
     settings: Settings,
@@ -573,20 +723,36 @@ def handle(
     started = time.monotonic()
     method = method.upper()
     path = urlsplit(path).path or "/"
-    lowered = {k.lower(): v for k, v in headers.items()}
+    lowered = {}
+    for name in headers:
+        if name.lower() != "authorization":
+            value = headers[name]
+            lowered[name.lower()] = value if isinstance(value, str) else ", ".join(value)
+    extra_secrets: list[str] = []
     log: dict[str, Any] = {
-        "method": method,
-        "path": path[:MAX_LOGGED_PATH],
+        "method": method if method in KNOWN_METHODS else "(unknown)",
+        "path": path if path in ALLOWED else "(unknown)",
         "mode": settings.mode,
         "body_bytes": len(body),
     }
     try:
-        result = _dispatch(method, path, lowered, body, settings, llm_factory, log, claude_factory)
+        result = _dispatch(
+            method,
+            path,
+            lowered,
+            body,
+            settings,
+            llm_factory,
+            log,
+            claude_factory,
+            headers,
+            extra_secrets,
+        )
     except ServiceError as exc:
         log["code"] = exc.code
         allow = ALLOWED.get(path) if exc.code == "method_not_allowed" else None
         extra = {**exc.headers, **({"Allow": ", ".join(allow)} if allow else {})}
-        result = _error(exc, settings, extra)
+        result = _error(exc, settings, extra, extra_secrets)
     except Exception as exc:  # noqa: BLE001 - a 500 with no detail; type and place to the log
         frames = traceback.extract_tb(exc.__traceback__)
         log["code"] = "internal"
@@ -595,10 +761,11 @@ def handle(
         result = _error(
             ServiceError("internal", "internal error; see the function log", status=500),
             settings,
+            extra_secrets=extra_secrets,
         )
     log["status"] = result[0]
     log.setdefault("timing_ms", {})["handle"] = round((time.monotonic() - started) * 1000)
-    _log(log, settings)
+    _log(log, settings, extra_secrets)
     return result
 
 
@@ -610,11 +777,13 @@ def _dispatch(
     settings: Settings,
     llm_factory: LLMFactory | None,
     log: dict[str, Any],
-    claude_factory: ClaudeFactory | None = None,
+    claude_factory: ClaudeFactory | None,
+    raw_headers: Mapping[str, str | Sequence[str]],
+    extra_secrets: list[str],
 ) -> Response:
     allowed = ALLOWED.get(path)
     if allowed is None:
-        raise ServiceError("not_found", f"no such endpoint: {path[:MAX_LOGGED_PATH]}", status=404)
+        raise ServiceError("not_found", "no such endpoint", status=404)
     if method not in allowed:
         raise ServiceError(
             "method_not_allowed",
@@ -637,14 +806,35 @@ def _dispatch(
     passcode = _passcode_error(settings, headers)
     if passcode is not None:
         raise passcode
-    if not settings.configured:
+    request = _check_encodable(_parse(body))
+    # Record only a recognised mode, even when its credential is missing or refused.
+    if request.provider in (None, providers.SITE):
+        log.update(provider=providers.SITE, credential="site")
+    elif request.provider in providers.OWN_PROVIDERS:
+        log.update(provider=request.provider, credential="visitor")
+    credential = providers.read_credential(
+        request.provider,
+        raw_headers,
+        enabled=tuple(info.id for info in settings.own_providers),
+        text=request.text,
+        prompt=request.prompt,
+    )
+    if credential is not None:
+        key = credential.token()
+        extra_secrets.append(key)
+        # A value pasted into a forwarding header is not an address to hash into SQL.
+        headers = {
+            name: headers[name]
+            for name in limits.ADDRESS_HEADERS
+            if name in headers and key not in headers[name]
+        }
+    elif not settings.configured:
         raise ServiceError(
             "not_configured",
             "the service has no ANTHROPIC_API_KEY and no OPENROUTER_API_KEY; the operator "
             "must set one (or NER_SITE_OFFLINE=1 for the stand-in extractor)",
             status=503,
         )
-    request = _check_encodable(_parse(body))
     log["text_chars"] = len(request.text)
     log["custom_prompt"] = bool(request.prompt and request.prompt.strip())
     started = time.monotonic()  # the request deadline also covers admission and the indexes
@@ -665,10 +855,11 @@ def _dispatch(
             started=started,
             indexes=indexes,
             admitted=admitted,
+            credential=credential,
             claude_factory=claude_factory,
         )
     )
-    return 200, _headers(), _json_body(data, settings)
+    return 200, _headers(), _json_body(data, settings, extra_secrets)
 
 
 # --- Vercel: settings from the process environment, and the shim's I/O -----------
@@ -681,14 +872,17 @@ def env_settings(env: Mapping[str, str] | None = None) -> Settings | SettingsErr
     """``Settings.from_env`` for the process environment, read once per distinct set of
     values (a warm instance reuses it); a bad value is returned, not raised."""
     source = os.environ if env is None else env
-    key = tuple(source.get(name) for name in ENV_NAMES)
+    key = tuple(
+        source.get(name) if name != "DATABASE_URL" or uses_database(source) else None
+        for name in ENV_NAMES
+    )
     with _SETTINGS_LOCK:
         found = _SETTINGS.get(key)
         if found is None:
             try:
                 found = Settings.from_env(source)
             except SettingsError as exc:
-                found = exc
+                found = SettingsError(str(exc))  # cached errors must not retain request frames
             _SETTINGS[key] = found
         return found
 
@@ -727,8 +921,8 @@ def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Respo
         request.close_connection = True
         _log(
             {
-                "method": method,
-                "path": urlsplit(request.path).path[:MAX_LOGGED_PATH],
+                "method": method if method in KNOWN_METHODS else "(unknown)",
+                "path": route if (route := urlsplit(request.path).path) in ALLOWED else "(unknown)",
                 "status": early.status,
                 "code": early.code,
                 "body_bytes": length,
@@ -737,7 +931,12 @@ def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Respo
         )
         return _error(early, settings)
     body = request.rfile.read(length) if length else b""
-    headers = {k.lower(): v for k, v in request.headers.items()}
+    headers: dict[str, str | Sequence[str]] = {
+        k.lower(): request.headers[k] for k in request.headers if k.lower() != "authorization"
+    }
+    if method == "POST" and urlsplit(request.path).path == NER_PATH:
+        headers["authorization"] = request.headers.get_all("Authorization", [])
+
     return handle(method, request.path, headers, body, settings=settings)
 
 
@@ -750,8 +949,8 @@ def serve(request: BaseHTTPRequestHandler) -> None:
         )
         _log(
             {
-                "method": request.command,
-                "path": urlsplit(request.path).path[:MAX_LOGGED_PATH],
+                "method": request.command if request.command in KNOWN_METHODS else "(unknown)",
+                "path": route if (route := urlsplit(request.path).path) in ALLOWED else "(unknown)",
                 "status": 503,
                 "code": "not_configured",
             },

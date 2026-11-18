@@ -1,5 +1,7 @@
 {
   "ok": true,
+  "provider": "site",
+  "credential_source": "site",
   "model": "offline",
   "mode": "offline",
   "entities": [

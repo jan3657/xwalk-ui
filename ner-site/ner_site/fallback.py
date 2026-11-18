@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from xwalk.llm.base import (
     LLMCapabilities,
@@ -224,13 +224,7 @@ class FallbackLLM:
                 retried = False
                 continue
             if failed != Usage.zero():
-                response = LLMResponse(
-                    text=response.text,
-                    usage=response.usage + failed,
-                    model=response.model,
-                    structured=response.structured,
-                    finish_reason=response.finish_reason,
-                )
+                response = replace(response, usage=response.usage + failed)
             return response, client.model
 
     def view(self) -> ChainView:
@@ -267,6 +261,7 @@ class ChainView:
         self._chain = chain
         self.answered_by: str | None = None
         self.asked: str | None = None
+        self.served_by_fallback = False
 
     @property
     def model(self) -> str:
@@ -283,6 +278,7 @@ class ChainView:
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response, asked = await self._chain.answer(request)
         self.answered_by, self.asked = response.model, asked
+        self.served_by_fallback = getattr(response, "served_by_fallback", False)
         return response
 
 

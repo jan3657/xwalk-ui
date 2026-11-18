@@ -15,6 +15,7 @@ import httpx
 import pytest
 from ner_site import fake, service
 from ner_site import indexes as indexes_mod
+from ner_site.claude import ClaudeResponse
 from ner_site.extract import DEFAULT_PROMPT, ExtractionError, extract
 from ner_site.schema import Limits, NerRequest, NerResponse, ServiceError
 from ner_site.service import Settings, SettingsError, make_llm, run, validate_request
@@ -873,7 +874,7 @@ def test_the_database_url_is_ignored_where_nothing_uses_it(env: dict[str, str]) 
     platform integration may have put anything in ``DATABASE_URL``: as before Claude,
     it is neither read nor validated."""
     for value in ("mysql://u:p@h/db", "not a url", DB_URL):
-        s = Settings.from_env({**env, "DATABASE_URL": value})
+        s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "", **env, "DATABASE_URL": value})
         assert s.backend == "bundled" and s.database_url is None
         assert value not in s.secrets() and s.index_settings().database_url is None
 
@@ -1355,7 +1356,12 @@ def test_a_model_id_the_site_has_no_name_for_is_shown_as_it_is(
     class Elsewhere(FakeLLM):
         async def complete(self, request: LLMRequest) -> LLMResponse:
             response = await super().complete(request)
-            return LLMResponse(text=response.text, usage=response.usage, model="claude-opus-4-9")
+            return ClaudeResponse(
+                text=response.text,
+                usage=response.usage,
+                model="claude-opus-4-9",
+                served_by_fallback=True,
+            )
 
     s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
     chain = service.make_chain(
@@ -1378,7 +1384,7 @@ def test_a_model_id_the_site_has_no_name_for_is_shown_as_it_is(
     ]
     assert out.notices == [
         "Claude Opus 5.5 declined this text; this ran on claude-opus-4-9.",
-        "Claude Opus 5.5 declined this text; the remaining picks ran on claude-opus-4-9.",
+        "Claude Opus 5.5 declined this text; the pick for e1 ran on claude-opus-4-9.",
     ]
     assert service.display_name("claude-opus-4-9") == "claude-opus-4-9"
     assert service.display_name(OPUS) == "Claude Opus 5.5"
@@ -1395,7 +1401,12 @@ def test_a_server_side_fallback_is_recorded_once_per_stage_and_model(
     class Elsewhere(FakeLLM):
         async def complete(self, request: LLMRequest) -> LLMResponse:
             response = await super().complete(request)
-            return LLMResponse(text=response.text, usage=response.usage, model=self.served)
+            return ClaudeResponse(
+                text=response.text,
+                usage=response.usage,
+                model=self.served,
+                served_by_fallback=self.model == SONNET,
+            )
 
     def served(model: str, handler: Any, as_: str) -> FakeLLM:
         llm = Elsewhere(handler=handler, model=model)
@@ -1425,7 +1436,7 @@ def test_a_server_side_fallback_is_recorded_once_per_stage_and_model(
     ]
     assert out.notices == [
         "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
-        "Claude Sonnet 5.5 declined this text; the remaining picks ran on claude-sonnet-4-9.",
+        "Claude Sonnet 5.5 declined this text; the picks for e1, e2 ran on claude-sonnet-4-9.",
     ]
 
     # The OpenRouter step: whatever name its answer carries, nothing was refused.
@@ -1600,3 +1611,111 @@ def test_a_claude_key_check_that_could_not_be_completed_is_not_an_outage(
     # Remembered only as long as a refusal, so the next look asks Anthropic again.
     clock[0] += service.KEY_REFUSED_TTL_S + 1
     assert service.check_claude_key(s, client=SDK(None)) == service.RetrieverStatus(status="ok")
+
+
+@pytest.mark.parametrize("field", ["opus_per_day", "sonnet_per_day", "own_per_hour", "own_per_day"])
+def test_new_allowance_settings(field: str) -> None:
+    name = "NER_SITE_" + field.upper()
+    assert name in service.ENV_NAMES
+    for value in (0, 9999, 10000):
+        assert getattr(Settings.from_env({name: str(value)}).allowance, field) == value
+    for value in ("-1", "10001", "3.2"):
+        with pytest.raises(SettingsError, match=name):
+            Settings.from_env({name: value})
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("NER_SITE_OWN_PROVIDERS", "openai,site"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "gpt-6-luna,"),
+        ("NER_SITE_OWN_MODELS_OPENROUTER", " "),
+        ("NER_SITE_OWN_MODELS_ANTHROPIC", "openai/gpt-6-luna"),
+        ("NER_SITE_OWN_MODELS_ANTHROPIC", "claude-invented"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "jev"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "retrieval"),
+    ],
+)
+def test_invalid_own_settings(name: str, value: str) -> None:
+    assert name in service.ENV_NAMES
+    with pytest.raises(SettingsError, match=name):
+        Settings.from_env({name: value})
+
+
+def test_own_models_resolve_per_provider_at_validation() -> None:
+    s = Settings.from_env({"NER_SITE_OWN_MODELS_OPENAI": " second, first,second "})
+    req = validate_request(NerRequest(provider="openai", text="sample"), s)
+    assert (req.model, req.selector, req.provider) == ("second", "retrieval", "openai")
+    for options, code in (
+        ({"model": GEMINI}, "unknown_model"),
+        ({"selector": "jev"}, "unknown_selector"),
+    ):
+        with pytest.raises(ServiceError) as exc:
+            validate_request(NerRequest(provider="openai", text="sample", **options), s)
+        assert exc.value.code == code
+    assert Settings.from_env({"DATABASE_URL": DB_URL}).database_url == DB_URL
+
+
+@pytest.mark.parametrize(
+    "kind,code,status",
+    [
+        ("key_refused", "provider_key_refused", 401),
+        ("rate_limited", "provider_rate_limited", 429),
+        ("call_limit", "provider_error", 502),
+        ("timeout", "provider_error", 502),
+    ],
+)
+def test_own_extraction_failures_are_fixed(
+    kind: str, code: str, status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xwalk.llm.budget import CallLimitExceeded
+
+    class Fails(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            if kind == "timeout":
+                await asyncio.sleep(10)
+            if kind == "call_limit":
+                raise CallLimitExceeded("unsafe upstream detail")
+            raise _failing(kind, "unsafe upstream detail")
+
+    monkeypatch.setattr(service, "EXTRACT_TIMEOUT_S", 0.02)
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(
+            run(
+                NerRequest(text="x", provider="openai"),
+                settings=Settings.from_env({}),
+                indexes={},
+                llm=Fails([]),
+            )
+        )
+    assert (exc.value.code, exc.value.status) == (code, status)
+    assert exc.value.message.startswith("OpenAI ") and "unsafe" not in exc.value.message
+    if status == 502:
+        assert exc.value.message == f"OpenAI could not complete the request ({kind})."
+
+
+@pytest.mark.parametrize("flag,answered", [(True, SONNET), (False, "claude-opus-5-5-echo")])
+def test_only_the_adapter_signal_produces_a_server_notice(
+    flag: bool, answered: str, tmp_path: Path, bm25_only: Any
+) -> None:
+    class Echo(FakeLLM):
+        async def complete(self, request: LLMRequest) -> ClaudeResponse:
+            response = await super().complete(request)
+            return ClaudeResponse(
+                text=response.text, usage=response.usage, model=answered, served_by_fallback=flag
+            )
+
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        claude_factory=lambda st, m, purpose: Echo(
+            [EXTRACTED if purpose == "extract" else PICK], model=m
+        ),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, indexes=bm25_only, llm=chain, select_llm=chain)
+    )
+    assert [n.stage for n in out.fallbacks] == (["extract", "select"] if flag else [])
+    assert out.model == answered and out.entities[0].pick.selector == answered
+    assert len(out.notices) == (2 if flag else 0)

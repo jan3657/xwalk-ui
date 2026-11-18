@@ -693,3 +693,18 @@ async def test_aclose_closes_the_rest_when_one_step_fails_to_close() -> None:
         await chain.aclose()
 
     assert sonnet.closed
+
+
+async def test_view_keeps_server_fallback_signal_after_a_failed_attempt() -> None:
+    from ner_site.claude import ClaudeResponse
+
+    class Substitute(Scripted):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            return ClaudeResponse(text="ok", model="opus", usage=ANSWERED, served_by_fallback=True)
+
+    view = chain_of(Scripted("opus", [failing("rate_limited")]), Substitute("sonnet")).view()
+    assert view.served_by_fallback is False
+    response = await view.complete(REQUEST)
+    assert isinstance(response, ClaudeResponse) and response.served_by_fallback
+    assert response.usage.calls == 2
+    assert (view.asked, view.answered_by, view.served_by_fallback) == ("sonnet", "opus", True)

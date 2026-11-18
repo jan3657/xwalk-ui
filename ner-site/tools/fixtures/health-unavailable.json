@@ -66,7 +66,16 @@
   },
   "visitor": {
     "limits": "unavailable",
-    "tier": "blocked"
+    "tier": "blocked",
+    "opus_left": 0,
+    "sonnet_left": 0,
+    "opus_left_today": 0,
+    "sonnet_left_today": 0,
+    "own_left": null,
+    "own_left_today": null,
+    "resets_in_s": 1380,
+    "day_resets_in_s": 30180,
+    "window": "hour"
   },
   "own_keys": {
     "enabled": true,

@@ -67,7 +67,7 @@ VERCEL_JSON = PROJECT / "vercel.json"
 MAX_READ_BYTES = 1 << 20  # the service itself rejects bodies over 64 KB
 
 Response = tuple[int, dict[str, str], bytes]
-Backend = Callable[[str, str, dict[str, str], bytes], Response]
+Backend = Callable[[str, str, dict[str, str | list[str]], bytes], Response]
 HeaderRules = list[tuple[re.Pattern[str], list[tuple[str, str]]]]
 
 
@@ -105,9 +105,13 @@ CANNED_ERROR_STATUS = {
 OWN_KEY_ERRORS = frozenset(
     {"bad_credential", "provider_key_refused", "provider_rate_limited", "provider_error"}
 )
-BAD_CREDENTIAL = "the API key is missing or is not in the expected form"
+NEEDS_HEADER = (
+    "a request with your own API key needs exactly one Authorization header of the form "
+    "'Bearer <key>'"
+)
+BAD_KEY = "the API key must be 20 to 512 printable ASCII characters without spaces"
 # 20 to 512 printable ASCII characters without spaces, as the real API requires.
-BEARER = re.compile(r"Bearer ([\x21-\x7e]{20,512})")
+BEARER = re.compile(r"Bearer ([\x21-\x7e]{20,512})", re.IGNORECASE | re.ASCII)
 
 
 def _load_fixture(file: Path) -> object:
@@ -137,15 +141,15 @@ def _error_response(envelope: object, health: object) -> Response:
     return response
 
 
-def _own_provider_ids(health: object) -> set[str]:
+def _own_models(health: object) -> dict[str, list[str]]:
     own = health.get("own_keys") if isinstance(health, dict) else None
     if not isinstance(own, dict) or own.get("enabled") is not True:
-        return set()
+        return {}
     providers = own.get("providers")
     return {
-        p["id"]
+        p["id"]: p["models"]
         for p in (providers if isinstance(providers, list) else [])
-        if isinstance(p, dict) and isinstance(p.get("id"), str)
+        if isinstance(p, dict) and isinstance(p.get("id"), str) and p.get("models")
     }
 
 
@@ -181,13 +185,15 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
     health, ner, error = pick("health"), pick("ner"), pick("error")
     own_file = directory / "ner-own.json"
     own_ner = _load_fixture(own_file) if own_file.is_file() else ner
-    own_ids = _own_provider_ids(health)
+    own_models = _own_models(health)
     # A scenario with an error file of its own refuses every POST of the kind the error
     # is about (e.g. the 429 state for the site's keys, a refused key for an own key).
     always_error = bool(scenario) and (directory / f"error{suffix}.json").is_file()
     error_is_own = _error_code(error) in OWN_KEY_ERRORS
 
-    def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
+    def backend(
+        method: str, path: str, headers: dict[str, str | list[str]], body: bytes
+    ) -> Response:
         authorization = headers.get("authorization")
         # Whether a credential came, never the credential.
         seen = "absent" if authorization is None else "present"
@@ -206,11 +212,47 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
             return _envelope(400, "bad_json", "the request body is not valid JSON")
         provider = request.get("provider") if isinstance(request, dict) else None
         own = provider is not None and provider != "site"
-        known = isinstance(provider, str) and provider in own_ids
-        if own and not (known and authorization and BEARER.fullmatch(authorization)):
-            return _envelope(400, "bad_credential", BAD_CREDENTIAL)
+        known = isinstance(provider, str) and provider in own_models
+        if own and not known:
+            return _envelope(
+                400,
+                "bad_credential",
+                "own API keys are not available for that provider on this site",
+            )
+        if own:
+            value = authorization.strip(" \t") if isinstance(authorization, str) else ""
+            if not value.lower().startswith("bearer "):
+                return _envelope(400, "bad_credential", NEEDS_HEADER)
+            match = BEARER.fullmatch(value)
+            if match is None:
+                return _envelope(400, "bad_credential", BAD_KEY)
+            if any(
+                isinstance(request.get(f), str) and match[1] in request[f]
+                for f in ("text", "prompt")
+            ):
+                return _envelope(
+                    400,
+                    "bad_credential",
+                    "your API key also appears in the text or the prompt; "
+                    "remove it from there before running (and consider revoking that key)",
+                )
+            models = own_models[provider]
+            for field, choices in (("model", models), ("selector", ["retrieval", *models])):
+                if request.get(field) is None:
+                    request[field] = choices[0]
+                if request[field] not in choices:
+                    return _envelope(
+                        400,
+                        f"unknown_{field}",
+                        f"{field} is not offered; choose one of {', '.join(choices)}",
+                    )
         if not own and authorization is not None:
-            return _envelope(400, "bad_credential", BAD_CREDENTIAL)
+            return _envelope(
+                400,
+                "bad_credential",
+                "this request carries an API key but asks for the site's models; choose your "
+                "provider, or send no Authorization header",
+            )
         if always_error and own == error_is_own:
             return _error_response(error, health)
         text = request.get("text") if isinstance(request, dict) else None
@@ -243,7 +285,9 @@ def service_backend(*, offline: bool) -> Backend:
     handle: Callable[..., tuple[int, dict[str, str], bytes]] = http_mod.handle
     settings = service_mod.Settings.from_env(os.environ)
 
-    def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
+    def backend(
+        method: str, path: str, headers: dict[str, str | list[str]], body: bytes
+    ) -> Response:
         status, out_headers, out_body = handle(method, path, headers, body, settings=settings)
         return status, dict(out_headers), out_body
 
@@ -289,13 +333,19 @@ def make_handler(
                 self.close_connection = True
             else:
                 raw = self.rfile.read(length) if length > 0 else b""
-                lowered = {k.lower(): v for k, v in self.headers.items()}
+                lowered: dict[str, str | list[str]] = {
+                    k.lower(): self.headers[k] for k in self.headers if k.lower() != "authorization"
+                }
+                if method == "POST":
+                    auth = self.headers.get_all("Authorization", [])
+                    if auth:
+                        lowered["authorization"] = auth[0] if len(auth) == 1 else auth
                 if delay > 0 and method == "POST":
                     time.sleep(delay)
                 try:
                     status, headers, body = backend(method, urlsplit(self.path).path, lowered, raw)
                 except Exception as exc:  # noqa: BLE001 - a local dev server reports and goes on
-                    self.log_error("backend raised %r", exc)
+                    self.log_error("backend raised %s", type(exc).__name__)
                     status, headers, body = _envelope(500, "internal", "internal error")
             self.send_response(status)
             for key, value in headers.items():

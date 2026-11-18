@@ -2,6 +2,6 @@
   "ok": false,
   "error": {
     "code": "bad_credential",
-    "message": "the API key is missing or is not in the expected form"
+    "message": "the API key must be 20 to 512 printable ASCII characters without spaces"
   }
 }

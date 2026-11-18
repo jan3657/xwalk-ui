@@ -71,7 +71,9 @@ def test_the_plan_s_ner_response_round_trips_unchanged() -> None:
     # The plan's example predates the fields of 18 November 2026: they are additions,
     # appended after it at their defaults, and nothing before them moves.
     added = {"requested_model": "", "requested_selector": "", "fallbacks": [], "notices": []}
-    _round_trip(NerResponse, NER_RESPONSE, added)
+    _round_trip(
+        NerResponse, NER_RESPONSE, {**added, "provider": "site", "credential_source": "site"}
+    )
 
 
 def test_the_plan_s_health_response_round_trips_unchanged() -> None:
@@ -240,3 +242,22 @@ def test_the_claude_fixtures_show_the_usage_the_server_sends(
     assert all(isinstance(t, int) and t > 0 for t in tokens) if known else tokens == (None,) * 4
     if known:
         assert usage.selector_calls == picks
+
+
+def test_own_result_fixture_round_trip() -> None:
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "ner-site/tools/fixtures/ner-own.json"
+    data = json.loads(path.read_text())
+    assert (data["provider"], data["credential_source"]) == ("anthropic", "visitor")
+    assert NerResponse.model_validate(data).model_dump(mode="json") == data
+
+
+def test_health_schema_preserves_new_wire_fields() -> None:
+    from pathlib import Path
+
+    directory = Path(__file__).resolve().parents[1] / "ner-site/tools/fixtures"
+    for name in ("health.json", "health-own-off.json"):
+        data = json.loads((directory / name).read_text())
+        dumped = HealthResponse.model_validate(data).model_dump(mode="json")
+        assert dumped["own_keys"] == data["own_keys"] and dumped["visitor"] == data["visitor"]
