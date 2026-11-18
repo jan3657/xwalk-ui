@@ -9,16 +9,25 @@ E5_MODEL = "intfloat/multilingual-e5-small"
 
 
 @pytest.fixture(autouse=True)
-def _site_process_state(request: pytest.FixtureRequest) -> Iterator[None]:
+def _site_process_state(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
     """The NER site keeps a little state per warm instance: that Claude is unusable
     (``fallback.block_claude``), what the key checks found, the settings and the visitor
     limiter. A test that drives a chain into ``balance_exhausted`` would otherwise start
-    every later test on the OpenRouter step. Only the site's tests pay for the import."""
+    every later test on the OpenRouter step. The limiter's database is also closed off:
+    a test that wants one gives ``http.make_limits_executor`` a fake. Only the site's
+    tests pay for the import."""
     if not request.module.__name__.rsplit(".", 1)[-1].startswith("test_site_"):
         yield
         return
     from ner_site import fallback, service
     from ner_site import http as site_http
+
+    def no_database(database_url: str) -> Any:
+        raise AssertionError("a site test reached for the visitor limiter's real database")
+
+    monkeypatch.setattr(site_http, "make_limits_executor", no_database)
 
     def clear() -> None:
         fallback.reset()

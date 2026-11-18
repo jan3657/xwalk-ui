@@ -8,9 +8,17 @@ JSON body, ``Cache-Control: no-store`` and no ``Access-Control-*`` header.
 Order of checks for ``POST /api/ner``: path (404), method (405; ``OPTIONS`` too, on
 purpose, so no preflight ever succeeds), body size (413), ``X-Requested-With:
 xwalk-ner`` (400 ``bad_header``), passcode (401), configuration (503), JSON (400), field
-limits (400), then the run (422/429/502). An unexpected exception is a 500 ``internal``
-whose log line names only the exception type and where it was raised: its message could
-carry the visitor's text.
+limits (400), the visitor's allowance (429 ``visitor_limit_reached``), then the run
+(422/429/502). An unexpected exception is a 500 ``internal`` whose log line names only
+the exception type and where it was raised: its message could carry the visitor's text.
+
+Admission (docs/superpowers/specs/2026-11-18-claude-provider-open-access-design.md
+sections 3.3 and 5) comes after every check that can refuse a request, so a refused
+request is never counted. It applies where Claude is offered (an Anthropic key, not
+offline): the visitor's hourly allowance decides whether a request for Opus starts on
+Opus or on Sonnet, and a Claude that is known to be unusable moves the start to the
+OpenRouter step. The visitor is a keyed hash of the client address; neither it nor the
+address is ever logged or returned.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import math
 import os
 import re
 import sys
@@ -26,17 +35,21 @@ import time
 import traceback
 from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 from xwalk.llm.base import LLMClient
+from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
-from ner_site import fake
+from ner_site import fake, fallback, limits
+from ner_site.claude import OPUS, SONNET, is_claude
 from ner_site.indexes import get_indexes
 from ner_site.ontologies import catalog, full_catalog
 from ner_site.schema import (
+    FallbackNote,
     HealthResponse,
     NerRequest,
     OntologySummary,
@@ -46,9 +59,14 @@ from ner_site.schema import (
 from ner_site.select import JEV, RETRIEVAL_ONLY
 from ner_site.service import (
     ENV_NAMES,
+    EXTRACT,
+    SELECT,
+    ClaudeFactory,
     Settings,
     SettingsError,
+    chain_models,
     check_key,
+    make_chain,
     make_decider,
     make_llm,
     make_select_llm,
@@ -68,6 +86,11 @@ REQUESTED_WITH = "xwalk-ner"
 MAX_LOGGED_PATH = 80
 MAX_LENGTH_DIGITS = 18
 REQUEST_WORKERS = 16  # threads per request for retriever searches (BM25 and embeddings)
+# One round trip to Neon before the request may run: short, so a slow database becomes
+# "limits unavailable" (Sonnet, uncounted) and not a slow request.
+LIMITS_TIMEOUT_S = 3.0
+LIMITS_UNAVAILABLE = "limits_unavailable"
+CLAUDE_UNAVAILABLE = "claude_unavailable"
 
 
 def _headers(extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -106,6 +129,134 @@ def default_llm_factory(settings: Settings, model: str) -> LLMClient:
     if settings.offline:
         return fake.offline_llm()
     return make_llm(settings, model)
+
+
+# --- the visitor allowance: one limiter per warm instance and database -------------
+
+_LIMITS_LOCK = threading.Lock()
+_LIMITS: dict[tuple[str, str, limits.Allowance], limits.VisitorLimits] = {}
+
+
+def make_limits_executor(database_url: str) -> SQLExecutor:
+    """The executor the visitor limiter queries with. Not the indexes' one
+    (``indexes.make_executor``): that one retries, and the limiter's statement counts a
+    visit, so a retried request could count one visit twice. Tests replace it."""
+    return NeonHTTPExecutor(database_url, timeout=LIMITS_TIMEOUT_S, max_retries=0)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _visitor_limits(settings: Settings) -> limits.VisitorLimits | None:
+    """The limiter, or None where it is off: Claude is not offered (nothing to meter),
+    or there is no ``DATABASE_URL``. Kept per database, schema and allowance, so a warm
+    instance creates the table once. Raises ``LimitsUnavailable`` when it cannot be set
+    up, which is handled like a database that cannot be reached."""
+    if not settings.claude_offered or settings.database_url is None:
+        return None
+    key = (settings.database_url, settings.neon_schema, settings.allowance)
+    with _LIMITS_LOCK:
+        found = _LIMITS.get(key)
+        if found is None:
+            try:
+                executor = make_limits_executor(settings.database_url)
+                found = limits.VisitorLimits(
+                    executor, settings.neon_schema, settings.allowance, clock=_now
+                )
+            except ValueError as exc:  # a connection string the executor cannot use
+                raise limits.LimitsUnavailable(
+                    f"visitor limits could not be set up ({type(exc).__name__})"
+                ) from None
+            _LIMITS[key] = found
+        return found
+
+
+def _visitor(settings: Settings, headers: Mapping[str, str]) -> str:
+    """The calling visitor's id (``limits.visitor_id``). Never log or return it."""
+    salt = settings.visitor_salt or limits.default_salt(settings.database_url or "")
+    return limits.visitor_id(headers, salt)
+
+
+@dataclass(frozen=True)
+class _Admitted:
+    """Where an admitted request starts: its tier (``opus``, ``sonnet`` or ``other``),
+    the step of ``chain_models`` its chain starts on, and the step-downs that decided
+    it (stage ``admit``)."""
+
+    tier: str
+    start: int = 0
+    notes: tuple[FallbackNote, ...] = ()
+
+
+def _admit(
+    settings: Settings, request: NerRequest, headers: Mapping[str, str], log: dict[str, Any]
+) -> _Admitted | None:
+    """Count the visit and decide where the request starts (spec sections 3.3 and 5).
+
+    None where Claude is not offered: no allowance, no chain, the request runs as it
+    always did. Otherwise the wanted tier comes from the model, or from the selector
+    when only the selector is Claude, and:
+
+    - limiter on: ``limits.admit`` grants Opus or Sonnet and records the visit, or the
+      hour is used (429 ``visitor_limit_reached`` with ``Retry-After``);
+    - limiter unreachable: the request is not counted and a request for Opus starts on
+      Sonnet;
+    - limiter off (no ``DATABASE_URL``): with a passcode Claude is unmetered, without
+      one a request for Opus starts on Sonnet, as for unreachable.
+
+    Then a Claude that is known to be unusable (``fallback.claude_block``) moves the
+    start to the OpenRouter step, when the chain has one."""
+    if not settings.claude_offered:
+        return None
+    assert request.model is not None
+    lead = next((m for m in (request.model, request.selector) if m and is_claude(m)), None)
+    wanted: limits.Tier = "opus" if lead == OPUS else "sonnet" if lead == SONNET else "other"
+    tier: str = wanted
+    reason: str | None = None
+    unmetered = False
+    try:
+        limiter = _visitor_limits(settings)
+        if limiter is None:
+            unmetered = settings.passcode is None
+        else:
+            admission = limiter.admit(_visitor(settings, headers), wanted)
+            tier, reason = admission.tier, admission.reason
+    except limits.VisitorLimitReached as exc:
+        minutes = max(1, math.ceil(exc.resets_in_s / 60))
+        raise ServiceError(
+            "visitor_limit_reached",
+            "you have used this hour's requests; try again in "
+            f"{minutes} minute{'' if minutes == 1 else 's'}",
+            status=429,
+            headers={"Retry-After": str(exc.resets_in_s)},
+        ) from None
+    except limits.LimitsUnavailable as exc:
+        log["limits"] = str(exc)  # the error's class and SQLSTATE, nothing else
+        unmetered = True
+    if unmetered and wanted == "opus":
+        tier, reason = "sonnet", LIMITS_UNAVAILABLE
+    log["tier"] = tier
+    if lead is None:
+        return _Admitted(tier)
+
+    models = chain_models(settings, lead)
+    start = 0
+    notes: list[FallbackNote] = []
+    if wanted == "opus" and tier == "sonnet":
+        start = 1
+        notes.append(
+            FallbackNote(stage="admit", from_=OPUS, to=SONNET, reason=reason or limits.OPUS_USED)
+        )
+    last = len(models) - 1
+    if fallback.claude_block() is not None and not is_claude(models[last]) and start < last:
+        notes.append(
+            FallbackNote(
+                stage="admit", from_=models[start], to=models[last], reason=CLAUDE_UNAVAILABLE
+            )
+        )
+        start = last
+    return _Admitted(tier, start, tuple(notes))
 
 
 def _passcode_error(settings: Settings, headers: Mapping[str, str]) -> ServiceError | None:
@@ -236,22 +387,49 @@ def _health(settings: Settings) -> dict[str, Any]:
 
 
 async def _ner(
-    settings: Settings, request: NerRequest, factory: LLMFactory, log: dict[str, Any]
+    settings: Settings,
+    valid: NerRequest,
+    factory: LLMFactory,
+    log: dict[str, Any],
+    *,
+    started: float,
+    admitted: _Admitted | None = None,
+    claude_factory: ClaudeFactory | None = None,
 ) -> dict[str, Any]:
-    started = time.monotonic()  # the request deadline also covers opening the indexes
-    valid = validate_request(request, settings)
+    """Build the clients for a validated, admitted request and run it.
+
+    A request for a Claude model runs on one fallback chain, started where `admitted`
+    says; a Claude selector uses that chain, or one of its own (for selection only) when
+    the extraction model is an OpenRouter model. Everything else is built as before."""
     assert valid.model is not None
-    log["model"] = valid.model
-    log["top_k"] = valid.top_k
-    log["selector"] = valid.selector
+    model, selector = valid.model, valid.selector or RETRIEVAL_ONLY
     indexes = get_indexes(settings.index_settings())
-    llm = factory(settings, valid.model)
-    decider = make_decider(settings) if valid.selector == JEV else None
-    select_llm = (
-        make_select_llm(settings, valid.selector)
-        if valid.selector not in (None, JEV, RETRIEVAL_ONLY)
-        else None
-    )
+    start = 0 if admitted is None else admitted.start
+    chain: LLMClient | None = None
+    if admitted is not None and is_claude(model):
+        chain = make_chain(
+            settings,
+            model,
+            start=start,
+            purposes=(EXTRACT, SELECT) if is_claude(selector) else (EXTRACT,),
+            claude_factory=claude_factory,
+            llm_factory=factory,
+            select_factory=make_select_llm,
+        )
+    llm = chain if chain is not None else factory(settings, model)
+    decider = make_decider(settings) if selector == JEV else None
+    select_llm: LLMClient | None = None
+    if admitted is not None and is_claude(selector):
+        select_llm = chain or make_chain(
+            settings,
+            selector,
+            start=start,
+            purposes=(SELECT,),
+            claude_factory=claude_factory,
+            select_factory=make_select_llm,
+        )
+    elif selector not in (JEV, RETRIEVAL_ONLY):
+        select_llm = make_select_llm(settings, selector)
     try:
         response = await run(
             valid,
@@ -261,12 +439,26 @@ async def _ner(
             started_at=started,
             decider=decider,
             select_llm=select_llm,
+            admitted=() if admitted is None else admitted.notes,
         )
+    except BaseException:
+        if admitted is not None:  # a failed request still says how far down it went
+            log["fallbacks"] = [note.model_dump(mode="json") for note in admitted.notes] + [
+                {"stage": f.stage, "from": f.from_model, "to": f.to_model, "reason": f.reason}
+                for client in dict.fromkeys(c for c in (llm, select_llm) if c is not None)
+                for f in getattr(client, "fallbacks", ())
+            ]
+        raise
     finally:
+        closed: list[object] = []
         for client in (llm, decider, select_llm):
             close = getattr(client, "aclose", None)
-            if callable(close):
+            if callable(close) and not any(client is seen for seen in closed):
+                closed.append(client)
                 await close()
+    if admitted is not None:
+        log["fallbacks"] = [note.model_dump(mode="json") for note in response.fallbacks]
+        log["ran"] = response.model
     log.update(
         entities=len(response.entities),
         matches=sum(len(e.matches) for e in response.entities),
@@ -292,8 +484,12 @@ def handle(
     *,
     settings: Settings,
     llm_factory: LLMFactory | None = None,
+    claude_factory: ClaudeFactory | None = None,
 ) -> Response:
-    """One request. ``headers`` keys in any case; ``path`` with or without a query."""
+    """One request. ``headers`` keys in any case; ``path`` with or without a query.
+
+    ``llm_factory`` builds the OpenRouter extraction client and ``claude_factory`` the
+    Claude clients (``service.make_claude``); both exist for tests."""
     started = time.monotonic()
     method = method.upper()
     path = urlsplit(path).path or "/"
@@ -305,11 +501,12 @@ def handle(
         "body_bytes": len(body),
     }
     try:
-        result = _dispatch(method, path, lowered, body, settings, llm_factory, log)
+        result = _dispatch(method, path, lowered, body, settings, llm_factory, log, claude_factory)
     except ServiceError as exc:
         log["code"] = exc.code
         allow = ALLOWED.get(path) if exc.code == "method_not_allowed" else None
-        result = _error(exc, settings, {"Allow": ", ".join(allow)} if allow else None)
+        extra = {**exc.headers, **({"Allow": ", ".join(allow)} if allow else {})}
+        result = _error(exc, settings, extra)
     except Exception as exc:  # noqa: BLE001 - a 500 with no detail; type and place to the log
         frames = traceback.extract_tb(exc.__traceback__)
         log["code"] = "internal"
@@ -333,6 +530,7 @@ def _dispatch(
     settings: Settings,
     llm_factory: LLMFactory | None,
     log: dict[str, Any],
+    claude_factory: ClaudeFactory | None = None,
 ) -> Response:
     allowed = ALLOWED.get(path)
     if allowed is None:
@@ -362,14 +560,30 @@ def _dispatch(
     if not settings.configured:
         raise ServiceError(
             "not_configured",
-            "the service has no OPENROUTER_API_KEY; the operator must set it "
-            "(or NER_SITE_OFFLINE=1 for the stand-in extractor)",
+            "the service has no ANTHROPIC_API_KEY and no OPENROUTER_API_KEY; the operator "
+            "must set one (or NER_SITE_OFFLINE=1 for the stand-in extractor)",
             status=503,
         )
     request = _check_encodable(_parse(body))
     log["text_chars"] = len(request.text)
     log["custom_prompt"] = bool(request.prompt and request.prompt.strip())
-    data = run_request(_ner(settings, request, llm_factory or default_llm_factory, log))
+    started = time.monotonic()  # the request deadline also covers admission and the indexes
+    valid = validate_request(request, settings)
+    log["model"] = valid.model
+    log["top_k"] = valid.top_k
+    log["selector"] = valid.selector
+    admitted = _admit(settings, valid, headers, log)  # last: a refused request is not counted
+    data = run_request(
+        _ner(
+            settings,
+            valid,
+            llm_factory or default_llm_factory,
+            log,
+            started=started,
+            admitted=admitted,
+            claude_factory=claude_factory,
+        )
+    )
     return 200, _headers(), _json_body(data, settings)
 
 
@@ -396,8 +610,11 @@ def env_settings(env: Mapping[str, str] | None = None) -> Settings | SettingsErr
 
 
 def reset() -> None:
+    """Forget the settings and the visitor limiter of this instance (tests)."""
     with _SETTINGS_LOCK:
         _SETTINGS.clear()
+    with _LIMITS_LOCK:
+        _LIMITS.clear()
 
 
 def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Response:
@@ -470,4 +687,11 @@ def serve(request: BaseHTTPRequestHandler) -> None:
         request.wfile.write(body)
 
 
-__all__ = ["default_llm_factory", "env_settings", "handle", "reset", "serve"]
+__all__ = [
+    "default_llm_factory",
+    "env_settings",
+    "handle",
+    "make_limits_executor",
+    "reset",
+    "serve",
+]

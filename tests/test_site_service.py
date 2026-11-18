@@ -964,27 +964,34 @@ def test_make_chain_steps_follow_the_wanted_model_and_the_keys(tmp_path: Path) -
         ("sonnet", SONNET),
         ("other", GEMINI),
     ]
-    assert seen == [(OPUS, "extract"), (OPUS, "select"), (SONNET, "extract"), (SONNET, "select")]
+    assert seen == []  # a client is built when the chain first reaches it
     opus, _, other = (step.client for step in chain.steps)
-    assert isinstance(opus, service.StagedLLM)
+    assert isinstance(opus, service.StagedLLM) and opus.stages == ("extract", "select")
     # Each Claude client has its own budget, with the limit of its OpenRouter twin.
-    extract_client, select_client = opus.clients["extract"], opus.clients["select"]
+    extract_client, select_client = opus.client("extract"), opus.client("select")
+    assert seen == [(OPUS, "extract"), (OPUS, "select")]
+    assert opus.client("extract") is extract_client  # built once
     assert isinstance(extract_client, BudgetedLLM) and isinstance(select_client, BudgetedLLM)
     assert extract_client.budget is not select_client.budget
     assert extract_client.budget.limit == 3 and select_client.budget.limit == 50
     # The last step is what a request for that OpenRouter model gets today.
     assert isinstance(other, service.StagedLLM)
-    last_extract, last_select = other.clients["extract"], other.clients["select"]
+    last_extract, last_select = other.client("extract"), other.client("select")
     assert isinstance(last_extract, BudgetedLLM) and isinstance(last_select, BudgetedLLM)
     assert isinstance(last_extract.inner, OpenAICompatClient)
     assert last_extract.budget.limit == 3 and last_select.budget.limit == 50
     assert last_extract.generation_defaults == {"temperature": 0.0, "max_tokens": 2048}
     assert last_select.generation_defaults == {"temperature": 0.0, "max_tokens": 600}
+    # The stage decides which of a step's clients answers.
+    service.enter_stage(chain, "select")
+    assert chain.stage == "select" and other.client() is last_select
+    service.enter_stage(chain, "extract")
+    assert other.client() is last_extract
     asyncio.run(chain.aclose())
 
     only_select = service.make_chain(s, SONNET, purposes=("select",), claude_factory=claude)
     assert only_select.stage == "select" and len(only_select.steps) == 2
-    assert set(only_select.steps[0].client.clients) == {"select"}  # type: ignore[attr-defined]
+    assert only_select.steps[0].client.stages == ("select",)  # type: ignore[attr-defined]
     asyncio.run(only_select.aclose())
 
 

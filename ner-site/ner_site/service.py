@@ -581,40 +581,54 @@ def make_claude(settings: Settings, model: str, purpose: str) -> LLMClient:
 
 
 class StagedLLM:
-    """One step of a chain: the same model with one client per stage.
+    """One step of a chain: one model with a client per stage, each built when first used.
 
     A chain serves the whole request, but extraction and selection are configured
     differently on every provider (token limit, retries, call budget; on OpenRouter
     exactly what :func:`make_llm` and :func:`make_select_llm` set). ``stage`` says which
-    client answers; :func:`enter_stage` moves a chain and its steps together."""
+    client answers; :func:`enter_stage` moves a chain and its steps together. Building
+    late means a request that stays on Opus never opens a connection pool for Sonnet or
+    for OpenRouter."""
 
-    def __init__(self, clients: Mapping[str, LLMClient]) -> None:
-        if not clients:
-            raise ValueError("a staged step needs at least one client")
-        self.clients: dict[str, LLMClient] = dict(clients)
-        self.stage = next(iter(self.clients))
+    def __init__(self, model: str, makers: Mapping[str, Callable[[], LLMClient]]) -> None:
+        if not makers:
+            raise ValueError("a staged step needs at least one stage")
+        self._model = model
+        self._makers = dict(makers)
+        self._clients: dict[str, LLMClient] = {}
+        self.stage = next(iter(self._makers))
+
+    def client(self, stage: str | None = None) -> LLMClient:
+        """The client of `stage` (the current one by default), built on first use. A
+        stage this step was not given is served by its first one."""
+        name = stage or self.stage
+        if name not in self._makers:
+            name = next(iter(self._makers))
+        if name not in self._clients:
+            self._clients[name] = self._makers[name]()
+        return self._clients[name]
 
     @property
-    def _current(self) -> LLMClient:
-        return self.clients.get(self.stage) or next(iter(self.clients.values()))
+    def stages(self) -> tuple[str, ...]:
+        return tuple(self._makers)
 
     @property
     def model(self) -> str:
-        return self._current.model
+        return self._model
 
     @property
     def fingerprint(self) -> str:
-        return self._current.fingerprint
+        return self.client().fingerprint
 
     @property
     def capabilities(self) -> LLMCapabilities:
-        return self._current.capabilities
+        return self.client().capabilities
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        return await self._current.complete(request)
+        return await self.client().complete(request)
 
     async def aclose(self) -> None:
-        for client in self.clients.values():
+        for client in self._clients.values():
             close = getattr(client, "aclose", None)
             if callable(close):
                 await close()
@@ -655,32 +669,33 @@ def make_chain(
     """The fallback chain for one request that asked for the Claude model `wanted`,
     started at step `start` of :func:`chain_models`.
 
-    Every step holds one client per purpose in `purposes`. A Claude client is wrapped in
-    its own ``BudgetedLLM`` with the limit the OpenRouter client of that purpose has: the
-    request's call cap for extraction, two calls per entity allowed for selection. The
-    last step is :func:`make_llm` / :func:`make_select_llm` for the fallback model, so on
-    OpenRouter a request behaves as it does without a chain. The factories exist for
-    tests. The caller closes the chain."""
+    Every step has one client per purpose in `purposes`, built when the chain first
+    reaches it. A Claude client is wrapped in its own ``BudgetedLLM`` with the limit the
+    OpenRouter client of that purpose has: the request's call cap for extraction, two
+    calls per entity allowed for selection. The last step is :func:`make_llm` /
+    :func:`make_select_llm` for the fallback model, so on OpenRouter a request behaves
+    as it does without a chain. The factories exist for tests. The caller closes the
+    chain."""
     build_claude = claude_factory or make_claude
     makers: dict[str, LLMMaker] = {
         EXTRACT: llm_factory or make_llm,
         SELECT: select_factory or make_select_llm,
     }
     caps = {EXTRACT: settings.limits.llm_call_cap, SELECT: settings.limits.max_entities * 2}
+
+    def claude(model: str, purpose: str) -> Callable[[], LLMClient]:
+        return lambda: BudgetedLLM(
+            build_claude(settings, model, purpose), CallBudget(limit=caps[purpose])
+        )
+
+    def openrouter(model: str, purpose: str) -> Callable[[], LLMClient]:
+        return lambda: makers[purpose](settings, model)
+
     steps: list[Step] = []
     for model in chain_models(settings, wanted):
-        if is_claude(model):
-            label = "opus" if model == OPUS else "sonnet"
-            clients: dict[str, LLMClient] = {
-                purpose: BudgetedLLM(
-                    build_claude(settings, model, purpose), CallBudget(limit=caps[purpose])
-                )
-                for purpose in purposes
-            }
-        else:
-            label = "other"
-            clients = {purpose: makers[purpose](settings, model) for purpose in purposes}
-        steps.append(Step(label, StagedLLM(clients)))
+        label = "opus" if model == OPUS else "sonnet" if model == SONNET else "other"
+        make = claude if is_claude(model) else openrouter
+        steps.append(Step(label, StagedLLM(model, {p: make(model, p) for p in purposes})))
     chain = FallbackLLM(steps, start=start)
     enter_stage(chain, purposes[0])
     return chain
@@ -1132,6 +1147,9 @@ async def run(
 
 
 __all__ = [
+    "EXTRACT",
+    "SELECT",
+    "ClaudeFactory",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODELS",
     "ENV_NAMES",

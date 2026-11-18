@@ -1137,3 +1137,492 @@ def test_the_default_prompt_follows_the_entity_limit(cache_dir: Path, tmp_path: 
     result = _post(s_live, {"text": "nothing", "prompt": None}, llm_factory=lambda st, m: llm)
     assert result[0] == 200, result[2]
     assert "at most 7 entities" in llm.requests[0].user
+
+
+# --- open access: admission, the chain and the visitor allowance --------------------
+# (docs/superpowers/specs/2026-11-18-claude-provider-open-access-design.md, 5, 6, 8)
+
+ANTHROPIC_KEY = "sk-ant-SENTINEL-feedbeef-9191"
+DB_URL = "postgresql://owner:npg_SENTINELpw0123@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
+RAW_IP = "203.0.113.77"
+OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5-5"
+GEMINI = "google/gemini-3.1-flash-lite"
+VISITOR_HEADERS = {**POST_HEADERS, "x-real-ip": RAW_IP, "x-forwarded-for": f"{RAW_IP}, 10.0.0.1"}
+HALO_TEXT = "She took haloperidol for a fever."
+HALO = _answer(("haloperidol", "chemical", 9, 20))
+PICK = '{"chosen_key": "C01", "confidence_score": 0.7, "explanation": "first"}'
+
+
+def _claude_error(reason: str) -> Exception:
+    error = LLMRetryableError(f"Anthropic said {reason} to {ANTHROPIC_KEY}")
+    error.reason = reason  # type: ignore[attr-defined]
+    return error
+
+
+class _Claude:
+    """The Claude seam of ``handle``: scripted clients, one per model and purpose."""
+
+    def __init__(self, extracted: str = '{"entities": []}', **scripts: Any) -> None:
+        self.extracted = extracted
+        self.scripts = scripts  # opus_extract=[...], sonnet_select=[...]
+        self.made: dict[tuple[str, str], FakeLLM] = {}
+
+    def __call__(self, settings: Settings, model: str, purpose: str) -> FakeLLM:
+        tier = "opus" if model == OPUS else "sonnet"
+        script = self.scripts.get(f"{tier}_{purpose}")
+        answer = self.extracted if purpose == "extract" else PICK
+        llm = (
+            FakeLLM(script, model=model)
+            if script is not None
+            else FakeLLM(handler=lambda request: answer, model=model)
+        )
+        self.made[(model, purpose)] = llm
+        return llm
+
+    def calls(self, model: str, purpose: str = "extract") -> int:
+        made = self.made.get((model, purpose))
+        return 0 if made is None else len(made.requests)
+
+
+def _no_claude(settings: Settings, model: str, purpose: str) -> Any:
+    pytest.fail("a Claude client was built for a request that should not use Claude")
+
+
+@pytest.fixture
+def visits(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The limiter's table, in memory (tests/test_site_limits.py), behind the seam the
+    real Neon executor is made by."""
+    from tests.test_site_limits import FakeVisits
+
+    fake = FakeVisits()
+    opened: list[str] = []
+
+    def executor(database_url: str) -> Any:
+        opened.append(database_url)
+        return fake
+
+    monkeypatch.setattr(http_mod, "make_limits_executor", executor)
+    fake.opened = opened
+    return fake
+
+
+def _open_site(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """An open deployment: both keys, the database, no passcode, the new defaults."""
+    base = {
+        "OPENROUTER_API_KEY": SENTINEL_KEY,
+        "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "DATABASE_URL": DB_URL,
+        "NER_SITE_SELECTOR": "",
+    }
+    return _settings(cache_dir, tmp_path, **{**base, **env})
+
+
+def _ask(
+    settings: Settings,
+    payload: dict[str, Any] | None = None,
+    *,
+    claude: Any = None,
+    llm_factory: Any = None,
+    headers: dict[str, str] | None = None,
+) -> Handled:
+    body = json.dumps({"text": "nothing", "selector": "retrieval", **(payload or {})})
+    return http_mod.handle(
+        "POST",
+        "/api/ner",
+        dict(VISITOR_HEADERS if headers is None else headers),
+        body.encode("utf-8"),
+        settings=settings,
+        llm_factory=llm_factory or _never,
+        claude_factory=claude or _Claude(),
+    )
+
+
+def _tiers(fake: Any) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for (_, _, tier), count in fake.rows.items():
+        found[tier] = found.get(tier, 0) + count
+    return found
+
+
+def _last_log(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    record: dict[str, Any] = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    return record
+
+
+def test_a_request_runs_on_opus_by_default(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    claude = _Claude(HALO)
+    result = http_mod.handle(
+        "POST",
+        "/api/ner",
+        dict(VISITOR_HEADERS),
+        json.dumps({"text": HALO_TEXT}).encode(),
+        settings=s,
+        llm_factory=_never,
+        claude_factory=claude,
+    )
+    assert result[0] == 200, result[2]
+    out = NerResponse.model_validate_json(result[2])
+    assert out.model == out.requested_model == OPUS
+    assert out.selector == out.requested_selector == OPUS
+    assert out.fallbacks == [] and out.notices == []
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == OPUS and entity.pick.id
+    assert claude.calls(OPUS, "extract") == 1 and claude.calls(OPUS, "select") == 1
+    assert claude.calls(SONNET, "extract") == claude.calls(SONNET, "select") == 0
+    assert _tiers(visits) == {"opus": 1} and visits.opened == [DB_URL]
+    record = _last_log(capsys)
+    assert record["tier"] == "opus" and record["fallbacks"] == []
+    assert record["model"] == OPUS and record["ran"] == OPUS and record["status"] == 200
+
+
+def test_the_eleventh_request_runs_on_sonnet_and_the_thirty_first_is_refused(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    for _ in range(10):
+        tenth = _ask(s)
+    assert _json(tenth)["model"] == OPUS and _json(tenth)["notices"] == []
+    eleventh = _json(_ask(s))
+    assert eleventh["model"] == SONNET and eleventh["requested_model"] == OPUS
+    assert eleventh["fallbacks"] == [
+        {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "opus_allowance_used"}
+    ]
+    assert eleventh["notices"] == [
+        "Your Opus allowance for this hour is used; this ran on Claude Sonnet 5.5."
+    ]
+    record = _last_log(capsys)
+    assert record["tier"] == "sonnet" and record["fallbacks"] == eleventh["fallbacks"]
+    for _ in range(19):
+        thirtieth = _ask(s)
+    assert thirtieth[0] == 200 and _tiers(visits) == {"opus": 10, "sonnet": 20}
+
+    claude = _Claude()
+    refused = _ask(s, claude=claude)
+    assert _error(refused) == (429, "visitor_limit_reached")
+    retry_after = int(refused[1]["Retry-After"])
+    assert 1 <= retry_after <= 3600
+    minutes = -(-retry_after // 60)
+    unit = "minute" if minutes == 1 else "minutes"
+    assert _json(refused)["error"]["message"] == (
+        f"you have used this hour's requests; try again in {minutes} {unit}"
+    )
+    _assert_common_headers(refused[1])
+    assert claude.made == {} and _tiers(visits) == {"opus": 10, "sonnet": 20}  # not recorded
+    record = _last_log(capsys)
+    assert record["status"] == 429 and record["code"] == "visitor_limit_reached"
+    # Another visitor is not affected.
+    other = _ask(s, headers={**POST_HEADERS, "x-real-ip": "198.51.100.9"})
+    assert other[0] == 200 and _json(other)["model"] == OPUS
+
+
+def test_the_allowance_follows_the_settings(cache_dir: Path, tmp_path: Path, visits: Any) -> None:
+    s = _open_site(cache_dir, tmp_path, NER_SITE_OPUS_PER_HOUR="1", NER_SITE_SONNET_PER_HOUR="1")
+    assert [_json(_ask(s)).get("model") for _ in range(2)] == [OPUS, SONNET]
+    assert _ask(s)[0] == 429
+
+
+def test_a_request_for_sonnet_is_counted_as_sonnet(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    claude = _Claude()
+    out = _json(_ask(s, {"model": SONNET}, claude=claude))
+    assert out["model"] == SONNET and out["fallbacks"] == [] and _tiers(visits) == {"sonnet": 1}
+    assert (OPUS, "extract") not in claude.made  # the chain starts at the wanted model
+
+
+def test_an_unreachable_limiter_means_sonnet_uncounted_with_a_notice(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from xwalk.retrieval.postgres import PostgresError
+
+    visits.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({DB_URL})", code="08006")
+    s = _open_site(cache_dir, tmp_path)
+    result = _ask(s)
+    assert result[0] == 200
+    out = _json(result)
+    assert out["model"] == SONNET
+    assert out["fallbacks"] == [
+        {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "limits_unavailable"}
+    ]
+    assert out["notices"] == ["Visitor limits are unavailable; this ran on Claude Sonnet 5.5."]
+    assert visits.rows == {}
+    err = capsys.readouterr().err
+    record = json.loads(err.strip().splitlines()[-1])
+    assert record["tier"] == "sonnet" and "PostgresError" in record["limits"]
+    assert "ep-x-pooler" not in err and "SENTINELpw" not in err
+    # A request for Sonnet or for an OpenRouter model runs as asked, uncounted.
+    assert _json(_ask(s, {"model": SONNET}))["fallbacks"] == []
+    plain = _ask(s, {"model": GEMINI}, llm_factory=_fake('{"entities": []}'), claude=_no_claude)
+    assert plain[0] == 200 and _json(plain)["fallbacks"] == [] and visits.rows == {}
+
+
+def test_without_a_database_an_open_site_starts_on_sonnet_and_a_private_one_on_opus(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    open_site = _open_site(cache_dir, tmp_path, DATABASE_URL="")
+    out = _json(_ask(open_site))
+    assert out["model"] == SONNET
+    assert out["fallbacks"][0]["reason"] == "limits_unavailable" and len(out["notices"]) == 1
+    private = _open_site(cache_dir, tmp_path, DATABASE_URL="", NER_SITE_PASSCODE=PASSCODE)
+    headers = {**VISITOR_HEADERS, "x-passcode": PASSCODE}
+    for _ in range(12):  # unmetered: Opus every time
+        out = _json(_ask(private, headers=headers))
+        assert out["model"] == OPUS and out["fallbacks"] == [] and out["notices"] == []
+
+
+def test_a_private_site_with_a_database_is_metered_after_the_passcode(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    assert _error(_ask(s, claude=_no_claude)) == (401, "passcode_required")
+    assert visits.sent == []  # refused before the limiter is asked
+    assert _ask(s, headers={**VISITOR_HEADERS, "x-passcode": PASSCODE})[0] == 200
+    assert _tiers(visits) == {"opus": 1}
+
+
+def test_a_blocked_claude_starts_on_the_fallback_model_with_the_notice(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ner_site import fallback
+
+    fallback.block_claude("balance_exhausted")
+    s = _open_site(cache_dir, tmp_path)
+    claude = _Claude()
+    result = _ask(s, claude=claude, llm_factory=_fake('{"entities": []}'))
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert out["requested_model"] == OPUS and out["model"] == "fake"  # what the answer names
+    assert out["fallbacks"] == [
+        {"stage": "admit", "from": OPUS, "to": GEMINI, "reason": "claude_unavailable"}
+    ]
+    assert out["notices"] == [
+        "Claude is unavailable (balance exhausted); this ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter."
+    ]
+    assert all(len(fake.requests) == 0 for fake in claude.made.values())
+    assert _tiers(visits) == {"opus": 1}  # the visit is still the visitor's
+    assert _last_log(capsys)["fallbacks"] == out["fallbacks"]
+    # After the allowance step-down too: both departures, in order.
+    for _ in range(10):
+        last = _json(_ask(s, llm_factory=_fake('{"entities": []}')))
+    assert [f["reason"] for f in last["fallbacks"]] == ["opus_allowance_used", "claude_unavailable"]
+    assert [(f["from"], f["to"]) for f in last["fallbacks"]] == [(OPUS, SONNET), (SONNET, GEMINI)]
+    # Without an OpenRouter key there is no step to move to: Claude is tried.
+    alone = _open_site(cache_dir, tmp_path, OPENROUTER_API_KEY="")
+    tried = _Claude()
+    fresh = {**POST_HEADERS, "x-real-ip": "198.51.100.9"}  # a visitor with Opus left
+    assert _json(_ask(alone, claude=tried, headers=fresh))["fallbacks"] == []
+    assert tried.calls(OPUS) == 1
+
+
+def test_a_balance_error_in_one_request_moves_the_next_one_off_claude(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    dead = _claude_error("balance_exhausted")
+    first = _ask(
+        s,
+        claude=_Claude(opus_extract=[dead], sonnet_extract=[dead]),
+        llm_factory=_fake('{"entities": []}'),
+    )
+    assert first[0] == 200 and ANTHROPIC_KEY.encode() not in first[2]
+    assert [f["stage"] for f in _json(first)["fallbacks"]] == ["extract", "extract"]
+    second = _json(_ask(s, claude=_no_claude_calls(), llm_factory=_fake('{"entities": []}')))
+    assert [f["reason"] for f in second["fallbacks"]] == ["claude_unavailable"]
+
+
+def _no_claude_calls() -> Any:
+    def build(settings: Settings, model: str, purpose: str) -> FakeLLM:
+        return FakeLLM([AssertionError("Claude was called while it is blocked")], model=model)
+
+    return build
+
+
+def test_a_request_for_an_openrouter_model_has_no_chain_and_counts_as_other(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    seen: list[str] = []
+
+    def factory(settings: Settings, model: str) -> FakeLLM:
+        seen.append(model)
+        return FakeLLM(['{"entities": []}'])
+
+    result = _ask(s, {"model": GEMINI}, llm_factory=factory, claude=_no_claude)
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert out["model"] == out["requested_model"] == GEMINI and seen == [GEMINI]
+    assert out["fallbacks"] == [] and out["notices"] == []
+    assert _tiers(visits) == {"other": 1} and _last_log(capsys)["tier"] == "other"
+    # Jev as the selector does not make it a Claude request either.
+    monkey_decider: list[int] = []
+
+    def decider(settings: Settings) -> Any:
+        from xwalk.decide.fake import FakeDecider
+
+        monkey_decider.append(1)
+        return FakeDecider()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(http_mod, "make_decider", decider)
+        jev = _ask(s, {"model": GEMINI, "selector": "jev"}, llm_factory=factory, claude=_no_claude)
+    assert jev[0] == 200 and monkey_decider == [1] and _tiers(visits) == {"other": 2}
+
+
+def test_a_claude_selector_decides_the_tier_of_an_openrouter_request(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path, NER_SITE_OPUS_PER_HOUR="1")
+    claude = _Claude()
+    payload = {"text": HALO_TEXT, "model": GEMINI, "selector": OPUS}
+    first = _json(_ask(s, payload, claude=claude, llm_factory=_fake(HALO)))
+    assert first["model"] == GEMINI and first["entities"][0]["pick"]["selector"] == OPUS
+    assert first["fallbacks"] == [] and _tiers(visits) == {"opus": 1}
+    assert (OPUS, "extract") not in claude.made  # a chain for selection only
+    second = _json(_ask(s, payload, claude=_Claude(), llm_factory=_fake(HALO)))
+    assert second["entities"][0]["pick"]["selector"] == SONNET
+    assert second["fallbacks"] == [
+        {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "opus_allowance_used"}
+    ]
+
+
+def test_opus_extraction_with_jev_or_an_openrouter_selector_keeps_those_selectors(
+    cache_dir: Path, tmp_path: Path, visits: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    picker = FakeLLM(handler=lambda request: PICK, model=GEMINI)
+    monkeypatch.setattr(http_mod, "make_select_llm", lambda settings, model: picker)
+    claude = _Claude(HALO)
+    out = _json(_ask(s, {"text": HALO_TEXT, "selector": GEMINI}, claude=claude))
+    assert out["model"] == OPUS and out["entities"][0]["pick"]["selector"] == GEMINI
+    assert (OPUS, "select") not in claude.made and len(picker.requests) == 1
+
+
+def test_a_refused_request_is_not_counted(cache_dir: Path, tmp_path: Path, visits: Any) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    for payload in ({"top_k": 0}, {"text": " "}, {"model": "nobody/knows"}, {"selector": "x"}):
+        assert _ask(s, payload, claude=_no_claude)[0] == 400
+    missing = http_mod.handle(
+        "POST", "/api/ner", {"x-real-ip": RAW_IP}, b'{"text": "a"}', settings=s
+    )
+    assert _error(missing) == (400, "bad_header")
+    assert visits.sent == [] and visits.rows == {}
+
+
+def test_no_address_visitor_id_or_key_reaches_a_response_or_a_log_line(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ner_site import limits
+
+    s = _open_site(cache_dir, tmp_path)
+    visitor = limits.visitor_id({"x-real-ip": RAW_IP}, limits.default_salt(DB_URL))
+    capsys.readouterr()
+    limited = _claude_error("rate_limited")
+    results = [
+        _ask(s, {"text": HALO_TEXT, "selector": OPUS}, claude=_Claude(HALO)),
+        _ask(s, claude=_Claude(opus_extract=[limited])),
+        _ask(s, {"top_k": 99}),
+        http_mod.handle("GET", "/api/health", dict(VISITOR_HEADERS), b"", settings=s),
+    ]
+    for _ in range(30):
+        results.append(_ask(s))
+    assert results[-1][0] == 429
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == len(results)
+    for secret in (RAW_IP, visitor, ANTHROPIC_KEY, SENTINEL_KEY, DB_URL, "SENTINELpw", "10.0.0.1"):
+        assert secret not in err, secret
+        for _, headers, body in results:
+            assert secret.encode() not in body and secret not in json.dumps(headers)
+    # The visitor is the keyed hash of the address in every statement, never the address.
+    params = [value for _, sent in visits.sent for value in sent]
+    assert visitor in params and RAW_IP not in json.dumps(params)
+
+
+def test_the_salt_setting_changes_the_visitor_id(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    from ner_site import limits
+
+    s = _open_site(cache_dir, tmp_path, NER_SITE_VISITOR_SALT="salt-SENTINEL-0001")
+    assert _ask(s)[0] == 200
+    ((visitor, _, _),) = visits.rows
+    assert visitor == limits.visitor_id({"x-real-ip": RAW_IP}, "salt-SENTINEL-0001")
+
+
+def test_offline_mode_never_consults_the_limiter_or_claude(cache_dir: Path, tmp_path: Path) -> None:
+    """The conftest fixture fails any attempt to open the limiter's database."""
+    s = _open_site(cache_dir, tmp_path, NER_SITE_OFFLINE="1")
+    result = http_mod.handle(
+        "POST",
+        "/api/ner",
+        dict(VISITOR_HEADERS),
+        json.dumps({"text": EXAMPLE_TEXT}).encode(),
+        settings=s,
+        claude_factory=_no_claude,
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert out["model"] == "offline" and out["fallbacks"] == [] and out["notices"] == []
+
+
+def test_a_deployment_without_the_anthropic_key_behaves_as_before(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OpenRouter key, passcode and a Neon database: no limiter, no chain, no tier. (The
+    conftest fixture fails any attempt to open the limiter's database.)"""
+    s = _settings(
+        cache_dir,
+        tmp_path,
+        OPENROUTER_API_KEY=SENTINEL_KEY,
+        NER_SITE_PASSCODE=PASSCODE,
+        DATABASE_URL=DB_URL,
+    )
+    headers = {**VISITOR_HEADERS, "x-passcode": PASSCODE}
+    for _ in range(35):  # more than the hourly total
+        result = _post(s, {"text": "nothing"}, headers=headers, llm_factory=_fake("{}"))
+        assert _error(result) == (422, "extraction_schema")
+    ok = _post(s, {"text": "nothing"}, headers=headers, llm_factory=_fake('{"entities": []}'))
+    out = _json(ok)
+    assert ok[0] == 200 and out["model"] == out["requested_model"] == GEMINI
+    assert out["requested_selector"] == "retrieval" and out["fallbacks"] == []
+    record = _last_log(capsys)
+    assert "tier" not in record and record["model"] == GEMINI
+    refused = _post(s, {"text": "a", "model": OPUS}, headers=headers, llm_factory=_never)
+    assert _error(refused) == (400, "unknown_model")
+
+
+def test_every_step_failing_is_a_502_whose_log_line_says_how_far_it_went(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    limited = _claude_error("rate_limited")
+    result = _ask(
+        s,
+        claude=_Claude(opus_extract=[limited], sonnet_extract=[limited]),
+        llm_factory=_fake(LLMFatalError(f"HTTP 401 for {SENTINEL_KEY}")),
+    )
+    assert _error(result) == (502, "provider_error")
+    assert b"HTTP 401" in result[2] and SENTINEL_KEY.encode() not in result[2]
+    record = _last_log(capsys)
+    assert record["status"] == 502 and record["tier"] == "opus"
+    assert [(f["stage"], f["from"], f["to"]) for f in record["fallbacks"]] == [
+        ("extract", OPUS, SONNET),
+        ("extract", SONNET, GEMINI),
+    ]
+    assert _tiers(visits) == {"opus": 1}  # admitted, so counted, though it failed later
+
+
+def test_only_the_anthropic_key_is_a_configured_site(cache_dir: Path, tmp_path: Path) -> None:
+    s = _open_site(cache_dir, tmp_path, OPENROUTER_API_KEY="", DATABASE_URL="")
+    limited = _claude_error("rate_limited")
+    out = _json(_ask(s, {"model": SONNET}, claude=_Claude(sonnet_extract=[limited])))
+    # The chain ends at Sonnet: its error is the provider error, scrubbed.
+    assert out["error"]["code"] == "provider_error"
+    assert "rate_limited" in out["error"]["message"] and ANTHROPIC_KEY not in json.dumps(out)
+    bare = _settings(cache_dir, tmp_path)
+    message = _json(_ask(bare, claude=_no_claude))["error"]["message"]
+    assert "ANTHROPIC_API_KEY" in message and "OPENROUTER_API_KEY" in message
