@@ -82,6 +82,19 @@ canned server logs each API request with `authorization=present` or `absent`, ne
 value, which is how to see that only `POST /api/ner` carries a key. `--delay SECONDS`
 slows the POST to show the busy state.
 
+The private stats page (`http://127.0.0.1:8765/stats`, see "Analytics" below) is canned
+too. `GET /api/stats` wants the header `X-Stats-Passcode: local-stats-passcode` (not a
+secret: it opens fixture data only, and it is shorter than a real deployment accepts)
+and answers 401 without it. With it, the answer is a populated one for 7, 30 and 90
+days (`stats-7.json`, `stats.json`, `stats-90.json`). Three scenarios change that:
+`empty` (stats on, no run recorded yet), `nostats` (stats off: 404, before any passcode
+check) and `unavailable` (the database is down: 503). Each canned stats request is
+logged with `stats_passcode=present` or `absent`, never the value. Without `--canned`
+the real handler answers `/api/stats`, query string included, so
+`NER_SITE_STATS_PASSCODE=... DATABASE_URL=... python ner-site/tools/serve_local.py`
+shows the page against a real Neon database (the executor speaks Neon's HTTPS
+endpoint only, not a local Postgres).
+
 Smoke check (Playwright is resolved from `NODE_PATH` or `npm root -g`):
 
 ```bash
@@ -404,6 +417,11 @@ another machine, and asks a URL on this machine directly, never through a proxy 
 environment names. Because its report is redacted, it says itself whether a response
 contained the key or the passcode: such a response is marked `CREDENTIAL ECHO` and
 fails the run, and a run that sent a secret ends with a `credential echo check:` line.
+A value escaped more deeply than the tool decodes (eight rounds of percent decoding)
+gets no verdict, and no verdict is not a pass: the value is withheld, the run fails,
+and the last line says an echo "was detected or could not be ruled out". A key or
+passcode that is itself escaped that deeply is refused before anything is sent (exit
+2), because the tool could not recognise its echo.
 
 The examples below are written for a preview deployment that has the passcode, which
 a preview has unless its environment says otherwise (it inherits `NER_SITE_PASSCODE`
@@ -639,6 +657,7 @@ until the visitor chooses that.
 | `NER_SITE_OWN_MODELS_OPENROUTER` | `google/gemini-3.1-flash-lite,openai/gpt-6-luna` | The models an own OpenRouter key may run; the first is the default. The same rules. |
 | `NER_SITE_VISITOR_SALT` | derived | Salt for the visitor ids (a keyed hash of the client address). Unset, it is the SHA-256 of `DATABASE_URL`. Changing it, or the database URL when it is unset, gives every visitor a new id, which resets the current hour's and day's counts. |
 | `NER_SITE_PASSCODE` | unset | When set, every `/api/ner` request must send it as `X-Passcode`; the page asks for it and keeps it in `sessionStorage`. ASCII only (8 characters or more recommended): header values arrive as Latin-1, so a non-ASCII passcode could never match and is refused with 503 `not_configured`. It does not exempt anyone from the visitor allowance, and a request on a visitor's own key needs it too. |
+| `NER_SITE_STATS_PASSCODE` | unset (analytics off) | Turns on the record of runs and the private stats page ("Analytics" below): with it, every run writes one row to `site_runs` and `GET /api/stats` answers to this value in the `X-Stats-Passcode` header. A generated secret of at least 24 ASCII characters (`openssl rand -hex 24` gives 48); a shorter one is refused (503 `not_configured`). Mark it sensitive; it is scrubbed from every response and log line. Unset, nothing is recorded, `/api/stats` answers 404 and `DATABASE_URL` is read no more than before. It is independent of `NER_SITE_PASSCODE`. |
 | `NER_SITE_MAX_CHARS` | 5000 | Maximum text length (characters). |
 | `NER_SITE_MAX_ENTITIES` | 25 | Maximum entities kept per request; the default prompt (and `/api/health`'s `default_prompt`) states this number. |
 | `NER_SITE_MAX_PROMPT_CHARS` | 4000 | Maximum prompt length (characters). |
@@ -646,8 +665,8 @@ until the visitor chooses that.
 | `NER_SITE_DENSE_DIR` | `<project root>/indexes` | Where the committed dense indexes live. |
 | `NER_SITE_CACHE_DIR` | `/tmp/xwalk-ner-site` | Where BM25 indexes are built at cold start. |
 | `NER_SITE_BACKEND` | `bundled` | `neon` reads the records, BM25 and vectors from Neon Postgres instead of building BM25 in `/tmp` and opening the committed dense indexes (see "Neon backend" below). |
-| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (`NER_SITE_OWN_PROVIDERS` lists a provider), because the visitor allowance and the own-key flood limit are counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. |
-| `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` is created in it; the schema itself must already exist. |
+| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (`NER_SITE_OWN_PROVIDERS` lists a provider), because the visitor allowance and the own-key flood limit are counted there. Where it is read for one of these, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. With `NER_SITE_STATS_PASSCODE` set it is read on every deployment, for the record of runs. Where that is the only reason it is read, a value that cannot be used (not a Postgres URL, no host, malformed) is not an error: there are then no statistics (`GET /api/stats` answers 503 `stats_unavailable`) and everything else answers as with analytics off. |
+| `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` and the record of runs `site_runs` are created in it; the schema itself must already exist (`tools/setup_usage.py` creates it when it does not). |
 | `NER_SITE_NEON_DIMENSIONS` | 1024 | The loaded vector dimension (`load_neon.py --dimensions`); a different value makes dense stale. |
 | `NER_SITE_NEON_CATALOG` | `samples` | `full` serves the full catalogs (`chebi`, `ctd-disease`, `ncbi-gene`, `foodon`) once they are loaded; needs `NER_SITE_BACKEND=neon`. |
 
@@ -681,7 +700,7 @@ has) and 60 s while selecting.
 | Claude declined the text, after the server-side refusal fallback | next step at once | `refused` |
 | No answer within the call's timeout | next step at once, with no second wait on the same model | `timeout` |
 | The step's call cap for the request was reached | next step at once | `call_limit` |
-| 5xx, 408, 409, connection error, a 200 whose body cannot be decoded | the same step once more, then the next | `transient` |
+| 5xx, 408, 409, connection error, a 200 that cannot be decoded (a body that is not JSON, or not a message at all: an HTML page, a body without a JSON content type that is not JSON either) | the same step once more, then the next | `transient` |
 | A request the API rejects (other 4xx) | no step-down: extraction answers 502 `provider_error`, a pick is `failed` | none |
 | An answer that cannot be read as the JSON asked for | no step-down: extraction answers 422 (`extraction_unparseable`, or `extraction_schema` without an `entities` list), a pick is `failed` | none |
 
@@ -940,9 +959,12 @@ a 200, and the line of that request has `own_error` too: the first class that
 failed, or `WireRefused` whenever a pick was refused, whatever else failed beside
 it. So `"status": 200` with `"own_error": "WireRefused"` means picks the site itself
 did not send. When picks failed for more than one reason, `own_errors` lists the
-classes (sorted, at most eight). Only a failure of the provider, the SDK, the HTTP
-client or a timeout is reported as the provider's error, and so is a 200 whose body
-cannot be decoded (`bad_answer`): any other exception is a fault of the site's code.
+classes, sorted and all of them, so the one `own_error` names is always in the list.
+Only a failure of the provider, the SDK, the HTTP client or a timeout is reported as
+the provider's error, and so is a 200 that cannot be decoded (`bad_answer`): a body
+that is not JSON, one that is not a message at all (an HTML page, or a body without a
+JSON content type that is not JSON either), or one in a content coding the client did
+not offer. Any other exception is a fault of the site's code.
 During extraction it answers 500 `internal`, with `exception` and `where` in the log
 line as for any request; during selection it is a failed pick with the word `error`
 and its class in `own_error`. A client that fails to close after the run changes
@@ -966,6 +988,184 @@ own that it drops; without either they skip:
 ```bash
 NER_SITE_TEST_DATABASE_URL=postgresql://user@localhost:5432/postgres \
     python -m pytest -q -m integration tests/test_site_limits.py
+```
+
+### Analytics: traffic and usage
+
+As built on 18 November 2026 (design:
+[docs/superpowers/specs/2026-11-18-site-analytics-design.md](../docs/superpowers/specs/2026-11-18-site-analytics-design.md);
+decisions: [docs/ner-site/PLAN.md](../docs/ner-site/PLAN.md) section 16). Two halves
+that do not depend on each other. Both are off until the operator turns them on, and a
+deployment that turns neither on behaves as before.
+
+**Traffic: Vercel Web Analytics.** `public/index.html` loads two scripts from the
+site's own origin, both deferred and after `app.js`: `analytics.js` (the one-line queue
+stub of Vercel's snippet, in a file so that the Content-Security-Policy needs no
+exception) and `/_vercel/insights/script.js`. Page views only; the site sends no custom
+events, and the stats page does not load the scripts. What is collected is collected by
+Vercel, not by this code: per page view the path, the referrer, the country, and the
+device, operating system and browser, without cookies (Vercel's Web Analytics
+documentation has the exact list and how it tells visitors apart). The footer says
+"This site counts visits without cookies."
+
+To turn it on: in the Vercel dashboard open the project, Analytics, enable Web
+Analytics, and redeploy. Then load the page with the browser's network panel open:
+`/_vercel/insights/script.js` answers 200 and a request to `/_vercel/insights/view`
+follows; the visit shows in the dashboard's Analytics tab. Until it is enabled
+`/_vercel/insights/script.js` answers 404, the browser logs that (Chromium adds a line
+about the MIME type of the 404 page), and the page works as before.
+
+**Usage: one row per run.** With `NER_SITE_STATS_PASSCODE` set and a usable
+`DATABASE_URL`, every `POST /api/ner` that got past the passcode and body parsing
+writes one row to `<schema>.site_runs` (`ner_site/usage.py`) after its response is
+built: the 200s, the 4xx and 5xx that follow, and the 429s and 503s of admission.
+Requests refused before that (a missing header, a wrong passcode, an unreadable body),
+health, stats and static requests write nothing.
+
+What a row holds:
+
+| Column | Meaning |
+|---|---|
+| `at` | When the request finished (server clock, UTC). |
+| `visitor_day` | 32 hex characters: a keyed hash of the visitor id and the UTC date. It counts distinct visitors within a day; the same visitor has another value the next day, so rows cannot be joined across days or back to an address. A request refused for its credential is counted under the address it came from, like an admitted one; a value in an address header that is not an IP address is not hashed. |
+| `status`, `code` | The HTTP status and the error code of the answer (null on success). |
+| `credential`, `provider`, `tier` | `site` or `visitor`; `site`, `anthropic`, `openai` or `openrouter`; the admitted tier (`opus`, `sonnet`, `other`, `own`) or null. |
+| `requested_model`, `model`, `requested_selector` | The ids asked for and the model that extracted. `model` is null for a run that no model answered. |
+| `fallback_reasons` | The distinct step-down reasons, comma-joined; empty when none. |
+| `country` | The two-letter code Vercel puts in `x-vercel-ip-country`, or null. |
+| `text_chars`, `custom_prompt` | The length of the text, and whether a prompt was sent. |
+| `entities`, `matches`, `picks` | Counts. |
+| `llm_calls`, `prompt_tokens`, `completion_tokens` | The extraction's calls and tokens. |
+| `selector_calls`, `selector_prompt_tokens`, `selector_completion_tokens`, `selector_cost_usd` | The selection's calls and tokens, and the cost its provider reported (Jev). |
+| `embedding_requests`, `extract_ms`, `map_ms`, `select_ms`, `total_ms` | Embedding requests and timings. |
+
+What it does not hold: the text, the prompt, an entity, a term id, an IP address, the
+visitor id, a passcode, an API key (the site's or a visitor's) or a user agent. No
+column is free text: a model or selector is stored only when it is an id this
+deployment lists (`NER_SITE_MODELS`, `NER_SITE_SELECTORS`, `NER_SITE_FALLBACK_MODEL`,
+the own-key lists, the Claude ids, `jev`, `retrieval`), an error code and a step-down
+reason only when they are ones the site defines, and anything else is stored as the
+word `other`. That matters for `model`: the model that answered is named by the
+provider's response, so a response that names itself in another spelling (a dated
+snapshot id, for example) is a row with `model: other`, which has no price.
+
+A run that failed after a model had answered (an answer that could not be parsed, a
+refusal that reported its tokens) records the calls and tokens its failure carried and
+the model that was asked, so that it is priced. A failure that reported no tokens
+records its calls and no model.
+
+**Turning usage on.**
+
+1. Create the table once, before recording is on:
+   `DATABASE_URL=postgresql://... python ner-site/tools/setup_usage.py` (add
+   `--schema NAME` when `NER_SITE_NEON_SCHEMA` is not the default `xwalk`). It sends one
+   request with `CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS` and
+   `CREATE INDEX IF NOT EXISTS`, writes no row, never prints the connection string, and
+   can be run again. The site also creates the table by itself on the first run of a
+   warm instance, but two cold instances doing that at the same moment on a database
+   without the table can collide, and the one that loses also loses its row; with the
+   table in place there is nothing to collide over.
+2. Generate the passcode: `openssl rand -hex 24`. Set it as `NER_SITE_STATS_PASSCODE`
+   (sensitive) and redeploy.
+3. Do a run on the site, then open `https://<deployment>/stats` (linked from nowhere,
+   `noindex`), enter the passcode and press Show.
+
+**The stats page and API.** `/stats` is a `vercel.json` rewrite to `public/stats.html`.
+It asks for the passcode, keeps it in session storage for the tab (the field is emptied
+once the passcode is accepted; "Forget passcode" removes it), and calls one endpoint:
+`GET /api/stats?days=N` with the header `X-Stats-Passcode`. `days` is 1 to 365, default
+30; the page offers 7, 30 and 90. Answers: 401 `stats_passcode_required` or
+`stats_passcode_invalid`; 400 `bad_days` for a `days` outside the range (after the
+passcode check); 404 when analytics is off; 503 `stats_unavailable` when the database
+cannot be read (no usable `DATABASE_URL`, an error, or no answer within 10 s); else
+200 with `totals`, `by_day` (every UTC day of the period, zeros included), `by_model`,
+`by_code`, `by_fallback` and `by_country`. `by_model` has a row with `model: null` for
+runs no model answered, a row `other` for model names the site does not know, and a
+row `jev` (with `runs: 0`) for what Jev reported; `by_country` has a row with
+`country: null`. The page shows the estimated spend, the share of runs with a step-down
+note, runs by tier (a grey "No tier" segment is the runs in none of the four tiers:
+most were refused before admission), successful runs, visitor-days, two charts and the
+tables.
+
+**What the estimate includes and what it does not.** Dollars are computed in code from
+the token sums, for runs on the site's keys only, at list prices per million tokens
+(input / output): `claude-opus-5-5` 4 / 20, `claude-sonnet-5-5` 2 / 10
+(`usage.PRICES`). Extraction tokens are priced at the model that answered, selection
+tokens at the selector that was asked for, and what Jev reported is added as it is.
+The per-model and per-day dollars both add up to the total. Not in the estimate:
+
+- Models without a list price: every OpenRouter model, and `other`. Their runs are
+  counted in `unpriced_runs` (once per run, when the extraction model or a model
+  selector has no price), and the page says so above the charts.
+- A successful run in which any model call did not report its tokens (a retry after a
+  failed attempt, a step-down in the middle): its token columns are null and it adds
+  nothing. Such runs are not in `unpriced_runs`. This is the largest known gap.
+- Query embeddings on the OpenRouter key, and all cache pricing (cached input tokens
+  are priced as input).
+- A run that stepped down is priced at the model that answered the extraction; the
+  tokens of the attempts before it are unknown.
+- Runs on a visitor's own key cost the operator nothing for the model and are shown
+  with "visitor pays".
+
+The Anthropic Console is the bill.
+
+**What recording costs a request.** One HTTPS round trip to Neon (a single `INSERT`),
+made after the response is built and before it is sent. The request waits for it at
+most 2 s, and that wait covers everything recording does, including finding or
+building the database client behind a lock the instance's requests share. A write that
+is not done by then is abandoned: the answer goes out, and the write ends on its own
+when the database client's timeout is up (also 2 s, for each of connecting, sending
+and waiting for the answer). At most four writes are under way on a warm instance at
+once; a run that finds all four taken is not recorded and does not wait. So a database
+that hangs costs a request at most 2 s, nothing while four writes are stuck, and never
+an answer. `timing_ms.handle` in the log does not include recording. The log line of a request gains one field, and only when its run
+was not recorded:
+
+| `usage` in the log line | Meaning |
+|---|---|
+| absent | The row was written, or recording is off. |
+| `"TimeoutError"` | No answer within 2 s; the write was abandoned and may still complete. |
+| `"saturated"` | Four writes were already under way; this run was skipped at once. |
+| `"PostgresError"` | The database refused the statement or could not be reached. |
+| another class name | What else failed (`ValueError`: a connection string the client cannot use). |
+
+**Deleting the data.** In the Neon SQL editor or with `psql`, on the schema of the
+deployment (`xwalk` by default):
+
+```sql
+DELETE FROM xwalk.site_runs WHERE at < '2026-12-01';   -- everything before a date
+DROP TABLE xwalk.site_runs;                              -- everything
+```
+
+Nothing prunes the table. After a `DROP TABLE` a deployment that still has
+`NER_SITE_STATS_PASSCODE` set creates the table again on its next run.
+
+**Turning it off.** Unset `NER_SITE_STATS_PASSCODE` and redeploy: nothing is recorded,
+`/api/stats` answers 404, no database client is built for it, and the rows stay until
+they are deleted. Web Analytics is turned off in the Vercel dashboard.
+
+**Rollout checks (operator).**
+
+1. Enable Web Analytics and redeploy; a visit shows a request to
+   `/_vercel/insights/view` and appears in the dashboard.
+2. Run `tools/setup_usage.py`, set `NER_SITE_STATS_PASSCODE` and redeploy; do a run;
+   open `/stats`, enter the passcode, see the run.
+3. Watch the first production log lines of `POST /api/ner` for a `usage` field. The
+   statements were run on a real Postgres 16, but through `psql`: Neon's HTTPS
+   endpoint has not been exercised with them. `usage: "PostgresError"` on every run
+   means the insert is refused there and nothing is being recorded.
+4. In the Neon console, look at the first rows: no text, no address, and `model`
+   showing the model ids rather than `other`. If Anthropic's responses name the model
+   in another spelling, every Claude run is `other` and unpriced until that spelling
+   is known to the site.
+5. `curl -si https://<deployment>/api/stats` answers 401 `stats_passcode_required`,
+   and with a wrong `X-Stats-Passcode` 401 `stats_passcode_invalid`.
+
+Tests for the statistics SQL need a real Postgres, like the limiter's:
+
+```bash
+NER_SITE_TEST_DATABASE_URL=postgresql://user@localhost:5432/postgres \
+    python -m pytest -q -m integration tests/test_site_usage.py
 ```
 
 ### Neon backend
@@ -1027,6 +1227,15 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   loosen it. Own-key requests cost the operator the term lookup; the flood limit (30
   an hour, 60 a day per address) bounds that, and does not count while the limiter
   cannot be asked.
+- **The stats passcode is the only thing between the internet and the usage numbers.**
+  `GET /api/stats` has no attempt limit of its own and answers 401 to a wrong passcode
+  as often as it is asked, so the passcode must be a generated secret
+  (`openssl rand -hex 24`), never a phrase; the site refuses anything under 24
+  characters and compares in constant time, before any database call. For a second
+  layer, add a Vercel Firewall rate-limit rule on the path `/api/stats`. Whether
+  analytics is on is not a secret: the endpoint answers 404 when it is off and 401
+  when it is on. The page keeps the passcode in session storage, like a visitor's
+  key, under the same Content-Security-Policy.
 - The keys live only in the function environment. `/api/health` never returns them, and
   error messages pass URLs through redaction. Do not put a key in `NER_SITE_BASE_URL`.
 - `vercel.json` sends `Content-Security-Policy: default-src 'self'; connect-src
@@ -1489,6 +1698,24 @@ And a third, of the second round's fixes:
   secret's own decoded forms, and a value escaped more deeply than it decodes
   (eight rounds) is withheld and fails the echo check.
 
+And a fourth, of the third round's fixes (18 November 2026, with the analytics fixes
+below):
+
+- The tool applied its decoding limit to the response and not to the secret: with a
+  key that holds an escape nine layers deep, the site's echo of its decoded form was
+  printed and the run exited 0. Such a key or passcode is now refused before anything
+  is sent, and when the limit is what failed the check, the last line says an echo
+  was detected or could not be ruled out.
+- `own_errors` was cut to eight classes, which could drop the one `own_error` names.
+  It lists every class.
+- A 200 from Anthropic that is not a message (an HTML page, or a body without a JSON
+  content type that is not JSON either) was read as an empty answer: 422 after one
+  call, with no retry and no step-down on the site's key. A body with an integer too
+  long for Python to convert was a 500. Both are response-decoding failures now:
+  `transient` on the site's key, `bad_answer` on an own key.
+- An answer in a content coding that was not offered left its dispatch open in the
+  call budget on OpenAI and OpenRouter. It is settled as `bad_answer`.
+
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
 - `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1305 passed, 23
@@ -1520,6 +1747,67 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
 Not run, in addition to the list above: Python 3.10 (the changed files parse with the
 3.10 grammar and compile on 3.11 and 3.12; the suite ran on 3.13 only); Firefox and
 Safari; a real proxy in front of the tool; any SDK version but 2.10.0.
+
+### Analytics, 18 November 2026
+
+Built and then fixed after a review by another model (the points are PLAN.md 16.4 to
+16.10, marked **[review]**). **Nothing was deployed, no production variable was
+changed, and no request was made to Vercel, to Neon or to https://www.xwalk.si by the
+sessions that wrote this.** "Analytics: traffic and usage" above describes the code
+after the fixes.
+
+What was run (Python 3.13.3, the repository venv, no key in the environment):
+
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1557 passed, 32
+  deselected (1431 before the fixes). The fixes were written test first. Reproduced
+  before the code changed: four requests in a row against a database that never
+  answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
+  a wrong-scheme or malformed `DATABASE_URL` on a deployment that only analytics made
+  read it was a settings error or an uncaught `ValueError`; an upstream model name
+  was stored as it came; a run that failed after a paid call had no tokens; and the
+  own-key probes of the fourth round listed under "Fixes after the final review".
+- With recording on: a database that hangs (a fake that holds every statement) across
+  sequential and concurrent requests left every answer as it is without analytics,
+  held at most four writes, skipped the rest at once, and recorded again once it
+  answered; the store's shared lock held by another thread cost a request no more
+  than the same wait; and the real Neon client against a local socket that accepts
+  and never answers gave its place back by its own timeout.
+- `python -m pytest -q -m integration tests/test_site_usage.py`: 9 passed, against a
+  local PostgreSQL 16.15 on 127.0.0.1 through `psql`, in throwaway schemas that were
+  dropped (none left), also with `PGTZ=Europe/Ljubljana` and
+  `PGTZ=America/Los_Angeles`. These run the real statements, including the changed
+  spend query and `SiteRuns.create`, which is what `tools/setup_usage.py` sends.
+- `ruff check` and `ruff format --check` on `src tests scripts ner-site`: passing.
+- The stats page in headless Chromium against `tools/serve_local.py --canned` on
+  127.0.0.1, under the production Content-Security-Policy, at 1280 and 390 px, light
+  and dark: a wrong passcode stays in the field and is not kept; an accepted one is
+  kept for the tab and the field is empty afterwards; the period selector, Show and a
+  reload send the kept value in `X-Stats-Passcode` and nowhere else, and it is in no
+  URL, other header, document or input value; a kept passcode the server refuses is
+  dropped; the legend says "No tier", the headline "had a step-down note"; an answer
+  with all four tier counts zero draws every bar as "No tier"; no page error, no CSP
+  violation, no inline style, no horizontal page scroll. An earlier session checked
+  the main page with `/_vercel/insights/script.js` answering 404.
+
+Not run or not verified:
+
+- Vercel Web Analytics itself: the real `/_vercel/insights/script.js`, the request to
+  `/_vercel/insights/view`, the dashboard. The `/stats` rewrite on Vercel.
+- Neon's HTTPS endpoint with these statements: that it takes the one text parameter
+  of the insert for `$1::jsonb` and returns the statistics column as text.
+  `tools/setup_usage.py` was run against a fake executor and, through
+  `SiteRuns.create`, on the local Postgres; never against Neon.
+- What Anthropic's responses put in `model` for `claude-opus-5-5` and
+  `claude-sonnet-5-5`. If it is not the id as requested, Claude runs are stored as
+  `other` and are unpriced (rollout check 4).
+- The real `/api/stats` in a browser (the page ran against canned answers only),
+  Firefox and Safari, a screen reader, a password manager.
+- Python 3.10 (no interpreter on the machine; the code uses nothing newer and ruff
+  targets it). A Vercel Firewall rule on `/api/stats`.
+- Two timing tests (`test_one_deadline_bounds_the_whole_mapping_step`,
+  `test_a_refusal_belongs_to_the_call_that_was_refused`) each failed once in a full
+  run while the machine was under heavy unrelated load and passed when run again,
+  with and without these changes.
 
 ### For the operator after deploying
 

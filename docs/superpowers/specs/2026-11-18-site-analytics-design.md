@@ -173,3 +173,57 @@ fixtures for a populated and an empty answer; verified in a browser.
 2. Set `NER_SITE_STATS_PASSCODE` (sensitive, 16+ characters) and redeploy; do a run;
    open `/stats`, enter the passcode, see the run.
 3. Confirm in the Neon console that `site_runs` holds no text or address.
+
+## 9. As built (18 November 2026, after review)
+
+The sections above are the design. Where the code differs, this section holds.
+
+- **Enablement is not secret (amends 4 and 6).** With the variable unset `/api/stats`
+  answers the application's 404 and that is sufficient; with it set, a request without
+  the passcode answers 401, so the two can be told apart from outside. Nothing is done
+  to hide that, in the shim or elsewhere. `/api/health` still says nothing about stats.
+- **The passcode is at least 24 characters (amends 3.1 and 8).** The endpoint has no
+  attempt limit of its own, so the passcode must be a generated secret
+  (`openssl rand -hex 24`). The comparison is constant-time and comes before any
+  database call. A Vercel Firewall rate-limit rule on `/api/stats` is the optional
+  second layer.
+- **Recording is capped (amends 3.4).** Finding or building the store and the insert
+  run in one worker thread, and the request waits for it at most 2 s in all. At most
+  four writes are under way per warm instance; a run that finds them all taken is not
+  recorded and does not wait, and its log line says `usage: "saturated"`. An abandoned
+  write ends with the executor's own 2 s timeout and gives its place back.
+- **The table can be provisioned (amends 3.2).** The lazy `CREATE TABLE IF NOT EXISTS`
+  stays; two cold instances racing on a database without the table may lose one row.
+  `tools/setup_usage.py` creates the schema, the table and the index once from
+  `DATABASE_URL`, so that nothing is left to create.
+- **An unusable `DATABASE_URL` (amends 3.1).** Where the stats passcode is the only
+  reason the variable is read, a value that cannot be used (wrong scheme, no host,
+  malformed) is not a settings error: recording is skipped, an authenticated
+  `/api/stats` answers 503 `stats_unavailable`, and `/api/ner` and `/api/health`
+  answer as with stats off. Where the index backend or the limiter needs the
+  variable, validation is as strict as before.
+- **Only the site's own words are stored (amends 3.2).** A model or selector that is
+  not an id the deployment lists (the answering model comes from the provider's
+  response), and an error code or step-down reason the site does not define, are
+  stored as `other`. An unknown tier is null.
+- **Spend (amends 3.3 and 4).** A run that failed after a model answered records the
+  calls and tokens its failure carried and the model that was asked. `unpriced_runs`
+  counts a site-key run once when either stage has no list price: the extraction
+  model, or a model selector whose provider reported no cost. Jev's reported cost is
+  a `by_model` row of its own (`model: "jev"`, `credential: "site"`, `runs: 0`), so
+  the rows' dollars add up to the total. Still not counted: a successful run in which
+  any call did not report its tokens (its token columns are null).
+- **Null rows (amends 4).** `by_model` has a row with `"model": null` per credential
+  for runs no model answered, and `by_country` a row with `"country": null` for runs
+  without a country, so that each list's runs add up to every run.
+- **`days` is refused, not clamped (amends 4).** Outside 1 to 365, repeated, signed,
+  zero-padded or not a number: 400 `bad_days`, after the passcode check.
+- **The read has its own timeout (amends 3.2).** Reading the statistics waits up to
+  10 s (no retry), so that a Neon compute that has to wake up does not fail the
+  operator's page. Recording keeps 2 s.
+- **`visitor_day` of a refused request.** A request refused for its credential is
+  counted under the address it came from when that is an IP address, like an admitted
+  one; anything else in an address header is not hashed.
+- **The page.** The residual chart segment is "No tier"; the step-down headline says
+  runs "had a step-down note"; the passcode field is emptied once the passcode is
+  accepted and the session value is used from then on.
