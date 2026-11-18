@@ -32,7 +32,14 @@ from xwalk.decide.budget import BudgetedDecider
 from xwalk.decide.fake import FakeDecider
 from xwalk.decide.jev import JevClient
 from xwalk.fingerprint import redact_url
-from xwalk.llm.base import LLMCapabilities, LLMClient, LLMError, LLMRequest, LLMResponse
+from xwalk.llm.base import (
+    LLMCapabilities,
+    LLMClient,
+    LLMError,
+    LLMRequest,
+    LLMResponse,
+    failure_usage,
+)
 from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
@@ -1278,6 +1285,10 @@ async def run(
             )
         else:
             raise
+        if isinstance(exc, LLMError):
+            # What the failed calls are known to have used (a refusal reports its
+            # tokens): the handler keeps it for the run's row, never for the answer.
+            failure.usage = failure_usage(exc)
     else:
         failure = None
     if failure is not None:

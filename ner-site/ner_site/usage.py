@@ -6,7 +6,11 @@ whether it stepped down, whose key paid, the tokens and the timings. A log line 
 in days; a row is not. This module keeps those values, and only those: the row has no
 text, prompt, entity, term id, address, visitor id, passcode, key or user agent, because
 ``run_of`` copies named, typed fields out of the log record and nothing else, and a
-field of the wrong type becomes null.
+field of the wrong type becomes null. No string in the row is free text either: a
+model or selector is an id the deployment itself lists, an error code and a step-down
+reason are words this site defines, and anything else is stored as the one word
+``other`` (the model that answered is named by the provider's response, which is not
+ours to trust with a column).
 
 Who a visitor is. ``visitor_day`` is a keyed hash of the visitor id (itself a keyed hash
 of the address, ``limits.visitor_id``) and the UTC date. Distinct values per day count
@@ -41,8 +45,13 @@ What the SQL leaves to Python is the money (``shape``): the price table lives he
 code, and an estimate is plain arithmetic over the token sums. Only runs on the site's
 keys are priced. Extraction tokens are priced at the model that answered, selection
 tokens at the selector that was asked for when it is a model, and a cost the provider
-itself reported (Jev) is added where the selector has no price of its own. It is an
-estimate; the provider's console is the bill.
+itself reported (Jev) is added where the selector has no price of its own, on a row of
+``by_model`` named after that selector (``jev``), so that the rows' dollars add up to
+the total. A run that failed after a model had answered keeps the tokens its failure
+carried and the model that was asked, and is priced like any other. A run on the
+site's keys counts once in ``unpriced_runs`` when either of its stages has no price:
+the model that extracted, or a model selector whose provider reported no cost. It is
+an estimate; the provider's console is the bill.
 
 When the database cannot be asked, every failure becomes ``UsageUnavailable`` with a
 message made here from the error's class and SQLSTATE only. The executor's own text is
@@ -57,20 +66,26 @@ import hmac
 import json
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from xwalk.retrieval.postgres import SQLExecutor, Statement
 
+from ner_site import fallback, limits
+from ner_site.claude import CLAUDE_MODELS, HAIKU
+from ner_site.providers import OWN_PROVIDERS
 from ner_site.select import JEV, RETRIEVAL_ONLY
 
 __all__ = [
+    "CODES",
     "COLUMNS",
     "DEFAULT_DAYS",
     "MAX_DAYS",
+    "OTHER",
     "PRICES",
+    "REASONS",
     "TABLE",
     "Run",
     "SiteRuns",
@@ -95,8 +110,66 @@ PRICES: dict[str, tuple[float, float]] = {
 USD_DIGITS = 6
 SITE = "site"
 TIERS = ("opus", "sonnet", "other", "own")
-# Selectors that are not a model: their tokens belong to no row of ``by_model``.
+# Selectors that are not a model, so that have no list price to be missing.
 _NOT_MODELS = frozenset({JEV, RETRIEVAL_ONLY})
+
+# What a string of the row is stored as when it is not one the site defines.
+OTHER = "other"
+# The model and selector ids every deployment knows; ``run_of`` is given the rest (the
+# deployment's own lists).
+_MODELS = frozenset({*CLAUDE_MODELS, HAIKU, JEV, RETRIEVAL_ONLY})
+_CREDENTIALS = frozenset({SITE, "visitor"})
+_PROVIDERS = frozenset({SITE, *OWN_PROVIDERS})
+# Every error code a response of this site can carry (``ServiceError`` and its
+# subclasses, wherever they are raised; tests/test_site_usage.py reads the source for
+# them, so a new code that is missing here fails a test instead of becoming ``other``).
+CODES = frozenset(
+    {
+        "bad_credential",
+        "bad_days",
+        "bad_header",
+        "bad_json",
+        "bad_top_k",
+        "body_too_large",
+        "call_budget_exhausted",
+        "extraction_schema",
+        "extraction_unparseable",
+        "internal",
+        "length_required",
+        "limits_unavailable",
+        "method_not_allowed",
+        "missing_text",
+        "not_configured",
+        "not_found",
+        "passcode_invalid",
+        "passcode_required",
+        "prompt_too_long",
+        "provider_error",
+        "provider_key_refused",
+        "provider_rate_limited",
+        "stats_passcode_invalid",
+        "stats_passcode_required",
+        "stats_unavailable",
+        "text_too_long",
+        "unknown_model",
+        "unknown_selector",
+        "visitor_limit_reached",
+    }
+)
+# Every reason a step-down note can give: the chain's (``ner_site.fallback``), the
+# limiter's, and the two the handler and the service write themselves
+# (``http.CLAUDE_UNAVAILABLE``, ``service.FOLLOWS_EXTRACTION``; both import this module,
+# so they are spelled out here and compared in the tests).
+REASONS = frozenset(
+    {
+        *fallback.STEP_DOWN_REASONS,
+        fallback.TRANSIENT,
+        fallback.CALL_LIMIT,
+        limits.OPUS_USED,
+        "claude_unavailable",
+        "follows_extraction",
+    }
+)
 
 _IDENT = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SQLSTATE = re.compile(r"[0-9A-Z]{5}")
@@ -220,7 +293,10 @@ WITH runs AS (
            coalesce(sum(completion_tokens), 0) AS completion_tokens,
            coalesce(sum(selector_prompt_tokens), 0) AS selector_prompt_tokens,
            coalesce(sum(selector_completion_tokens), 0) AS selector_completion_tokens,
-           coalesce(sum(selector_cost_usd), 0) AS selector_cost_usd
+           coalesce(sum(selector_cost_usd), 0) AS selector_cost_usd,
+           count(*) FILTER (
+               WHERE selector_calls > 0 AND selector_cost_usd IS NULL
+           ) AS unreported_selections
     FROM runs
     GROUP BY day, credential, model, requested_selector
 ), codes AS (
@@ -309,6 +385,14 @@ def _text(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _one_of(value: Any, known: Collection[str]) -> str | None:
+    """`value` when it is a string the site defines, ``other`` for any other string
+    that is not empty, None for what is no string at all."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value if value in known else OTHER
+
+
 def run_of(
     log: Mapping[str, Any],
     *,
@@ -316,46 +400,71 @@ def run_of(
     visitor_day: str,
     country: str | None = None,
     selector_tokens: tuple[int | None, int | None] = (None, None),
+    models: Collection[str] = (),
+    failed: Mapping[str, Any] | None = None,
 ) -> Run:
     """The row of a finished request, from the record the handler logs (``http.handle``)
-    and the three things that record does not hold: the day's visitor, the country and
-    the selection step's tokens. ``at`` is the time in seconds since the epoch.
+    and what that record does not hold: the day's visitor, the country, the selection
+    step's tokens and, for a run that failed, what its failed calls carried. ``at`` is
+    the time in seconds since the epoch.
+
+    ``models`` are the model and selector ids this deployment lists, beside the ones
+    every deployment knows. A model or selector that is none of them is stored as
+    ``other``, like an error code or a step-down reason the site does not define: the
+    model that answered comes out of the provider's response, and a row holds no text
+    that came from anywhere but this site. A tier that is none of the four is null
+    (``other`` is one of the four).
 
     ``model`` is the model that produced the extraction (as in the response), so it is
-    null for a run that did not get that far."""
+    null for a run that did not get that far. ``failed`` (``model``, ``llm_calls``,
+    ``prompt_tokens``, ``completion_tokens``) is read for a run that did not end in a
+    200: its calls are counted, and when any of them reported tokens those are kept
+    with the model that was asked, so that a failure that was paid for is priced."""
+    known = _MODELS | frozenset(models)
     status = _whole(log.get("status")) or 0
-    requested = _text(log.get("model"))
+    requested = _one_of(log.get("model"), known)
     timing = log.get("timing_ms")
     timing = timing if isinstance(timing, Mapping) else {}
     notes = log.get("fallbacks")
     reasons = [
-        note["reason"]
+        _one_of(note.get("reason"), REASONS)
         for note in (notes if isinstance(notes, list) else ())
-        if isinstance(note, Mapping) and isinstance(note.get("reason"), str)
+        if isinstance(note, Mapping)
     ]
     cost = log.get("selector_cost_usd")
     custom = log.get("custom_prompt")
+    tier = log.get("tier")
+    ran = _one_of(log.get("ran"), known) or (requested if status == 200 else None)
+    calls = _whole(log.get("llm_calls"))
+    prompt_tokens = _whole(log.get("prompt_tokens"))
+    completion_tokens = _whole(log.get("completion_tokens"))
+    if status != 200 and isinstance(failed, Mapping):
+        calls = _whole(failed.get("llm_calls"))
+        prompt_tokens = _whole(failed.get("prompt_tokens"))
+        completion_tokens = _whole(failed.get("completion_tokens"))
+        if prompt_tokens is not None or completion_tokens is not None:
+            ran = _one_of(failed.get("model"), known)
     return Run(
         at=datetime.fromtimestamp(at, tz=timezone.utc).isoformat(),
         visitor_day=visitor_day,
         status=status,
-        code=_text(log.get("code")),
-        credential=_text(log.get("credential")) or SITE,
-        provider=_text(log.get("provider")) or SITE,
-        tier=_text(log.get("tier")),
+        code=_one_of(log.get("code"), CODES),
+        credential=_one_of(log.get("credential"), _CREDENTIALS) or SITE,
+        provider=_one_of(log.get("provider"), _PROVIDERS) or SITE,
+        tier=tier if isinstance(tier, str) and tier in TIERS else None,
         requested_model=requested,
-        model=_text(log.get("ran")) or (requested if status == 200 else None),
-        requested_selector=_text(log.get("selector")),
-        fallback_reasons=",".join(dict.fromkeys(reasons)),
+        model=ran,
+        requested_selector=_one_of(log.get("selector"), known),
+        fallback_reasons=",".join(dict.fromkeys(r for r in reasons if r is not None)),
         country=country_of(country),
         text_chars=_whole(log.get("text_chars")),
         custom_prompt=custom if isinstance(custom, bool) else None,
         entities=_whole(log.get("entities")),
         matches=_whole(log.get("matches")),
         picks=_whole(log.get("picks")),
-        llm_calls=_whole(log.get("llm_calls")),
-        prompt_tokens=_whole(log.get("prompt_tokens")),
-        completion_tokens=_whole(log.get("completion_tokens")),
+        llm_calls=calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
         selector_calls=_whole(log.get("selector_calls")),
         selector_prompt_tokens=_whole(selector_tokens[0]),
         selector_completion_tokens=_whole(selector_tokens[1]),
@@ -413,10 +522,13 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         picked_prompt = _count(group["selector_prompt_tokens"])
         picked_completion = _count(group["selector_completion_tokens"])
         reported = float(group["selector_cost_usd"])
+        # The group's runs whose selection ran and whose provider reported no cost.
+        selections = _count(group["unreported_selections"])
         site = credential == SITE
         prompt_tokens += prompt + picked_prompt
         completion_tokens += completion + picked_completion
         spent = 0.0
+        is_model = selector is not None and selector not in _NOT_MODELS
         # A run that reached no model (refused, or failed first) is in the row whose
         # model is null, so that the rows' runs add up to every run.
         row = row_of(None if model is None else str(model), credential)
@@ -427,13 +539,21 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
             cost = _usd(model, prompt, completion)
             row["estimated_usd"] += cost
             spent += cost
-            if model not in PRICES:
+        if site:
+            # Once per run, whichever stage it is that has no price: every run of an
+            # extraction model without one, else the runs whose model selector has
+            # none and reported no cost of its own.
+            if model is not None and model not in PRICES:
                 unpriced += runs
+            elif is_model and selector not in PRICES:
+                unpriced += selections
         # Never both: a selector with a price is priced by its tokens, any other by
         # what its provider reported.
         extra = reported if site and selector not in PRICES else 0.0
-        is_model = selector is not None and selector not in _NOT_MODELS
-        if is_model and (picked_prompt or picked_completion or extra):
+        # Jev is no model, but what it reported is shown on a row of its own name, so
+        # that the rows' dollars add up to the total.
+        named = selector is not None and selector != RETRIEVAL_ONLY
+        if named and (picked_prompt or picked_completion or extra):
             row = row_of(str(selector), credential)
             row["prompt_tokens"] += picked_prompt
             row["completion_tokens"] += picked_completion

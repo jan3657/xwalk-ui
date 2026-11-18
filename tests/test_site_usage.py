@@ -182,10 +182,14 @@ class FakeRuns:
                 {
                     **dict(zip(("day", "credential", "model", "selector"), key, strict=True)),
                     "runs": 0,
+                    "unreported_selections": 0,
                     **dict.fromkeys(sums, 0),
                 },
             )
             group["runs"] += 1
+            group["unreported_selections"] += bool(
+                (row["selector_calls"] or 0) > 0 and row["selector_cost_usd"] is None
+            )
             for name in sums:
                 group[name] += row[name] or 0
 
@@ -319,7 +323,14 @@ OK_LOG: dict[str, Any] = {
 
 
 def test_the_row_of_a_successful_run_is_read_from_the_log_fields() -> None:
-    row = run_of(OK_LOG, at=NOW, visitor_day="f" * 32, country="SI", selector_tokens=(700, 70))
+    row = run_of(
+        OK_LOG,
+        at=NOW,
+        visitor_day="f" * 32,
+        country="SI",
+        selector_tokens=(700, 70),
+        models=(GEMINI,),
+    )
     assert asdict(row) == {
         "at": "2026-11-18T14:20:00+00:00",
         "visitor_day": "f" * 32,
@@ -385,7 +396,7 @@ def test_the_row_of_a_refused_run_has_nulls_for_what_did_not_happen() -> None:
         "status": 429,
         "timing_ms": {"handle": 12},
     }
-    row = run_of(log, at=NOW, visitor_day="f" * 32, country=None)
+    row = run_of(log, at=NOW, visitor_day="f" * 32, country=None, models=("gpt-6-luna",))
     assert (row.status, row.code, row.credential, row.provider) == (
         429,
         "visitor_limit_reached",
@@ -419,6 +430,150 @@ def test_a_log_field_of_the_wrong_type_is_dropped_not_stored() -> None:
     assert row.entities is None and row.prompt_tokens is None and row.custom_prompt is None
     assert row.total_ms is None and row.extract_ms is None and row.selector_cost_usd is None
     assert row.tier is None and row.country is None and row.fallback_reasons == "rate_limited"
+
+
+# --- the row holds only strings the site defines (fix wave, A3) ----------------------
+
+SENTINEL = "SENTINEL-upstream-text"
+
+
+def test_the_ids_the_site_always_knows_need_no_list() -> None:
+    for model in (OPUS, SONNET, "claude-haiku-5-5", "jev", "retrieval"):
+        log = {**OK_LOG, "model": model, "ran": model, "selector": model}
+        row = run_of(log, at=NOW, visitor_day="f" * 32)
+        assert (row.requested_model, row.model, row.requested_selector) == (model,) * 3
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        f"claude-opus-5-5-{SENTINEL}",
+        SENTINEL,
+        "claude-opus-5-5-20261101",
+        "CLAUDE-OPUS-5-5",
+        " claude-opus-5-5",
+        "openai/gpt-6-luna",
+        "",
+    ],
+)
+def test_a_model_name_the_site_does_not_know_is_stored_as_other(upstream: str) -> None:
+    """The answering model is what the provider's response says it was. Only an id from
+    the deployment's own lists is kept; anything else is one fixed word."""
+    known = ("google/gemini-3.1-flash-lite", "gpt-6-luna")
+    log = {**OK_LOG, "model": OPUS, "ran": upstream, "selector": "gpt-6-luna"}
+    row = run_of(log, at=NOW, visitor_day="f" * 32, models=known)
+    assert row.model == ("other" if upstream else OPUS)
+    assert (row.requested_model, row.requested_selector) == (OPUS, "gpt-6-luna")
+    assert SENTINEL not in json.dumps(asdict(row))
+    asked = {**OK_LOG, "model": upstream or SENTINEL, "selector": upstream or SENTINEL}
+    row = run_of(asked, at=NOW, visitor_day="f" * 32, models=known)
+    assert (row.requested_model, row.requested_selector) == ("other", "other")
+
+
+def test_codes_reasons_and_the_rest_are_the_sites_own_words_or_other() -> None:
+    log = {
+        **OK_LOG,
+        "status": 502,
+        "code": f"provider said {SENTINEL}",
+        "credential": SENTINEL,
+        "provider": SENTINEL,
+        "tier": SENTINEL,
+        "fallbacks": [
+            {"reason": "rate_limited"},
+            {"reason": SENTINEL},
+            {"reason": "a,b"},
+            {"reason": "transient"},
+            {"reason": "follows_extraction"},
+        ],
+    }
+    row = run_of(log, at=NOW, visitor_day="f" * 32, models=(GEMINI,))
+    assert (row.code, row.credential, row.provider, row.tier) == ("other", "other", "other", None)
+    assert row.fallback_reasons == "rate_limited,other,transient,follows_extraction"
+    assert SENTINEL not in json.dumps(asdict(row))
+
+
+def test_every_code_and_reason_the_site_can_raise_is_one_the_row_keeps() -> None:
+    """A code that is missing from ``usage.CODES`` would be stored as ``other``: this
+    reads the site's own source for the codes it raises and the reasons it notes."""
+    from ner_site import fallback, http, limits, service
+
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((Path(usage.__file__).parent).glob("*.py"))
+    )
+    raised = set(re.findall(r'(?:ServiceError|ExtractionError|_bad)\(\s*"([a-z_]+)"', source))
+    assert len(raised) > 25 and "visitor_limit_reached" in raised
+    constants = {http.STATS_UNAVAILABLE, http.LIMITS_UNAVAILABLE}
+    assert raised | constants <= usage.CODES
+    reasons = {
+        *fallback.STEP_DOWN_REASONS,
+        fallback.TRANSIENT,
+        fallback.CALL_LIMIT,
+        limits.OPUS_USED,
+        http.CLAUDE_UNAVAILABLE,
+        service.FOLLOWS_EXTRACTION,
+    }
+    assert reasons == usage.REASONS
+    assert "other" not in usage.CODES | usage.REASONS
+    assert all("," not in word for word in usage.REASONS)
+
+
+# --- a run that failed after paid calls (fix wave, A4) --------------------------------
+
+FAILED_LOG: dict[str, Any] = {
+    "method": "POST",
+    "path": "/api/ner",
+    "provider": "site",
+    "credential": "site",
+    "text_chars": 33,
+    "custom_prompt": False,
+    "model": OPUS,
+    "selector": "retrieval",
+    "tier": "opus",
+    "code": "extraction_unparseable",
+    "status": 422,
+    "timing_ms": {"handle": 2100},
+}
+
+
+def test_a_failed_run_keeps_the_tokens_its_failure_carried_and_the_model_asked() -> None:
+    carried = {"model": SONNET, "llm_calls": 2, "prompt_tokens": 900, "completion_tokens": 90}
+    row = run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, failed=carried)
+    assert (row.status, row.code, row.requested_model, row.model) == (
+        422,
+        "extraction_unparseable",
+        OPUS,
+        SONNET,
+    )
+    assert (row.llm_calls, row.prompt_tokens, row.completion_tokens) == (2, 900, 90)
+    assert row.entities is None and row.total_ms is None
+
+
+def test_a_failure_without_reported_tokens_names_no_model() -> None:
+    """Calls were sent and nothing came back that was billed by the token: the run is
+    still one that reached no model."""
+    carried = {"model": OPUS, "llm_calls": 3, "prompt_tokens": None, "completion_tokens": None}
+    row = run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, failed=carried)
+    assert (row.model, row.llm_calls, row.prompt_tokens, row.completion_tokens) == (
+        None,
+        3,
+        None,
+        None,
+    )
+
+
+def test_what_a_failure_carried_is_typed_and_named_like_the_rest_of_the_row() -> None:
+    carried = {"model": SENTINEL, "llm_calls": "2", "prompt_tokens": 9.5, "completion_tokens": 9}
+    row = run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, failed=carried)
+    assert (row.model, row.llm_calls, row.prompt_tokens, row.completion_tokens) == (
+        "other",
+        None,
+        None,
+        9,
+    )
+    # A successful run is read from its log record alone.
+    ok = run_of(OK_LOG, at=NOW, visitor_day="f" * 32, models=(GEMINI,), failed=carried)
+    assert (ok.model, ok.llm_calls, ok.prompt_tokens) == (GEMINI, 2, 412)
 
 
 # --- recording -----------------------------------------------------------------------
@@ -640,6 +795,7 @@ def _group(**over: Any) -> dict[str, Any]:
         "selector_prompt_tokens": 0,
         "selector_completion_tokens": 0,
         "selector_cost_usd": 0,
+        "unreported_selections": 0,
         **over,
     }
 
@@ -726,16 +882,82 @@ def test_selection_tokens_are_priced_at_the_requested_selector_when_it_is_a_mode
     ]
 
 
-@pytest.mark.parametrize("selector", ["jev", "retrieval", None])
-def test_selection_tokens_of_a_selector_that_is_not_a_model_go_to_no_model(
-    selector: str | None,
-) -> None:
+@pytest.mark.parametrize("selector", ["retrieval", None])
+def test_selection_tokens_without_a_selector_go_to_no_model(selector: str | None) -> None:
     answer = _priced(
         _group(selector=selector, selector_prompt_tokens=500, selector_completion_tokens=50)
     )
     assert [row["model"] for row in answer["by_model"]] == [OPUS]
     assert answer["by_model"][0]["prompt_tokens"] == 0
     assert answer["totals"]["prompt_tokens"] == 500 and answer["totals"]["estimated_usd"] == 0.0
+
+
+def test_jev_has_a_row_of_its_own_with_the_cost_it_reported() -> None:
+    """So that the dollars of ``by_model`` add up to the total (fix wave, A4)."""
+    answer = _priced(
+        _group(
+            selector="jev",
+            runs=2,
+            prompt_tokens=1_000_000,
+            selector_prompt_tokens=500,
+            selector_completion_tokens=50,
+            selector_cost_usd=0.0375,
+        ),
+        _group(credential="visitor", selector="jev", selector_cost_usd=9.0),
+    )
+    assert answer["by_model"] == [
+        {
+            "model": OPUS,
+            "credential": "site",
+            "runs": 2,
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "estimated_usd": 4.0,
+        },
+        {
+            "model": OPUS,
+            "credential": "visitor",
+            "runs": 1,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
+        {
+            "model": "jev",
+            "credential": "site",
+            "runs": 0,
+            "prompt_tokens": 500,
+            "completion_tokens": 50,
+            "estimated_usd": 0.0375,
+        },
+    ]
+    assert answer["totals"]["estimated_usd"] == 4.0375 == answer["by_day"][0]["estimated_usd"]
+    assert sum(row["estimated_usd"] for row in answer["by_model"]) == 4.0375
+    assert answer["totals"]["unpriced_runs"] == 0
+
+
+def test_a_run_is_unpriced_once_when_either_stage_has_no_list_price() -> None:
+    """A priced extraction with an unpriced model selector used to count as priced."""
+    answer = _priced(
+        # Priced extraction, unpriced selector that ran in two of the three runs.
+        _group(runs=3, selector=GEMINI, prompt_tokens=1000, unreported_selections=2),
+        # Both stages unpriced: each run once, not twice.
+        _group(model=GEMINI, runs=4, selector=GEMINI, unreported_selections=4),
+        # Unpriced extraction, priced selector.
+        _group(model=GEMINI, runs=5, selector=OPUS, unreported_selections=5),
+        # Priced on both stages, Jev, and no selector: nothing unpriced.
+        _group(runs=6, selector=SONNET, unreported_selections=6),
+        _group(runs=7, selector="jev", unreported_selections=7),
+        _group(runs=8, selector="retrieval"),
+        # A visitor's key is never priced, so never unpriced either.
+        _group(
+            credential="visitor", model=GEMINI, runs=9, selector=GEMINI, unreported_selections=9
+        ),
+        # No model answered and no selection ran.
+        _group(model=None, runs=10, selector=GEMINI),
+    )
+    assert answer["totals"]["unpriced_runs"] == 2 + 4 + 5
+    assert answer["totals"]["runs"] == 52
 
 
 def test_a_reported_selector_cost_is_added_and_a_model_without_a_price_is_unpriced() -> None:
@@ -752,7 +974,13 @@ def test_a_reported_selector_cost_is_added_and_a_model_without_a_price_is_unpric
     )
     assert answer["totals"]["estimated_usd"] == 0.0375 and answer["totals"]["unpriced_runs"] == 3
     assert answer["by_day"][0]["estimated_usd"] == 0.0375
-    assert [row["estimated_usd"] for row in answer["by_model"]] == [0.0, 0.0]
+    assert [
+        (row["model"], row["credential"], row["estimated_usd"]) for row in answer["by_model"]
+    ] == [
+        (GEMINI, "site", 0.0),
+        (GEMINI, "visitor", 0.0),
+        ("jev", "site", 0.0375),
+    ]
 
 
 def test_a_reported_cost_is_not_added_on_top_of_a_priced_selector() -> None:
@@ -933,6 +1161,37 @@ FIXED: tuple[Run, ...] = (
         fallback_reasons="rate_limited",
         country="SI",
     ),
+    # A priced extraction whose selector is a model without a list price.
+    a_run(
+        at=at(17, 9),
+        visitor_day=A_17,
+        tier="opus",
+        requested_model=OPUS,
+        model=OPUS,
+        requested_selector=GEMINI,
+        country="SI",
+        prompt_tokens=2000,
+        completion_tokens=200,
+        selector_calls=2,
+        selector_prompt_tokens=400,
+        selector_completion_tokens=40,
+        total_ms=1500,
+    ),
+    # Failed after a paid call: the model answered and the answer could not be used.
+    a_run(
+        at=at(18, 13),
+        visitor_day=B_18,
+        status=422,
+        code="extraction_unparseable",
+        tier="sonnet",
+        requested_model=SONNET,
+        model=SONNET,
+        requested_selector="retrieval",
+        country="US",
+        llm_calls=1,
+        prompt_tokens=100_000,
+        completion_tokens=10_000,
+    ),
     # Outside the three days, on either side.
     a_run(at=at(15, 23, 59, 59), model=OPUS, prompt_tokens=1_000_000, total_ms=9, country="DE"),
     a_run(at=at(19), model=OPUS, prompt_tokens=1_000_000, total_ms=9, country="DE"),
@@ -943,48 +1202,66 @@ EXPECTED: dict[str, Any] = {
     "days": 3,
     "generated_at": "2026-11-18T14:20:00Z",
     "totals": {
-        "runs": 6,
-        "ok": 4,
-        "errors": 2,
+        "runs": 8,
+        "ok": 5,
+        "errors": 3,
         "visitors": 3,
-        "prompt_tokens": 517_050,
-        "completion_tokens": 101_705,
-        "estimated_usd": 2.0365,
-        "unpriced_runs": 1,
+        "prompt_tokens": 619_450,
+        "completion_tokens": 111_945,
+        "estimated_usd": 2.3485,
+        # The OpenRouter extraction, and the Opus run whose selector has no list price.
+        "unpriced_runs": 2,
     },
     "by_day": [
         {"day": "2026-11-16", **EMPTY_DAY},
         {
             "day": "2026-11-17",
-            "runs": 2,
-            "ok": 1,
+            "runs": 3,
+            "ok": 2,
             "visitors": 1,
-            "opus": 1,
+            "opus": 2,
             "sonnet": 0,
             "other": 1,
             "own": 0,
             "stepped_down": 2,
-            "estimated_usd": 0.0125,
-            "p50_ms": 500,
-            "p95_ms": 500,
+            "estimated_usd": 0.0245,
+            "p50_ms": 1000,
+            "p95_ms": 1450,
         },
         {
             "day": "2026-11-18",
-            "runs": 4,
+            "runs": 5,
             "ok": 3,
             "visitors": 2,
             "opus": 1,
-            "sonnet": 1,
+            "sonnet": 2,
             "other": 0,
             "own": 1,
             "stepped_down": 1,
-            "estimated_usd": 2.024,
+            "estimated_usd": 2.324,
             "p50_ms": 2000,
             "p95_ms": 2900,
         },
     ],
     "by_model": [
-        # The refused run and the failed one: no model answered.
+        {
+            "model": OPUS,
+            "credential": "site",
+            "runs": 2,
+            "prompt_tokens": 6000,
+            "completion_tokens": 600,
+            "estimated_usd": 0.036,
+        },
+        # One answered run and the one that failed after its paid call.
+        {
+            "model": SONNET,
+            "credential": "site",
+            "runs": 2,
+            "prompt_tokens": 600_000,
+            "completion_tokens": 110_000,
+            "estimated_usd": 2.3,
+        },
+        # The refused run and the one whose provider failed: no model answered.
         {
             "model": None,
             "credential": "site",
@@ -995,14 +1272,6 @@ EXPECTED: dict[str, Any] = {
         },
         {
             "model": OPUS,
-            "credential": "site",
-            "runs": 1,
-            "prompt_tokens": 4000,
-            "completion_tokens": 400,
-            "estimated_usd": 0.024,
-        },
-        {
-            "model": OPUS,
             "credential": "visitor",
             "runs": 1,
             "prompt_tokens": 10_000,
@@ -1010,23 +1279,25 @@ EXPECTED: dict[str, Any] = {
             "estimated_usd": 0.0,
         },
         {
-            "model": SONNET,
-            "credential": "site",
-            "runs": 1,
-            "prompt_tokens": 500_000,
-            "completion_tokens": 100_000,
-            "estimated_usd": 2.0,
-        },
-        {
             "model": GEMINI,
             "credential": "site",
             "runs": 1,
-            "prompt_tokens": 3000,
-            "completion_tokens": 300,
+            "prompt_tokens": 3400,
+            "completion_tokens": 340,
             "estimated_usd": 0.0,
+        },
+        # What Jev reported for its selections, on no run of its own.
+        {
+            "model": "jev",
+            "credential": "site",
+            "runs": 0,
+            "prompt_tokens": 50,
+            "completion_tokens": 5,
+            "estimated_usd": 0.0125,
         },
     ],
     "by_code": [
+        {"code": "extraction_unparseable", "runs": 1},
         {"code": "provider_error", "runs": 1},
         {"code": "visitor_limit_reached", "runs": 1},
     ],
@@ -1036,8 +1307,8 @@ EXPECTED: dict[str, Any] = {
         {"reason": "overloaded", "runs": 1},
     ],
     "by_country": [
-        {"country": "SI", "runs": 3},
-        {"country": "US", "runs": 2},
+        {"country": "SI", "runs": 4},
+        {"country": "US", "runs": 3},
         {"country": None, "runs": 1},
     ],
 }
@@ -1093,7 +1364,11 @@ def stored(request: pytest.FixtureRequest) -> Iterator[SiteRuns]:
 
 
 def test_the_statistics_of_a_fixed_set_of_rows(stored: SiteRuns) -> None:
-    assert stored.stats(3) == EXPECTED
+    answer = stored.stats(3)
+    assert answer == EXPECTED
+    # The dollars per model and per day both add up to the total.
+    for part in ("by_model", "by_day"):
+        assert round(sum(row["estimated_usd"] for row in answer[part]), 6) == 2.3485
     # The page draws "refused, no tier" as the runs that are in none of the four tiers.
     for day in stored.stats(30)["by_day"]:
         assert sum(day[tier] for tier in ("opus", "sonnet", "other", "own")) <= day["runs"]
@@ -1102,23 +1377,27 @@ def test_the_statistics_of_a_fixed_set_of_rows(stored: SiteRuns) -> None:
 def test_a_shorter_window_leaves_out_the_earlier_day(stored: SiteRuns) -> None:
     answer = stored.stats(1)
     assert answer["by_day"] == [EXPECTED["by_day"][2]]
-    assert answer["totals"]["runs"] == 4 and answer["totals"]["visitors"] == 2
-    assert answer["by_code"] == [{"code": "visitor_limit_reached", "runs": 1}]
+    assert answer["totals"]["runs"] == 5 and answer["totals"]["visitors"] == 2
+    assert answer["by_code"] == [
+        {"code": "extraction_unparseable", "runs": 1},
+        {"code": "visitor_limit_reached", "runs": 1},
+    ]
     assert answer["by_fallback"] == [{"reason": "opus_allowance_used", "runs": 1}]
-    assert answer["by_country"] == [{"country": "SI", "runs": 2}, {"country": "US", "runs": 2}]
+    assert answer["by_country"] == [{"country": "US", "runs": 3}, {"country": "SI", "runs": 2}]
+    assert answer["totals"]["unpriced_runs"] == 0
 
 
 def test_a_longer_window_is_zero_filled_and_takes_in_the_older_run(stored: SiteRuns) -> None:
     answer = stored.stats(30)
     assert len(answer["by_day"]) == 30 and answer["by_day"][0]["day"] == "2026-10-20"
-    assert [day["runs"] for day in answer["by_day"][-4:]] == [1, 0, 2, 4]
+    assert [day["runs"] for day in answer["by_day"][-4:]] == [1, 0, 3, 5]
     assert all(day == {"day": day["day"], **EMPTY_DAY} for day in answer["by_day"][:-4])
-    assert answer["totals"]["runs"] == 7
+    assert answer["totals"]["runs"] == 9
     assert answer["by_country"][-2:] == [{"country": "DE", "runs": 1}, {"country": None, "runs": 1}]
-    assert sum(row["runs"] for row in answer["by_country"]) == 7
-    assert sum(row["runs"] for row in answer["by_model"]) == 7
+    assert sum(row["runs"] for row in answer["by_country"]) == 9
+    assert sum(row["runs"] for row in answer["by_model"]) == 9
     # One million more Opus input tokens on the site's key: four dollars.
-    assert answer["totals"]["estimated_usd"] == 6.0365
+    assert answer["totals"]["estimated_usd"] == 6.3485
 
 
 # --- against Postgres only -----------------------------------------------------------
@@ -1371,10 +1650,13 @@ def test_the_setup_tool_builds_a_neon_executor_and_prints_by_default(
 
 def test_module_exports() -> None:
     assert set(usage.__all__) == {
+        "CODES",
         "COLUMNS",
         "DEFAULT_DAYS",
         "MAX_DAYS",
+        "OTHER",
         "PRICES",
+        "REASONS",
         "TABLE",
         "Run",
         "SiteRuns",

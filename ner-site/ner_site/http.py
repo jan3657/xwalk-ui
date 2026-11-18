@@ -47,6 +47,7 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import ValidationError
 from xwalk.llm.base import LLMCapabilities, LLMClient, LLMRequest, LLMResponse, ParseError
 from xwalk.llm.parsing import parse_json_object
+from xwalk.records import Usage
 from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
 from ner_site import fake, fallback, limits, providers, usage
@@ -302,6 +303,37 @@ def _usage_store(settings: Settings, timeout: float) -> usage.SiteRuns | None:
         return found
 
 
+def _known_models(settings: Settings) -> frozenset[str]:
+    """The model and selector ids this deployment lists: what the row of a run may
+    name (``usage.run_of`` adds the ids every deployment knows)."""
+    return frozenset(
+        {
+            *settings.models,
+            *settings.offered_models,
+            *settings.selectors,
+            settings.fallback_model,
+            *(model for info in settings.own_providers for model in info.models),
+        }
+    )
+
+
+def _failed_calls(recorded: dict[str, Any] | None, exc: BaseException, asked: str) -> None:
+    """Keep, for the row of a run that is being recorded, what the model calls of a
+    failed request are known to have used (``ServiceError.usage``) and the model that
+    was asked. Tokens only when a call reported them: a failure that reported none
+    used an unknown amount, not zero."""
+    carried = getattr(exc, "usage", None)
+    if not recorded or not isinstance(carried, Usage) or carried.calls <= 0:
+        return
+    reported = carried.calls > carried.unknown_calls
+    recorded["failed"] = {
+        "model": asked,
+        "llm_calls": carried.calls,
+        "prompt_tokens": carried.prompt_tokens if reported else None,
+        "completion_tokens": carried.completion_tokens if reported else None,
+    }
+
+
 def _allowed(path: str, settings: Settings) -> tuple[str, ...] | None:
     """The methods of a path, None for a path that does not exist. ``/api/stats``
     exists only on a deployment with the stats passcode set."""
@@ -339,6 +371,8 @@ def _record(
             visitor_day=usage.visitor_day(_visitor(settings, recorded["address"]), salt, now),
             country=country,
             selector_tokens=recorded.get("selector_tokens", (None, None)),
+            models=_known_models(settings),
+            failed=recorded.get("failed"),
         )
         if not _USAGE_FLIGHTS.enter():
             log["usage"] = USAGE_SATURATED
@@ -865,6 +899,9 @@ async def _ner(
         token = _OWN_RUN.set(True)
         try:
             response = await _run_own(credential, valid, settings, indexes, started, log)
+        except ServiceError as exc:
+            _failed_calls(recorded, exc, model)
+            raise
         finally:
             _OWN_RUN.reset(token)
     else:
@@ -907,7 +944,9 @@ async def _ner(
                 claude_blocked=None if admitted is None else admitted.blocked,
                 allowance_window="hour" if admitted is None else admitted.window,
             )
-        except BaseException:
+        except BaseException as exc:
+            # The model the chain was on when it gave up, else the one asked for.
+            _failed_calls(recorded, exc, getattr(llm, "model", None) or model)
             if admitted is not None:  # a failed request still says how far down it went
                 log["fallbacks"] = [note.model_dump(mode="json") for note in admitted.notes] + [
                     {"stage": f.stage, "from": f.from_model, "to": f.to_model, "reason": f.reason}

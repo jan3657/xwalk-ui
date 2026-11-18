@@ -4184,3 +4184,163 @@ def test_an_unusable_database_url_for_analytics_alone_only_makes_stats_unavailab
     assert _error(_stats(on, headers={})) == (401, "stats_passcode_required")
     assert _error(_stats(on, headers={"x-stats-passcode": "no"})) == (401, "stats_passcode_invalid")
     assert _error(_stats(off)) == (404, "not_found")
+
+
+def test_an_upstream_model_name_never_reaches_a_row_or_the_statistics(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The model that answered is what the provider's response says. The real adapter
+    and SDK over a mock Anthropic that names itself with a sentinel."""
+    import anthropic
+    import httpx2
+    from ner_site.claude import ClaudeClient
+
+    upstream = "claude-UPSTREAMSENTINEL-9"
+
+    def handler(request: Any) -> Any:
+        body = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": upstream,
+            "content": [{"type": "text", "text": HALO}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 700, "output_tokens": 30},
+        }
+        return httpx2.Response(200, json=body)
+
+    def factory(settings: Settings, model: str, purpose: str) -> Any:
+        sdk = anthropic.AsyncAnthropic(
+            api_key=ANTHROPIC_KEY,
+            max_retries=0,
+            http_client=anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)),
+        )
+        return ClaudeClient(model, api_key=ANTHROPIC_KEY, max_tokens=1000, client=sdk)
+
+    s = _stats_site(cache_dir, tmp_path)
+    result = _ask(s, {"text": HALO_TEXT}, claude=factory)
+    assert result[0] == 200 and _json(result)["model"] == upstream  # the answer is as it was
+    (row,) = _recorded(runs)
+    assert (row["requested_model"], row["model"]) == (OPUS, "other")
+    assert (row["prompt_tokens"], row["completion_tokens"]) == (700, 30)
+    stats = _stats(s)
+    data = _json(stats)
+    assert data["by_model"] == [
+        {
+            "model": "other",
+            "credential": "site",
+            "runs": 1,
+            "prompt_tokens": 700,
+            "completion_tokens": 30,
+            "estimated_usd": 0.0,
+        }
+    ]
+    # Not priced, and said so: the estimate is not silently short.
+    assert data["totals"]["unpriced_runs"] == 1 and data["totals"]["estimated_usd"] == 0.0
+    stored = json.dumps([runs.sent, [str(r) for r in runs.rows]], default=str)
+    assert "UPSTREAMSENTINEL" not in stored and b"UPSTREAMSENTINEL" not in stats[2]
+
+
+def test_the_models_a_deployment_lists_are_stored_by_name(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, own_clients: Any
+) -> None:
+    lists = {
+        "NER_SITE_MODELS": f"{OPUS},{SONNET},vendor/site-model",
+        "NER_SITE_SELECTORS": "jev,vendor/site-selector",
+        "NER_SITE_FALLBACK_MODEL": "vendor/last-step",
+    }
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=ALL_OWN, **lists)
+    assert http_mod._known_models(s) >= {
+        "vendor/site-model",
+        "vendor/site-selector",
+        "vendor/last-step",
+        "gpt-6-luna",
+        "openai/gpt-6-luna",
+        GEMINI,
+    }
+    assert "offline" in http_mod._known_models(Settings.from_env({"NER_SITE_OFFLINE": "1"}))
+    ran = _ask(
+        s,
+        {"provider": "openai", "text": HALO_TEXT, "selector": "gpt-6-luna"},
+        headers=OWN_HEADERS,
+    )
+    assert ran[0] == 200, ran[2]
+    plain = _stats_site(cache_dir, tmp_path, **lists)
+    site = _ask(
+        plain,
+        {"text": HALO_TEXT, "model": "vendor/site-model", "selector": "retrieval"},
+        llm_factory=_fake(HALO),
+    )
+    assert site[0] == 200, site[2]
+    first, second = _recorded(runs)
+    assert (first["requested_model"], first["model"], first["requested_selector"]) == (
+        "gpt-6-luna",
+        "gpt-6-luna",
+        "gpt-6-luna",
+    )
+    assert (second["requested_model"], second["model"], second["requested_selector"]) == (
+        "vendor/site-model",
+        "vendor/site-model",
+        "retrieval",
+    )
+
+
+def test_a_run_that_failed_after_a_paid_call_records_its_tokens_and_model(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only a 200 used to fill the token columns, so an answer that was paid for and
+    then could not be used cost nothing in the statistics."""
+    from xwalk.records import Usage
+
+    s = _stats_site(cache_dir, tmp_path)
+    # The model answered; the answer is not the JSON that was asked for (422).
+    unusable = _ask(s, {"text": HALO_TEXT}, claude=_Claude("this is not json"))
+    assert _error(unusable) == (422, "extraction_unparseable")
+    record = _last_log(capsys)
+    # The log line gains nothing: what the failure carried goes to the row only.
+    assert not {"failed", "llm_calls", "prompt_tokens", "ran"} & set(record)
+    # The provider failed with usage of its own (a refusal reports its tokens).
+    paid = LLMFatalError("declined", usage=Usage(prompt_tokens=700, completion_tokens=70, calls=1))
+    refused = _ask(s, {"text": HALO_TEXT}, claude=_Claude(opus_extract=[paid]))
+    assert _error(refused) == (502, "provider_error")
+    # A failure that reported no tokens: its calls are counted, no model is named.
+    down = LLMFatalError("the provider said no")
+    failed = _ask(s, {"text": HALO_TEXT}, claude=_Claude(opus_extract=[down]))
+    assert _error(failed) == (502, "provider_error")
+    first, second, third = _recorded(runs)
+    assert (first["status"], first["code"], first["model"]) == (422, "extraction_unparseable", OPUS)
+    assert first["llm_calls"] == 1
+    assert first["prompt_tokens"] > 0 and first["completion_tokens"] > 0
+    assert (second["model"], second["llm_calls"]) == (OPUS, 1)
+    assert (second["prompt_tokens"], second["completion_tokens"]) == (700, 70)
+    assert (third["model"], third["llm_calls"]) == (None, 1)
+    assert (third["prompt_tokens"], third["completion_tokens"]) == (None, None)
+    data = _json(_stats(s))
+    opus = next(row for row in data["by_model"] if row["model"] == OPUS)
+    assert opus["runs"] == 2
+    assert opus["prompt_tokens"] == first["prompt_tokens"] + 700
+    expected = (opus["prompt_tokens"] * 4.0 + opus["completion_tokens"] * 20.0) / 1_000_000
+    assert data["totals"]["estimated_usd"] == round(expected, 6) > 0
+    assert data["totals"]["ok"] == 0 and data["totals"]["errors"] == 3
+
+
+def test_an_own_key_run_that_failed_after_an_answer_records_its_tokens(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    runs: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ner_site import providers
+
+    def build(credential: Any, model: str, *, purpose: str, **options: Any) -> Any:
+        return FakeLLM(["this is not json"], model=model)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=ALL_OWN)
+    result = _ask(s, {"provider": "openai", "text": HALO_TEXT}, headers=OWN_HEADERS)
+    assert _error(result) == (422, "extraction_unparseable")
+    (row,) = _recorded(runs)
+    assert (row["credential"], row["model"], row["llm_calls"]) == ("visitor", "gpt-6-luna", 1)
+    assert row["prompt_tokens"] > 0
