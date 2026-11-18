@@ -237,7 +237,8 @@ def _usable_database_url(url: str) -> bool:
     is), whose host is a DNS name and whose port, if it names one, is a number in
     range. A name is labels of 1 to 63 letters, digits and hyphens, no hyphen at an
     end of one, at most 253 characters, with or without one dot at its very end. An
-    address is not a name (a Neon host always is one), in brackets or not. Never
+    address is not a name (a Neon host always is one): in brackets, with a dot at its
+    end, or in a resolver's short forms. Nothing in brackets is. Never
     raises: the URL parser leaves the port and the brackets to whoever asks for them,
     and anything it stumbles on then means "not usable"."""
     if not url.isascii() or not all(0x21 <= ord(ch) <= 0x7E for ch in url):
@@ -250,14 +251,22 @@ def _usable_database_url(url: str) -> bool:
         return False
     if parts.scheme not in {"postgres", "postgresql"} or not host or len(host) > 254:
         return False
+    if "[" in parts.netloc or "]" in parts.netloc:
+        return False  # brackets hold an address, or something that is not a host at all
+    name = host[:-1] if host.endswith(".") else host
+    labels = name.split(".")
     try:
-        ipaddress.ip_address(host)
+        ipaddress.ip_address(name)
     except ValueError:
         pass
     else:
         return False
-    name = host[:-1] if host.endswith(".") else host
-    return len(name) <= 253 and all(_DNS_LABEL.fullmatch(label) for label in name.split("."))
+    # A name whose last label is a number is read as an IPv4 address by resolvers and
+    # URL parsers, in decimal or hexadecimal and with fewer than four parts (127.1,
+    # 2130706433, 0x7f.1): not a name either.
+    if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", labels[-1]):
+        return False
+    return len(name) <= 253 and all(_DNS_LABEL.fullmatch(label) for label in labels)
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:

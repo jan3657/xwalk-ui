@@ -1891,6 +1891,19 @@ UNUSABLE_URLS = [
     "postgresql://owner:pw@[2001:db8::7]:5432/db",
     "postgresql://owner:pw@127.0.0.1/db",
     "postgresql://owner:pw@127.0.0.1:5432/db",
+    # An address with a dot at its end, in the short forms a resolver takes, as one
+    # number, in hexadecimal; a name that ends in a number is read as one too.
+    "postgresql://owner:retrieval@127.0.0.1./db",
+    "postgresql://owner:retrieval@127.1/db",
+    "postgresql://owner:pw@127.1./db",
+    "postgresql://owner:pw@2130706433/db",
+    "postgresql://owner:pw@0x7f.0.0.1/db",
+    "postgresql://owner:pw@0x7f000001/db",
+    "postgresql://owner:pw@db.example.123/db",
+    # Anything in brackets, also what is no address.
+    "postgresql://owner:retrieval@[v1.example.]/db",
+    "postgresql://owner:pw@[db.example]/db",
+    "postgresql://owner:pw@[::ffff:127.0.0.1]/db",
     # A credential that cannot travel in a header.
     "postgresql://owner:p\u00e4ss@ep-x.neon.tech/db",
 ]
@@ -1901,6 +1914,8 @@ USABLE_URLS = [
     "postgresql://owner:pw@" + "a" * 63 + ".example/db",
     "postgresql://owner:pw@localhost/db",
     "postgresql://owner:pw@1.example/db",
+    "postgresql://owner:pw@123.example.com./db",
+    "postgresql://owner:pw@0x7f.example/db",
     "postgresql://ep-x.neon.tech",
 ]
 
