@@ -5,6 +5,12 @@ Binding: docs/ner-site/PLAN.md sections 3.2 (environment), 3.3 (signatures) and 
 entities and assembles a :class:`NerResponse`; every failure it knows about leaves as a
 :class:`ServiceError` with a code from section 3.1. ``ner_site.http`` turns those into
 responses.
+
+Since 18 November 2026 (docs/superpowers/specs/
+2026-11-18-claude-provider-open-access-design.md sections 4 to 6) Claude on the
+operator's Anthropic key leads the model lists, and a request for a Claude model runs
+on a fallback chain (:func:`make_chain`) that ``run`` reports on: the model that
+answered, every step-down, and a sentence for the visitor about each.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
+from ner_site.claude import CLAUDE_MODELS, EFFORTS, OPUS, SONNET, is_claude
 from ner_site.extract import MAX_TOKENS, TEMPERATURE, extract, render_default_prompt
 from ner_site.indexes import (
     NEON_DIMENSIONS,
@@ -40,6 +47,7 @@ from ner_site.indexes import (
     OntologyIndex,
     summarise_status,
 )
+from ner_site.limits import Allowance
 from ner_site.mapping import MapStats, map_entities
 from ner_site.ontologies import FULL_ROUTES, ROUTES
 from ner_site.schema import (
@@ -64,22 +72,17 @@ from ner_site.select import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODELS = (
-    "openai/gpt-4o-mini",
-    "google/gemini-2.5-flash-lite",
-    "qwen/qwen3-next-80b-a3b-instruct",
-)
+# A model id starting with "claude-" is called on the operator's Anthropic key
+# (ner_site.claude); anything else goes through OpenRouter. Claude leads both lists; an
+# id is only offered while the key it needs is set (Settings.offered_models).
+DEFAULT_FALLBACK_MODEL = "google/gemini-3.1-flash-lite"
+DEFAULT_MODELS = (OPUS, SONNET, DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna")
 # What may pick the match among an entity's retrieved candidates (ner_site.select), after
-# "retrieval" (the fused ranking alone), which is always offered. Each one answered live
-# requests on 4 November 2026 (cheap, recent, structured output); DeepSeek V4.1 Flash
-# returned non-JSON once and Qwen3.7 Flash had no endpoint under the account's data
-# policy, so they are left out.
-DEFAULT_SELECTORS = (
-    JEV,
-    "openai/gpt-6-luna",
-    "anthropic/claude-haiku-5.5",
-    "google/gemini-3.1-flash-lite",
-)
+# "retrieval" (the fused ranking alone), which is always offered. The OpenRouter ones
+# answered live requests on 4 November 2026 (cheap, recent, structured output); DeepSeek
+# V4.1 Flash returned non-JSON once and Qwen3.7 Flash had no endpoint under the account's
+# data policy, so they are left out.
+DEFAULT_SELECTORS = (OPUS, SONNET, JEV, DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna")
 SELECTOR_CALLS_PER_ENTITY = 4  # Jev: one screen chunk, choose, gate, and one spare
 DEFAULT_CACHE_DIR = Path("/tmp/xwalk-ner-site")
 OFFLINE_MODEL = "offline"
@@ -114,6 +117,12 @@ _LIMIT_ENV: tuple[tuple[str, str, int, int], ...] = (
     ("NER_SITE_MAX_ENTITIES", "max_entities", 1, 100),
     ("NER_SITE_MAX_PROMPT_CHARS", "max_prompt_chars", 1, 16000),
 )
+# (env name, Allowance field): whole numbers 0..1000, refused outside like the limits.
+_ALLOWANCE_ENV: tuple[tuple[str, str], ...] = (
+    ("NER_SITE_OPUS_PER_HOUR", "opus_per_hour"),
+    ("NER_SITE_SONNET_PER_HOUR", "sonnet_per_hour"),
+)
+ALLOWANCE_MAX = 1000
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 ENV_NAMES = (
@@ -132,6 +141,11 @@ ENV_NAMES = (
     "NER_SITE_SELECTORS",
     "NER_SITE_SELECTOR",
     *(name for name, _, _, _ in _LIMIT_ENV),
+    "ANTHROPIC_API_KEY",
+    "NER_SITE_CLAUDE_EFFORT",
+    "NER_SITE_FALLBACK_MODEL",
+    *(name for name, _ in _ALLOWANCE_ENV),
+    "NER_SITE_VISITOR_SALT",
 )
 
 
@@ -171,7 +185,13 @@ class Settings:
     neon_dimensions: int = NEON_DIMENSIONS
     catalog: Catalog = "samples"
     selectors: tuple[str, ...] = DEFAULT_SELECTORS
-    selector: str = RETRIEVAL_ONLY
+    # The configured default selector; None means the first one that can run.
+    selector: str | None = None
+    anthropic_api_key: str | None = field(default=None, repr=False)
+    claude_effort: str = "low"
+    fallback_model: str = DEFAULT_FALLBACK_MODEL
+    allowance: Allowance = field(default_factory=Allowance)
+    visitor_salt: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -187,13 +207,41 @@ class Settings:
                 "NER_SITE_BASE_URL must be an http(s) URL such as https://openrouter.ai/api/v1"
             )
 
+        def known_claude(name: str, ids: tuple[str, ...]) -> None:
+            unknown = [m for m in ids if is_claude(m) and m not in CLAUDE_MODELS]
+            if unknown:
+                raise SettingsError(
+                    f"{name} names an unknown Claude model ({', '.join(unknown)[:80]}); "
+                    f"the Claude ids are {' and '.join(CLAUDE_MODELS)}"
+                )
+
         raw_models = get("NER_SITE_MODELS")
         if raw_models:
             models = tuple(dict.fromkeys(m.strip() for m in raw_models.split(",") if m.strip()))
             if not models:
                 raise SettingsError("NER_SITE_MODELS must list at least one model id")
+            known_claude("NER_SITE_MODELS", models)
         else:
             models = DEFAULT_MODELS
+
+        effort = get("NER_SITE_CLAUDE_EFFORT").lower() or "low"
+        if effort not in EFFORTS:
+            raise SettingsError(f"NER_SITE_CLAUDE_EFFORT must be one of {', '.join(EFFORTS)}")
+        fallback_model = get("NER_SITE_FALLBACK_MODEL") or DEFAULT_FALLBACK_MODEL
+        if is_claude(fallback_model) or fallback_model in (RETRIEVAL_ONLY, JEV):
+            # The last step of the chain is the one that does not depend on Anthropic.
+            raise SettingsError(
+                "NER_SITE_FALLBACK_MODEL must be an OpenRouter model id such as "
+                f"{DEFAULT_FALLBACK_MODEL}"
+            )
+        allowance: dict[str, int] = {}
+        for name, attr in _ALLOWANCE_ENV:
+            raw = get(name)
+            if not raw:
+                continue
+            if not re.fullmatch(r"[0-9]{1,4}", raw) or int(raw) > ALLOWANCE_MAX:
+                raise SettingsError(f"{name} must be a whole number from 0 to {ALLOWANCE_MAX}")
+            allowance[attr] = int(raw)
 
         passcode = get("NER_SITE_PASSCODE") or None
         if passcode is not None and not passcode.isascii():
@@ -232,9 +280,9 @@ class Settings:
             raise SettingsError("NER_SITE_NEON_CATALOG must be samples or full")
         if catalog == "full" and backend != "neon":
             raise SettingsError("NER_SITE_NEON_CATALOG=full needs NER_SITE_BACKEND=neon")
-        # Read only for the Neon backend: a bundled deployment ignores whatever a
-        # platform integration may have put in DATABASE_URL.
-        database_url = (get("DATABASE_URL") or None) if backend == "neon" else None
+        # Read on every backend since the visitor allowance lives there too
+        # (ner_site.limits). Bundled indexes still never see it: index_settings().
+        database_url = get("DATABASE_URL") or None
         if database_url is not None and urlsplit(database_url).scheme not in {
             "postgres",
             "postgresql",
@@ -248,16 +296,19 @@ class Settings:
             else DEFAULT_SELECTORS
         )
         selectors = tuple(m for m in selectors if m != RETRIEVAL_ONLY)
-        selector = get("NER_SITE_SELECTOR") or RETRIEVAL_ONLY
+        known_claude("NER_SITE_SELECTORS", selectors)
+        # Checked against the list, not against the keys: a selector whose key is
+        # missing is a default that cannot run (default_selector moves on), not a typo.
+        selector = get("NER_SITE_SELECTOR") or None
         offered = (RETRIEVAL_ONLY, JEV) if offline_raw in _TRUE else (RETRIEVAL_ONLY, *selectors)
-        if selector not in offered:
+        if selector is not None and selector not in offered:
             raise SettingsError(
                 f"NER_SITE_SELECTOR must be one of {', '.join(offered)} (NER_SITE_SELECTORS)"
             )
 
         dense = get("NER_SITE_DENSE_DIR")
         cache = get("NER_SITE_CACHE_DIR")
-        return cls(
+        settings = cls(
             api_key=get("OPENROUTER_API_KEY") or None,
             base_url=base_url.rstrip("/"),
             models=models,
@@ -273,16 +324,39 @@ class Settings:
             catalog="full" if catalog == "full" else "samples",
             selectors=selectors,
             selector=selector,
+            anthropic_api_key=get("ANTHROPIC_API_KEY") or None,
+            claude_effort=effort,
+            fallback_model=fallback_model,
+            allowance=Allowance(**allowance),
+            visitor_salt=get("NER_SITE_VISITOR_SALT") or None,
         )
+        if not settings.offered_models:
+            raise SettingsError(
+                "NER_SITE_MODELS lists no model that the keys that are set can run "
+                "(Claude ids need ANTHROPIC_API_KEY, the others OPENROUTER_API_KEY)"
+            )
+        return settings
 
     @property
     def mode(self) -> Mode:
         return "offline" if self.offline else "live"
 
+    def _runnable(self, model: str) -> bool:
+        """Whether the key `model` needs is set. A Claude id needs the Anthropic key. An
+        OpenRouter id (and Jev) is left out only where Claude is all the deployment has:
+        with no key at all the lists show what an OpenRouter key would offer, as they
+        did before Claude."""
+        if is_claude(model):
+            return self.anthropic_api_key is not None
+        return self.api_key is not None or self.anthropic_api_key is None
+
     @property
     def offered_models(self) -> tuple[str, ...]:
-        """What ``/api/health`` lists and a request may name: the stand-in when offline."""
-        return (OFFLINE_MODEL,) if self.offline else self.models
+        """What ``/api/health`` lists and a request may name: the stand-in when offline,
+        otherwise the configured models whose key is set."""
+        if self.offline:
+            return (OFFLINE_MODEL,)
+        return tuple(m for m in self.models if self._runnable(m))
 
     @property
     def default_model(self) -> str:
@@ -290,15 +364,21 @@ class Settings:
 
     @property
     def offered_selectors(self) -> tuple[str, ...]:
-        """What may pick the match: ``retrieval`` (no selector) first, then Jev and the
-        LLMs. Offline, Jev is a token-overlap stand-in and no LLM is offered."""
+        """What may pick the match: ``retrieval`` (no selector) first, then the
+        configured selectors whose key is set. Offline, Jev is a token-overlap stand-in
+        and no LLM is offered."""
         if self.offline:
             return (RETRIEVAL_ONLY, JEV)
-        return (RETRIEVAL_ONLY, *self.selectors)
+        return (RETRIEVAL_ONLY, *(m for m in self.selectors if self._runnable(m)))
 
     @property
     def default_selector(self) -> str:
-        return self.selector
+        """``NER_SITE_SELECTOR`` while it is offered, otherwise the first selector that
+        can run (``retrieval`` when none can)."""
+        offered = self.offered_selectors
+        if self.selector in offered:
+            return self.selector
+        return offered[1] if len(offered) > 1 else RETRIEVAL_ONLY
 
     @property
     def default_prompt(self) -> str:
@@ -313,8 +393,14 @@ class Settings:
 
     @property
     def configured(self) -> bool:
-        """Whether ``/api/ner`` can run: offline, or a key to call the provider with."""
-        return self.offline or self.api_key is not None
+        """Whether ``/api/ner`` can run: offline, or a key to call a provider with
+        (OpenRouter's or Anthropic's)."""
+        return self.offline or self.api_key is not None or self.anthropic_api_key is not None
+
+    @property
+    def claude_offered(self) -> bool:
+        """Whether a request can ask for Claude at all (the allowance applies only then)."""
+        return not self.offline and self.anthropic_api_key is not None
 
     def index_settings(self) -> IndexView:
         """The view the indexes are opened with. Offline mode never spends the key, so
@@ -324,7 +410,7 @@ class Settings:
             dense_dir=self.dense_dir,
             api_key=None if self.offline else self.api_key,
             backend=self.backend,
-            database_url=self.database_url,
+            database_url=self.database_url if self.backend == "neon" else None,
             neon_schema=self.neon_schema,
             neon_dimensions=self.neon_dimensions,
             catalog=self.catalog,
@@ -335,7 +421,13 @@ class Settings:
         (nothing echoes them in the first place). Values shorter than
         ``MIN_SCRUBBED_CHARS`` are left alone: replacing a passcode like ``ok`` would
         corrupt ordinary JSON, and so short a value cannot be hidden anyway."""
-        values: list[str | None] = [self.api_key, self.passcode, self.database_url]
+        values: list[str | None] = [
+            self.api_key,
+            self.anthropic_api_key,
+            self.passcode,
+            self.database_url,
+            self.visitor_salt,
+        ]
         if self.database_url:
             password = urlsplit(self.database_url).password
             if password:
@@ -779,6 +871,8 @@ async def run(
         warnings=[scrub(n, settings) for n in notes],
         usage=wire_usage(usage, stats.embedding_requests, picked),
         timing_ms=timing,
+        requested_model=req.model,
+        requested_selector=selector,
     )
 
 

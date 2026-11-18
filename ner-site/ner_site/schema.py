@@ -46,6 +46,19 @@ Binding: docs/ner-site/PLAN.md section 3. Every response model serialises with
     ``usage`` also carries ``selector_calls``, ``selector_prompt_tokens``,
     ``selector_completion_tokens`` and ``selector_cost_usd`` (PLAN.md section 13).
 
+Additions of 18 November 2026 (docs/superpowers/specs/
+2026-11-18-claude-provider-open-access-design.md section 6). The 200 response also
+carries what was asked for and every departure from it::
+
+    "requested_model": "claude-opus-5-5", "requested_selector": "claude-opus-5-5",
+    "fallbacks": [{"stage": "extract", "from": "claude-opus-5-5",
+                   "to": "claude-sonnet-5-5", "reason": "rate_limited"}],
+    "notices": ["Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5."]
+
+``model`` is then the model that produced the extraction and each ``pick.selector`` the
+model that made that pick. ``/api/health`` gains ``claude`` and ``visitor`` beside
+``llm`` (added by ``ner_site.http``, not part of :class:`HealthResponse`).
+
 Token counts are ``null`` when the provider did not report them, never 0.
 
 Error envelope (see :meth:`ServiceError.envelope`)::
@@ -56,10 +69,17 @@ Error envelope (see :meth:`ServiceError.envelope`)::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, SerializerFunctionWrapHandler, model_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 EntityType = Literal["chemical", "disease", "gene", "food", "other"]
 ENTITY_TYPES: tuple[EntityType, ...] = ("chemical", "disease", "gene", "food", "other")
@@ -161,7 +181,30 @@ class NerRequest(BaseModel):
     selector: str | None = None
 
 
+class FallbackNote(BaseModel):
+    """One departure from the requested model. ``stage`` is ``admit`` (decided before
+    any call: the visitor's allowance, the limiter, a Claude that is known to be
+    unavailable), ``extract`` or ``select``. ``reason`` is a machine string
+    (``rate_limited``, ``opus_allowance_used`` ...); the sentence for the visitor is in
+    ``NerResponse.notices``. ``from_`` is ``"from"`` on the wire (a Python keyword)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    stage: str
+    from_: str = Field(alias="from")
+    to: str
+    reason: str
+
+    @model_serializer(mode="plain")
+    def _from_on_the_wire(self) -> dict[str, str]:
+        return {"stage": self.stage, "from": self.from_, "to": self.to, "reason": self.reason}
+
+
 class NerResponse(BaseModel):
+    """``model`` is the model that produced the extraction; ``requested_model`` and
+    ``requested_selector`` are what was asked for, defaults resolved (empty only in
+    responses written before those fields existed)."""
+
     ok: Literal[True] = True
     model: str
     mode: Mode
@@ -171,6 +214,10 @@ class NerResponse(BaseModel):
     warnings: list[str]
     usage: Usage
     timing_ms: dict[str, int]
+    requested_model: str = ""
+    requested_selector: str = ""
+    fallbacks: list[FallbackNote] = []
+    notices: list[str] = []
 
 
 class OntologySummary(BaseModel):
@@ -220,11 +267,20 @@ class ServiceError(Exception):
     visitor's text in it.
     """
 
-    def __init__(self, code: str, message: str, *, status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        # Response headers that belong to the failure (``Retry-After`` on a 429).
+        self.headers: dict[str, str] = dict(headers or {})
 
     def envelope(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message}}

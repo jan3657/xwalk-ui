@@ -61,14 +61,17 @@ HEALTH_RESPONSE = """
 """
 
 
-def _round_trip(model: Any, raw: str) -> None:
+def _round_trip(model: Any, raw: str, added: dict[str, Any] | None = None) -> None:
     data = json.loads(raw)
     dumped = model.model_validate(data).model_dump(mode="json", exclude_none=False)
-    assert json.dumps(dumped) == json.dumps(data)
+    assert json.dumps(dumped) == json.dumps({**data, **(added or {})})
 
 
 def test_the_plan_s_ner_response_round_trips_unchanged() -> None:
-    _round_trip(NerResponse, NER_RESPONSE)
+    # The plan's example predates the fields of 18 November 2026: they are additions,
+    # appended after it at their defaults, and nothing before them moves.
+    added = {"requested_model": "", "requested_selector": "", "fallbacks": [], "notices": []}
+    _round_trip(NerResponse, NER_RESPONSE, added)
 
 
 def test_the_plan_s_health_response_round_trips_unchanged() -> None:
@@ -156,3 +159,50 @@ def test_service_error_envelope_matches_the_plan() -> None:
 
 def test_limits_public_is_the_health_subset() -> None:
     assert Limits().public() == json.loads(HEALTH_RESPONSE)["limits"]
+
+
+# --- Claude as the default provider (spec 2026-11-18, section 6) ---------------------
+
+
+def test_a_fallback_note_is_from_on_the_wire() -> None:
+    from ner_site.schema import FallbackNote
+
+    note = FallbackNote(stage="extract", from_="claude-opus-5-5", to="b/c", reason="rate_limited")
+    wire = {"stage": "extract", "from": "claude-opus-5-5", "to": "b/c", "reason": "rate_limited"}
+    assert note.model_dump(mode="json") == wire
+    assert list(note.model_dump(mode="json")) == ["stage", "from", "to", "reason"]
+    assert FallbackNote.model_validate(wire) == note
+
+
+def test_the_response_carries_what_was_asked_for_and_every_departure() -> None:
+    from ner_site.schema import FallbackNote
+
+    data = json.loads(NER_RESPONSE)
+    plain = NerResponse.model_validate(data).model_dump(mode="json")
+    assert plain["requested_model"] == "" and plain["requested_selector"] == ""
+    assert plain["fallbacks"] == [] and plain["notices"] == []
+    note = {"stage": "admit", "from": "a", "to": "b", "reason": "opus_allowance_used"}
+    full = NerResponse.model_validate(
+        {
+            **data,
+            "requested_model": "claude-opus-5-5",
+            "requested_selector": "jev",
+            "fallbacks": [note],
+            "notices": ["Your Opus allowance for this hour is used."],
+        }
+    )
+    assert full.fallbacks == [FallbackNote(stage="admit", from_="a", to="b", reason=note["reason"])]
+    dumped = full.model_dump(mode="json")
+    assert dumped["fallbacks"] == [note] and dumped["requested_selector"] == "jev"
+    assert json.loads(full.model_dump_json())["fallbacks"] == [note]
+
+
+def test_a_service_error_may_carry_response_headers() -> None:
+    plain = ServiceError("bad_json", "no", status=400)
+    assert plain.headers == {}
+    limited = ServiceError("visitor_limit_reached", "x", status=429, headers={"Retry-After": "60"})
+    assert limited.headers == {"Retry-After": "60"}
+    assert limited.envelope() == {
+        "ok": False,
+        "error": {"code": "visitor_limit_reached", "message": "x"},
+    }

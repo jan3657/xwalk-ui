@@ -41,9 +41,12 @@ EXAMPLE_TEXT = (
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
+    # The default selector is the first that can run (Jev with only an OpenRouter key);
+    # these tests are about the request without a selection step unless they say so.
     env = {
         "NER_SITE_CACHE_DIR": str(tmp_path / "cache"),
         "NER_SITE_DENSE_DIR": str(tmp_path / "no-dense"),
+        "NER_SITE_SELECTOR": "retrieval",
         **overrides,
     }
     return Settings.from_env(env)
@@ -77,11 +80,14 @@ def test_from_env_defaults() -> None:
     assert s.api_key is None and s.passcode is None and s.offline is False
     assert s.base_url == "https://openrouter.ai/api/v1"
     assert s.models == (
-        "openai/gpt-4o-mini",
-        "google/gemini-2.5-flash-lite",
-        "qwen/qwen3-next-80b-a3b-instruct",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "google/gemini-3.1-flash-lite",
+        "openai/gpt-6-luna",
     )
-    assert s.default_model == "openai/gpt-4o-mini" and s.offered_models == s.models
+    # No Anthropic key: the Claude ids are configured but not offered.
+    assert s.offered_models == s.models[2:]
+    assert s.default_model == "google/gemini-3.1-flash-lite"
     assert s.limits == Limits()
     assert s.dense_dir == PROJECT / "indexes"
     assert s.cache_dir == Path("/tmp/xwalk-ner-site")
@@ -251,8 +257,9 @@ def test_validate_request_resolves_defaults(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     got = validate_request(NerRequest(text="x" * 5000, prompt="  ", top_k=10), s)
     assert got.prompt == DEFAULT_PROMPT and got.model == s.default_model and got.top_k == 10
-    custom = validate_request(NerRequest(text="ok", prompt="only genes", model=s.models[1]), s)
-    assert custom.prompt == "only genes" and custom.model == s.models[1]
+    second = s.offered_models[1]
+    custom = validate_request(NerRequest(text="ok", prompt="only genes", model=second), s)
+    assert custom.prompt == "only genes" and custom.model == second
 
 
 def test_text_length_counts_code_points(tmp_path: Path) -> None:
@@ -266,7 +273,7 @@ def test_offline_accepts_only_the_offline_model(tmp_path: Path) -> None:
     s = _settings(tmp_path, NER_SITE_OFFLINE="1")
     assert validate_request(NerRequest(text="ok", model="offline"), s).model == "offline"
     with pytest.raises(ServiceError) as exc:
-        validate_request(NerRequest(text="ok", model="openai/gpt-4o-mini"), s)
+        validate_request(NerRequest(text="ok", model="google/gemini-3.1-flash-lite"), s)
     assert exc.value.code == "unknown_model"
 
 
@@ -285,7 +292,9 @@ def test_run_end_to_end_with_fake_llm(tmp_path: Path, bm25_only: Any) -> None:
     s = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
     out = asyncio.run(run(NerRequest(text=text, top_k=2), settings=s, llm=llm, indexes=bm25_only))
     assert isinstance(out, NerResponse)
-    assert out.model == "openai/gpt-4o-mini" and out.mode == "live"
+    assert out.model == "google/gemini-3.1-flash-lite" and out.mode == "live"
+    assert out.requested_model == out.model and out.requested_selector == "retrieval"
+    assert out.fallbacks == [] and out.notices == []
     first, second = out.entities
     assert (first.text, first.start, first.end) == ("haloperidol", 9, 20)  # relocated
     assert text[first.start : first.end] == first.text
@@ -521,7 +530,7 @@ def test_selectors_are_offered_and_validated(tmp_path: Path) -> None:
 
     plain = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
     assert plain.offered_selectors[0] == RETRIEVAL_ONLY and JEV in plain.offered_selectors
-    assert plain.default_selector == RETRIEVAL_ONLY
+    assert plain.default_selector == RETRIEVAL_ONLY  # the helper's NER_SITE_SELECTOR
     assert validate_request(NerRequest(text="ok"), plain).selector == RETRIEVAL_ONLY
     jev = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY, NER_SITE_SELECTOR="jev")
     assert jev.default_selector == JEV
@@ -700,3 +709,160 @@ def test_a_key_check_that_cannot_reach_openrouter_is_not_an_outage(tmp_path: Pat
     assert status is not None and status.status == "ok"
     assert status.reason is not None and "not checked" in status.reason
     assert service.check_key(_settings(tmp_path), transport=httpx.MockTransport(down)) is None
+
+
+# --- Claude as the default provider (spec 2026-11-18, section 4) ----------------------
+
+ANTHROPIC_KEY = "sk-ant-SENTINEL-feedbeef-9191"
+OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5-5"
+GEMINI, LUNA = "google/gemini-3.1-flash-lite", "openai/gpt-6-luna"
+DB_URL = "postgresql://owner:npg_SENTINELpw0123@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
+
+
+def test_claude_leads_the_defaults_when_both_keys_are_set() -> None:
+    from ner_site.limits import Allowance
+
+    s = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY})
+    assert s.anthropic_api_key == ANTHROPIC_KEY and s.configured
+    assert s.models == service.DEFAULT_MODELS == (OPUS, SONNET, GEMINI, LUNA)
+    assert s.offered_models == (OPUS, SONNET, GEMINI, LUNA) and s.default_model == OPUS
+    assert s.selectors == service.DEFAULT_SELECTORS == (OPUS, SONNET, "jev", GEMINI, LUNA)
+    assert s.offered_selectors == ("retrieval", OPUS, SONNET, "jev", GEMINI, LUNA)
+    assert s.default_selector == OPUS
+    assert s.claude_effort == "low" and s.fallback_model == GEMINI
+    assert s.allowance == Allowance(opus_per_hour=10, sonnet_per_hour=20)
+    assert s.visitor_salt is None and s.database_url is None
+
+
+def test_without_the_anthropic_key_nothing_about_claude_is_offered() -> None:
+    s = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY})
+    assert s.offered_models == (GEMINI, LUNA) and s.default_model == GEMINI
+    assert s.offered_selectors == ("retrieval", "jev", GEMINI, LUNA)
+    assert s.default_selector == "jev" and s.configured
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", model=OPUS, selector="retrieval"), s)
+    assert exc.value.code == "unknown_model"
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", selector=SONNET), s)
+    assert exc.value.code == "unknown_selector"
+    # No key at all: not configured, and what is listed is what an OpenRouter key would
+    # offer, as before.
+    bare = Settings.from_env({})
+    assert not bare.configured and bare.offered_models == (GEMINI, LUNA)
+    assert bare.default_selector == "jev"
+
+
+def test_without_the_openrouter_key_only_claude_is_offered() -> None:
+    s = Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY})
+    assert s.configured and s.api_key is None
+    assert s.offered_models == (OPUS, SONNET) and s.default_model == OPUS
+    assert s.offered_selectors == ("retrieval", OPUS, SONNET) and s.default_selector == OPUS
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", selector="jev"), s)
+    assert exc.value.code == "unknown_selector"
+
+
+def test_offline_offers_no_claude_even_with_the_key() -> None:
+    s = Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_OFFLINE": "1"})
+    assert s.offered_models == ("offline",) and s.offered_selectors == ("retrieval", "jev")
+    assert s.default_selector == "jev"
+
+
+def test_a_configured_selector_is_the_default_while_it_is_offered() -> None:
+    both = {"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY}
+    assert Settings.from_env({**both, "NER_SITE_SELECTOR": "jev"}).default_selector == "jev"
+    kept = Settings.from_env({**both, "NER_SITE_SELECTOR": "retrieval"})
+    assert kept.default_selector == "retrieval"
+    # Named, but its key is missing: the first selector that can run, not a 503.
+    lost = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_SELECTOR": OPUS})
+    assert lost.default_selector == "jev"
+    with pytest.raises(SettingsError, match="NER_SITE_SELECTOR"):
+        Settings.from_env({**both, "NER_SITE_SELECTOR": "nobody"})
+
+
+def test_the_claude_effort_and_the_fallback_model_are_read_and_checked() -> None:
+    s = Settings.from_env({"NER_SITE_CLAUDE_EFFORT": " High ", "NER_SITE_FALLBACK_MODEL": LUNA})
+    assert s.claude_effort == "high" and s.fallback_model == LUNA
+    for name, value in (
+        ("NER_SITE_CLAUDE_EFFORT", "max"),
+        ("NER_SITE_CLAUDE_EFFORT", "0"),
+        ("NER_SITE_FALLBACK_MODEL", SONNET),
+        ("NER_SITE_FALLBACK_MODEL", "retrieval"),
+        ("NER_SITE_FALLBACK_MODEL", "jev"),
+    ):
+        with pytest.raises(SettingsError) as exc:
+            Settings.from_env({name: value})
+        assert name in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["NER_SITE_OPUS_PER_HOUR", "NER_SITE_SONNET_PER_HOUR"])
+def test_the_allowance_is_read_and_refused_out_of_range(name: str) -> None:
+    from ner_site.limits import Allowance
+
+    low = Settings.from_env({name: "0"}).allowance
+    high = Settings.from_env({name: "1000"}).allowance
+    field = "opus_per_hour" if "OPUS" in name else "sonnet_per_hour"
+    assert getattr(low, field) == 0 and getattr(high, field) == 1000
+    assert Settings.from_env({name: " "}).allowance == Allowance()
+    for bad in ("1001", "-1", "ten", "2.5"):
+        with pytest.raises(SettingsError) as exc:
+            Settings.from_env({name: bad})
+        assert name in str(exc.value) and "0 to 1000" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["NER_SITE_MODELS", "NER_SITE_SELECTORS"])
+def test_an_unknown_claude_id_is_a_settings_error(name: str) -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({name: f"{OPUS}, claude-haiku-5-5"})
+    assert name in str(exc.value) and "claude-haiku-5-5" in str(exc.value)
+    # An OpenRouter id of an Anthropic model is not a Claude id of this site.
+    ok = Settings.from_env({name: f"anthropic/claude-haiku-5.5, {SONNET}"})
+    assert SONNET in (ok.models if name == "NER_SITE_MODELS" else ok.selectors)
+
+
+def test_a_model_list_that_no_key_can_run_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError, match="NER_SITE_MODELS"):
+        Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_MODELS": OPUS})
+    with pytest.raises(SettingsError, match="NER_SITE_MODELS"):
+        Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_MODELS": GEMINI})
+    assert Settings.from_env({"NER_SITE_MODELS": OPUS, "NER_SITE_OFFLINE": "1"}).offline
+
+
+def test_both_keys_and_the_salt_are_scrubbed_and_stay_out_of_repr() -> None:
+    s = Settings.from_env(
+        {
+            "OPENROUTER_API_KEY": SENTINEL_KEY,
+            "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+            "NER_SITE_VISITOR_SALT": "salt-SENTINEL-0001",
+        }
+    )
+    assert s.visitor_salt == "salt-SENTINEL-0001"
+    assert {SENTINEL_KEY, ANTHROPIC_KEY, "salt-SENTINEL-0001"} <= set(s.secrets())
+    for secret in (SENTINEL_KEY, ANTHROPIC_KEY, "salt-SENTINEL-0001"):
+        assert secret not in repr(s)
+    scrubbed = service.scrub(f"401 for {ANTHROPIC_KEY} and {SENTINEL_KEY}", s)
+    assert scrubbed == "401 for [redacted] and [redacted]"
+
+
+def test_the_database_url_is_read_for_the_limiter_on_any_backend() -> None:
+    s = Settings.from_env({"DATABASE_URL": DB_URL})
+    assert s.backend == "bundled" and s.database_url == DB_URL
+    assert DB_URL in s.secrets() and "npg_SENTINELpw0123" in s.secrets()
+    assert "SENTINELpw" not in repr(s)
+    # The index backend choice is unchanged: bundled indexes never see the database.
+    assert s.index_settings().database_url is None and s.index_settings().backend == "bundled"
+    neon = Settings.from_env({"DATABASE_URL": DB_URL, "NER_SITE_BACKEND": "neon"})
+    assert neon.index_settings().database_url == DB_URL
+    with pytest.raises(SettingsError, match="DATABASE_URL"):
+        Settings.from_env({"DATABASE_URL": "mysql://u:p@h/db"})
+
+
+def test_every_new_variable_is_part_of_the_settings_cache_key() -> None:
+    assert {
+        "ANTHROPIC_API_KEY",
+        "NER_SITE_CLAUDE_EFFORT",
+        "NER_SITE_FALLBACK_MODEL",
+        "NER_SITE_OPUS_PER_HOUR",
+        "NER_SITE_SONNET_PER_HOUR",
+        "NER_SITE_VISITOR_SALT",
+    } <= set(service.ENV_NAMES)

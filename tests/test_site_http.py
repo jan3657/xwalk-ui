@@ -82,10 +82,13 @@ def cache_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _settings(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    # The default selector is the first that can run (Jev with only an OpenRouter key);
+    # these tests are about requests without a selection step unless they say so.
     return Settings.from_env(
         {
             "NER_SITE_CACHE_DIR": str(cache_dir),
             "NER_SITE_DENSE_DIR": str(tmp_path / "no-dense"),
+            "NER_SITE_SELECTOR": "retrieval",
             **env,
         }
     )
@@ -153,8 +156,8 @@ def test_health_shape(cache_dir: Path, tmp_path: Path) -> None:
     assert status == 200
     _assert_common_headers(headers)
     health = HealthResponse.model_validate_json(body)
-    assert health.mode == "live" and health.default_model == "openai/gpt-4o-mini"
-    assert health.models == list(s.models)
+    assert health.mode == "live" and health.default_model == "google/gemini-3.1-flash-lite"
+    assert health.models == ["google/gemini-3.1-flash-lite", "openai/gpt-6-luna"]
     assert health.limits == {
         "max_chars": 5000,
         "max_prompt_chars": 4000,
@@ -501,7 +504,7 @@ def test_full_post_live_through_mock_transport(cache_dir: Path, tmp_path: Path) 
         return httpx.Response(
             200,
             json={
-                "model": "google/gemini-2.5-flash-lite",
+                "model": "google/gemini-3.1-flash-lite",
                 "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 412, "completion_tokens": 88},
             },
@@ -510,12 +513,12 @@ def test_full_post_live_through_mock_transport(cache_dir: Path, tmp_path: Path) 
     s = _settings(cache_dir, tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
     result = _post(
         s,
-        {"text": text, "prompt": SECRET_PROMPT, "model": "google/gemini-2.5-flash-lite"},
+        {"text": text, "prompt": SECRET_PROMPT, "model": "openai/gpt-6-luna"},
         llm_factory=lambda st, m: make_llm(st, m, transport=httpx.MockTransport(chat)),
     )
     assert result[0] == 200, result[2]
     out = NerResponse.model_validate_json(result[2])
-    assert out.model == "google/gemini-2.5-flash-lite" and out.mode == "live"
+    assert out.model == "openai/gpt-6-luna" and out.mode == "live"
     assert [(e.text, e.start, e.end) for e in out.entities] == [
         ("haloperidol", 9, 20),
         ("ketamine", 25, 33),
@@ -530,7 +533,7 @@ def test_full_post_live_through_mock_transport(cache_dir: Path, tmp_path: Path) 
         "selector_completion_tokens": None,
         "selector_cost_usd": None,
     }
-    assert bodies[0]["model"] == "google/gemini-2.5-flash-lite"
+    assert bodies[0]["model"] == "openai/gpt-6-luna"
     assert SECRET_PROMPT in bodies[0]["messages"][-1]["content"]
     assert SENTINEL_KEY.encode() not in result[2]
 
@@ -642,7 +645,7 @@ def test_one_log_line_per_request_without_text_prompt_or_key(
     records = [json.loads(line) for line in lines]
     first = records[0]
     assert first["status"] == 200 and first["path"] == "/api/ner"
-    assert first["model"] == "openai/gpt-4o-mini" and first["mode"] == "live"
+    assert first["model"] == "google/gemini-3.1-flash-lite" and first["mode"] == "live"
     assert first["text_chars"] == len(SECRET_TEXT) and first["custom_prompt"] is True
     assert first["entities"] == 1 and first["llm_calls"] == 1
     assert {"extract", "map", "total"} <= set(first["timing_ms"])
