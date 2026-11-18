@@ -183,9 +183,11 @@ class FakeRuns:
             for name in sums:
                 group[name] += row[name] or 0
 
-        def counted(name: str, values: list[str]) -> list[dict[str, Any]]:
+        def counted(name: str, values: list[Any]) -> list[dict[str, Any]]:
             found = {value: values.count(value) for value in values}
-            ordered = sorted(found.items(), key=lambda item: (-item[1], item[0]))
+            ordered = sorted(
+                found.items(), key=lambda item: (-item[1], item[0] is None, item[0] or "")
+            )
             return [{name: value, "runs": count} for value, count in ordered]
 
         stats = {
@@ -201,9 +203,7 @@ class FakeRuns:
                     for reason in row["fallback_reasons"].split(",")
                 ],
             ),
-            "by_country": counted(
-                "country", [row["country"] for row in runs if row["country"] is not None]
-            ),
+            "by_country": counted("country", [row["country"] for row in runs]),
         }
         return [{"stats": json.dumps(stats)}]
 
@@ -637,7 +637,19 @@ def test_prices_are_per_million_tokens_input_and_output() -> None:
     sonnet = _priced(_group(model=SONNET, prompt_tokens=1_000_000, completion_tokens=1_000_000))
     assert sonnet["totals"]["estimated_usd"] == 12.0
     small = _priced(_group(prompt_tokens=412, completion_tokens=88))
-    assert small["totals"]["estimated_usd"] == round(412 * 4e-6 + 88 * 20e-6, 4) == 0.0034
+    assert small["totals"]["estimated_usd"] == round(412 * 4e-6 + 88 * 20e-6, 6) == 0.003408
+
+
+@pytest.mark.parametrize("model", sorted(PRICES))
+def test_a_priced_model_with_any_tokens_never_shows_as_zero_dollars(model: str) -> None:
+    """The page reads a site-key row with tokens and zero dollars as "no price"."""
+    for tokens in ({"prompt_tokens": 1}, {"completion_tokens": 1}):
+        answer = _priced(_group(model=model, **tokens))
+        assert answer["by_model"][0]["estimated_usd"] > 0
+        assert answer["by_day"][0]["estimated_usd"] > 0 and answer["totals"]["estimated_usd"] > 0
+    picked = _priced(_group(model=GEMINI, selector=model, selector_prompt_tokens=1))
+    row = next(row for row in picked["by_model"] if row["model"] == model)
+    assert row["runs"] == 0 and row["estimated_usd"] > 0
 
 
 def test_only_runs_on_the_sites_keys_are_priced() -> None:
@@ -737,10 +749,18 @@ def test_a_reported_cost_of_a_selector_model_is_shown_on_that_model() -> None:
     assert answer["totals"]["estimated_usd"] == 0.25 and answer["totals"]["unpriced_runs"] == 0
 
 
-def test_runs_that_never_reached_a_model_are_in_no_model_row_and_not_unpriced() -> None:
-    answer = _priced(_group(model=None, selector=None, runs=4))
-    assert answer["by_model"] == [] and answer["totals"]["unpriced_runs"] == 0
-    assert answer["totals"]["runs"] == 4
+def test_runs_that_never_reached_a_model_are_in_the_null_row_and_not_unpriced() -> None:
+    answer = _priced(_group(model=None, selector=None, runs=4), _group(prompt_tokens=10))
+    assert answer["by_model"][0] == {
+        "model": None,
+        "credential": "site",
+        "runs": 4,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "estimated_usd": 0.0,
+    }
+    assert answer["by_model"][1]["model"] == OPUS and answer["totals"]["unpriced_runs"] == 0
+    assert answer["totals"]["runs"] == 5
 
 
 def test_numbers_that_arrive_as_strings_or_floats_are_read() -> None:
@@ -936,6 +956,15 @@ EXPECTED: dict[str, Any] = {
         },
     ],
     "by_model": [
+        # The refused run and the failed one: no model answered.
+        {
+            "model": None,
+            "credential": "site",
+            "runs": 2,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
         {
             "model": OPUS,
             "credential": "site",
@@ -978,7 +1007,11 @@ EXPECTED: dict[str, Any] = {
         {"reason": "opus_allowance_used", "runs": 1},
         {"reason": "overloaded", "runs": 1},
     ],
-    "by_country": [{"country": "SI", "runs": 3}, {"country": "US", "runs": 2}],
+    "by_country": [
+        {"country": "SI", "runs": 3},
+        {"country": "US", "runs": 2},
+        {"country": None, "runs": 1},
+    ],
 }
 
 
@@ -1033,6 +1066,9 @@ def stored(request: pytest.FixtureRequest) -> Iterator[SiteRuns]:
 
 def test_the_statistics_of_a_fixed_set_of_rows(stored: SiteRuns) -> None:
     assert stored.stats(3) == EXPECTED
+    # The page draws "refused, no tier" as the runs that are in none of the four tiers.
+    for day in stored.stats(30)["by_day"]:
+        assert sum(day[tier] for tier in ("opus", "sonnet", "other", "own")) <= day["runs"]
 
 
 def test_a_shorter_window_leaves_out_the_earlier_day(stored: SiteRuns) -> None:
@@ -1049,10 +1085,10 @@ def test_a_longer_window_is_zero_filled_and_takes_in_the_older_run(stored: SiteR
     assert len(answer["by_day"]) == 30 and answer["by_day"][0]["day"] == "2026-10-20"
     assert [day["runs"] for day in answer["by_day"][-4:]] == [1, 0, 2, 4]
     assert all(day == {"day": day["day"], **EMPTY_DAY} for day in answer["by_day"][:-4])
-    assert answer["totals"]["runs"] == 7 and answer["by_country"][-1] == {
-        "country": "DE",
-        "runs": 1,
-    }
+    assert answer["totals"]["runs"] == 7
+    assert answer["by_country"][-2:] == [{"country": "DE", "runs": 1}, {"country": None, "runs": 1}]
+    assert sum(row["runs"] for row in answer["by_country"]) == 7
+    assert sum(row["runs"] for row in answer["by_model"]) == 7
     # One million more Opus input tokens on the site's key: four dollars.
     assert answer["totals"]["estimated_usd"] == 6.0365
 

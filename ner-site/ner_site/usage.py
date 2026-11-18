@@ -24,7 +24,8 @@ round trip, so each call here is exactly one:
 - ``stats`` sends one ``SELECT`` that answers with one JSON document: the per-day
   counts (zero-filled with ``generate_series``, distinct visitors, the median and the
   95th percentile of the run time), the token sums per day, credential, model and
-  requested selector, and the counts per error code, step-down reason and country.
+  requested selector, and the counts per error code, step-down reason and country
+  (a null country is the runs that came without one).
 - The first call of an instance puts ``CREATE TABLE IF NOT EXISTS`` and the index on
   ``at`` in front, in the same transaction: still one round trip.
 
@@ -84,6 +85,9 @@ PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-5-5": (4.0, 20.0),
     "claude-sonnet-5-5": (2.0, 10.0),
 }
+# Dollars are rounded to this many places: fine enough that a priced model with even
+# one token never shows as exactly zero, which the page reads as "no price".
+USD_DIGITS = 6
 SITE = "site"
 TIERS = ("opus", "sonnet", "other", "own")
 # Selectors that are not a model: their tokens belong to no row of ``by_model``.
@@ -217,7 +221,7 @@ WITH runs AS (
     WHERE fallback_reasons <> ''
     GROUP BY reason
 ), countries AS (
-    SELECT country, count(*) AS runs FROM runs WHERE country IS NOT NULL GROUP BY country
+    SELECT country, count(*) AS runs FROM runs GROUP BY country
 )
 SELECT jsonb_build_object(
     'by_day', (
@@ -366,7 +370,7 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
     models: dict[tuple[str, str], dict[str, Any]] = {}
     prompt_tokens = completion_tokens = unpriced = 0
 
-    def row_of(model: str, credential: str) -> dict[str, Any]:
+    def row_of(model: str | None, credential: str) -> dict[str, Any]:
         return models.setdefault(
             (model, credential),
             {
@@ -391,17 +395,18 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         prompt_tokens += prompt + picked_prompt
         completion_tokens += completion + picked_completion
         spent = 0.0
-        if model is not None:
-            row = row_of(str(model), credential)
-            row["runs"] += runs
-            row["prompt_tokens"] += prompt
-            row["completion_tokens"] += completion
-            if site:
-                cost = _usd(model, prompt, completion)
-                row["estimated_usd"] += cost
-                spent += cost
-                if model not in PRICES:
-                    unpriced += runs
+        # A run that reached no model (refused, or failed first) is in the row whose
+        # model is null, so that the rows' runs add up to every run.
+        row = row_of(None if model is None else str(model), credential)
+        row["runs"] += runs
+        row["prompt_tokens"] += prompt
+        row["completion_tokens"] += completion
+        if site and model is not None:
+            cost = _usd(model, prompt, completion)
+            row["estimated_usd"] += cost
+            spent += cost
+            if model not in PRICES:
+                unpriced += runs
         # Never both: a selector with a price is priced by its tokens, any other by
         # what its provider reported.
         extra = reported if site and selector not in PRICES else 0.0
@@ -426,7 +431,7 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
             "visitors": _count(found["visitors"]),
             **{tier: _count(found[tier]) for tier in TIERS},
             "stepped_down": _count(found["stepped_down"]),
-            "estimated_usd": round(day_usd.get(str(found["day"]), 0.0), 4),
+            "estimated_usd": round(day_usd.get(str(found["day"]), 0.0), USD_DIGITS),
             "p50_ms": _count(found["p50_ms"]),
             "p95_ms": _count(found["p95_ms"]),
         }
@@ -435,13 +440,25 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
     runs_total = sum(day["runs"] for day in by_day)
     ok_total = sum(day["ok"] for day in by_day)
     by_model = sorted(
-        models.values(), key=lambda row: (-row["runs"], row["model"], row["credential"])
+        models.values(),
+        key=lambda row: (
+            -row["runs"],
+            row["model"] is None,
+            row["model"] or "",
+            row["credential"],
+        ),
     )
     for row in by_model:
-        row["estimated_usd"] = round(row["estimated_usd"], 4)
+        row["estimated_usd"] = round(row["estimated_usd"], USD_DIGITS)
 
     def counted(name: str, key: str) -> list[dict[str, Any]]:
-        return [{key: str(found[key]), "runs": _count(found["runs"])} for found in raw[name]]
+        return [
+            {
+                key: None if found[key] is None else str(found[key]),
+                "runs": _count(found["runs"]),
+            }
+            for found in raw[name]
+        ]
 
     stamp = datetime.fromtimestamp(generated_at, tz=timezone.utc)
     return {
@@ -456,7 +473,7 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
             "visitors": sum(day["visitors"] for day in by_day),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "estimated_usd": round(sum(day_usd.values()), 4),
+            "estimated_usd": round(sum(day_usd.values()), USD_DIGITS),
             "unpriced_runs": unpriced,
         },
         "by_day": by_day,
