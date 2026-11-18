@@ -141,6 +141,30 @@ def _outside_own_run(record: logging.LogRecord) -> bool:
     return not _OWN_RUN.get() and not _DATABASE_CALL.get()
 
 
+# The HTTP stack of the engine's Neon executor. Its loggers are not named one by one:
+# the packages have more than the ones that show in an ordinary exchange (through a
+# proxy, ``httpcore.proxy`` logs the host it is asked to reach).
+_HTTP_STACK = ("httpx", "httpcore")
+_HUSHED = 0  # how many loggers there were when the stack's were last looked for
+
+
+def _hush_http_stack() -> None:
+    """Put the filter on every logger under ``httpx`` and ``httpcore`` that exists by
+    now, the two themselves included. A filter on a logger does not reach its
+    children, so each one gets it; this runs again before every database exchange,
+    for loggers made since, and looks only when there are more loggers than before."""
+    global _HUSHED
+    loggers = logging.root.manager.loggerDict
+    if len(loggers) == _HUSHED:
+        return
+    for name in _HTTP_STACK:
+        logging.getLogger(name)  # so that the top of each hierarchy is a logger too
+    for name, found in list(loggers.items()):
+        if isinstance(found, logging.Logger) and name.split(".", 1)[0] in _HTTP_STACK:
+            found.addFilter(_outside_own_run)  # once: a filter is not added twice
+    _HUSHED = len(loggers)
+
+
 class _Unlogged:
     """An ``SQLExecutor`` whose exchanges the HTTP libraries' loggers say nothing
     about (``_outside_own_run``). The mark is set for the length of a call, in the
@@ -150,6 +174,7 @@ class _Unlogged:
         self._inner = inner
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        _hush_http_stack()
         token = _DATABASE_CALL.set(True)
         try:
             return self._inner.execute(sql, params)
@@ -159,6 +184,7 @@ class _Unlogged:
     def transaction(
         self, statements: Sequence[tuple[str, Sequence[Any]]], *, read_only: bool = False
     ) -> list[list[dict[str, Any]]]:
+        _hush_http_stack()
         token = _DATABASE_CALL.set(True)
         try:
             return self._inner.transaction(statements, read_only=read_only)
@@ -178,6 +204,7 @@ for _logger in (
     ),
 ):
     logging.getLogger(_logger).addFilter(_outside_own_run)
+_hush_http_stack()
 
 
 def _headers(extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -523,8 +550,10 @@ def _stats(
         if store is None:
             raise usage.UsageUnavailable("site runs have no database")
         data = store.stats(days, models=_known_models(settings))
-    except (usage.UsageUnavailable, ValueError, TimeoutError) as exc:
-        # The store exposes only the class and SQLSTATE; a ValueError may quote the URL.
+    except Exception as exc:  # noqa: BLE001 - whatever kept the statistics from being read
+        # The store exposes only the class and SQLSTATE. Anything else is named by its
+        # class alone: an executor that could not be built (a connection string it
+        # refuses, a certificate file that is not there) may quote the URL or a path.
         log["stats"] = str(exc) if isinstance(exc, usage.UsageUnavailable) else type(exc).__name__
         raise ServiceError(
             STATS_UNAVAILABLE,

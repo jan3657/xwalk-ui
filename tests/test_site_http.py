@@ -4919,3 +4919,166 @@ def test_a_database_that_answers_a_byte_at_a_time_pauses_recording_and_nothing_e
         server.close()
     # The connections ended: the writes fail, and their places are given back.
     assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0, 5)
+
+
+# --- analytics fix round 5 ---------------------------------------------------------------
+
+
+def test_with_a_proxy_configured_the_http_stack_logs_nothing_of_a_database_exchange(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The go/no-go review's case. Through a proxy the HTTP library logs, at DEBUG, the
+    host it asks the proxy to reach (``httpcore.proxy``, ``server_hostname=...``), and
+    that logger was not one of those the filter was put on. The proxy here is a socket
+    on 127.0.0.1 that accepts the CONNECT and then hangs up."""
+    import logging
+
+    from xwalk.retrieval.postgres import NeonHTTPExecutor
+
+    proxy = socket.socket()
+    proxy.bind(("127.0.0.1", 0))
+    proxy.listen(8)
+    asked: list[bytes] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                connection, _ = proxy.accept()
+            except OSError:
+                return
+            try:
+                asked.append(connection.recv(65536))
+                connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            except OSError:
+                pass
+            connection.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.getsockname()[1]}")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    build = lambda url, timeout=2.0: NeonHTTPExecutor(url, timeout=timeout, max_retries=0)  # noqa: E731
+    monkeypatch.setattr(http_mod, "make_usage_executor", build)
+    monkeypatch.setattr(http_mod, "make_limits_executor", build)
+    url = "postgresql://owner:npg_URLSENTINELpw9@db-sentinel.example/neondb"
+    try:
+        s = _stats_site(cache_dir, tmp_path, DATABASE_URL=url)
+        capsys.readouterr()
+        with caplog.at_level(logging.DEBUG):
+            assert _error(_ask(s, claude=_no_claude)) == (503, "limits_unavailable")
+            assert _error(_stats(s)) == (503, "stats_unavailable")
+            during = list(caplog.records)
+            # The same stack outside those exchanges logs as it always did.
+            with pytest.raises(httpx.HTTPError), httpx.Client() as client:
+                client.get("https://elsewhere.example/")
+        err = capsys.readouterr().err
+    finally:
+        proxy.close()
+    assert len(asked) == 4 and all(b"CONNECT" in request for request in asked)
+    assert b"db-sentinel.example" in asked[0]  # the exchanges did go through the proxy
+    assert [r for r in during if r.name.split(".")[0] in ("httpx", "httpcore")] == []
+    after = [r for r in caplog.records if r not in during]
+    assert any(r.name == "httpcore.proxy" and "elsewhere.example" in r.getMessage() for r in after)
+    text = err + " ".join(r.getMessage() + repr(r.__dict__) for r in during)
+    for secret in ("db-sentinel", "URLSENTINEL"):
+        assert secret not in text
+
+
+def test_every_logger_of_the_http_stack_is_silent_during_a_database_exchange(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not a list of names: whatever logger the two packages have, or get later, under
+    ``httpx`` and ``httpcore``. Others are left alone."""
+    import logging
+
+    import httpcore
+
+    names = {
+        name
+        for name in logging.root.manager.loggerDict
+        if name.split(".")[0] in ("httpx", "httpcore")
+    }
+    assert {"httpx", "httpcore.connection", "httpcore.http11", "httpcore.proxy"} <= names
+    assert "httpcore.http2" in names and httpcore is not None
+    made_later = "httpcore.made_later.deeper"
+    logging.getLogger(made_later)  # after this module was imported, before the exchange
+    spoken: list[str] = []
+
+    class Loud:
+        def execute(self, sql: str, params: Any = ()) -> list[dict[str, Any]]:
+            for name in (*sorted(names), made_later, "httpcore", "httpxyz", "urllib3", "xwalk"):
+                logging.getLogger(name).warning("from %s", name)
+                spoken.append(name)
+            return []
+
+        def transaction(self, statements: Any, *, read_only: bool = False) -> Any:
+            return [self.execute("")]
+
+    quiet = http_mod._Unlogged(Loud())
+    with caplog.at_level(logging.DEBUG):
+        quiet.execute("SELECT 1")
+        quiet.transaction([("SELECT 1", ())])
+        heard = [record.name for record in caplog.records]
+        assert heard == ["httpxyz", "urllib3", "xwalk"] * 2
+        Loud().execute("SELECT 1")  # the same loggers outside a marked exchange
+    assert len(caplog.records) == 6 + len(names) + 5
+
+
+def test_an_executor_that_cannot_be_built_for_the_statistics_is_a_503(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A CA file the environment names and that is not there: the HTTP client cannot be
+    made. That used to be a 500 on this route."""
+    for error in (
+        FileNotFoundError(2, "No such file or directory", f"/missing/{DB_URL}.pem"),
+        OSError("could not load the certificates"),
+        RuntimeError(f"no client for {DB_URL}"),
+    ):
+
+        def broken(database_url: str, timeout: float, error: Exception = error) -> Any:
+            raise error
+
+        monkeypatch.setattr(http_mod, "make_usage_executor", broken)
+        http_mod.reset()
+        s = _stats_site(cache_dir, tmp_path)
+        capsys.readouterr()
+        result = _stats(s)
+        assert _error(result) == (503, "stats_unavailable")
+        err = capsys.readouterr().err
+        record = json.loads(err.strip().splitlines()[-1])
+        assert record["stats"] == type(error).__name__ and "exception" not in record
+        assert "SENTINELpw" not in err and "ep-x-pooler" not in err
+
+
+def test_a_reply_that_names_the_host_as_a_day_is_not_returned(
+    cache_dir: Path, tmp_path: Path, runs: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The go/no-go review's case: a reply that is the statement's in every way but one
+    string was returned as it came, with HTTP 200."""
+    host = "db-sentinel.example"
+    real = runs._site_runs_stats
+
+    def echoing(sql: str, p: list[Any]) -> list[dict[str, Any]]:
+        document = json.loads(real(sql, p)[0]["stats"])
+        document["by_day"][0]["day"] = host
+        return [{"stats": json.dumps(document)}]
+
+    runs._site_runs_stats = echoing
+    s = _stats_site(cache_dir, tmp_path)
+    capsys.readouterr()
+    result = _stats(s)
+    assert _error(result) == (503, "stats_unavailable")
+    err = capsys.readouterr().err
+    assert json.loads(err.strip().splitlines()[-1])["stats"] == (
+        "site runs answered with an unreadable row"
+    )
+    assert host.encode() not in result[2] and host not in err
+    runs._site_runs_stats = real
+    assert _stats(s)[0] == 200
