@@ -302,8 +302,9 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    - `INCONCLUSIVE`: the run could not establish the count, and proves nothing either
      way. Health showed no `visitor` block with `limits: "on"` and whole-number
      balances before the burst (step 3 was not met; requests that ran all the same
-     are reported as `not counted`, under no tier) or after it; the hour or the day
-     ended during the burst; a balance fell by more than the starts (something else
+     are reported as `not counted`, under no tier) or after it; no request of the
+     burst started at all (every one was refused); the hour or the day ended during
+     the burst; a balance fell by more than the starts (something else
      used that address's allowance: run it alone); or the requests used no Claude
      model, for which health has no balance. Fix what it names and run it again.
 7. **Check (know what a Neon outage does, by design).** When the limiter cannot query
@@ -386,7 +387,8 @@ Visitors' own keys are a third change, and that one waits for a variable: they a
 until `NER_SITE_OWN_PROVIDERS` lists the providers to allow (step 9). Until then a
 deployment without the Anthropic key behaves as it did before this code, apart from
 fields that are added: `own_keys` (off) in health, `provider: "site"` and
-`credential_source: "site"` in a response and in the log line. That includes the
+`credential_source: "site"` in a response, and `provider: "site"` and `credential:
+"site"` in the log line. That includes the
 production deployment of 4 November (OpenRouter key, passcode, Neon): the same
 models, no "Run with" field, `DATABASE_URL` read only for the Neon backend, and an
 `Authorization` header on a request (HTTP basic auth, `curl -u`, a proxy that adds
@@ -849,7 +851,9 @@ with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). Off 
   then Run (the button and the keyboard shortcut) is held. If health cannot be
   loaded, or no longer offers the provider, the page says so and runs on the site's
   models only after the visitor presses "Use the site's models" (or picks another
-  key under "Run with").
+  key under "Run with"). That the visitor chose an own key is kept in session storage
+  on its own (the provider id, never the key) and is removed only by that choice, so
+  the page asks again after every reload, also when the key itself has been forgotten.
 - The API reads the key from that one header, builds a client for that request, and
   closes it after. The key is not written to the settings, a cache, the database, a log
   line or a response, and no length or digest of it is kept. For the length of the
@@ -860,10 +864,14 @@ with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). Off 
   `NER_SITE_BASE_URL`, `ANTHROPIC_BASE_URL`, proxy variables, `.netrc` and
   `ANTHROPIC_CUSTOM_HEADERS` do not apply, and redirects are not followed. Each
   request is checked as it leaves (the pinned host, the visitor's key once; for
-  Anthropic every header and its value) and is not sent otherwise. A redirect's
-  `Location`, and any response header that carries the key, is removed before the
-  HTTP client reads the response, so a provider that echoes the key there leaves it
-  in no cache of the warm instance. The text and the prompt go to that provider
+  Anthropic every header and its value, and a `Content-Length` that is the body's)
+  and is not sent otherwise. Of a response, the HTTP client is given the status, the
+  body and a header set the site writes itself: one of two fixed content types, and
+  `content-length`, `content-encoding`, `retry-after` and `retry-after-ms` only in
+  a strict form. A redirect's `Location`, a charset, a cookie and every other header
+  stop there, so a provider that echoes the key in one (in any encoding) leaves it
+  in no cache of the warm instance, and no cookie is stored or sent back. The text
+  and the prompt go to that provider
   with the key. An own OpenRouter request carries the site's `HTTP-Referer` and
   `X-Title` headers, as the site's own do.
 - A provider's error text is never repeated (it can echo the key, whole or masked):
@@ -925,11 +933,15 @@ credential was then refused. One of the three provider errors above also has
 `own_error`, the class name of what failed (`LLMFatalError` or `LLMRetryableError`
 for a provider's answer, `TimeoutError` for the deadline, `CallLimitExceeded`,
 `WireRefused` for a request the site did not send, or the class of whatever kept a
-client from being built). Only a failed provider call or a timeout is reported as the
-provider's error: any other exception on that path is a fault of the site's code
-and answers 500 `internal`, with `exception` and `where` in the log line as for any
-request. A client that fails to close after the run changes nothing for the visitor
-and adds `own_close_error` (a class name) to the line. No part of the key is in any
+client from being built). A call that fails during selection is a failed pick inside
+a 200, and the line of that request has `own_error` too (the first such class), so
+`"status": 200` with `"own_error": "WireRefused"` means picks the site itself did
+not send. Only a failure of the provider, the SDK, the HTTP client or a timeout is
+reported as the provider's error: any other exception is a fault of the site's code.
+During extraction it answers 500 `internal`, with `exception` and `where` in the log
+line as for any request; during selection it is a failed pick with the word `error`
+and its class in `own_error`. A client that fails to close after the run changes
+nothing for the visitor and adds `own_close_error` (a class name) to the line. No part of the key is in any
 of these.
 
 *The Anthropic SDK is pinned.* `anthropic==2.10.0`, in `requirements.txt` and in the
@@ -1420,10 +1432,10 @@ Known and accepted:
 ### Fixes after the final review, 18 November 2026
 
 Two reviews of the whole branch (one of them by another model) found the points below.
-**Still nothing deployed, no production variable changed, no request with a real key
-to any provider, to Neon or to https://www.xwalk.si.** The sections above describe the
-code after these fixes; the decisions are PLAN.md 15.6, 15.11, 15.12 and 15.16 to
-15.20.
+**The sessions that wrote these fixes deployed nothing, changed no production variable
+and made no request with a real key to any provider, to Neon or to
+https://www.xwalk.si.** The sections above describe the code after these fixes; the
+decisions are PLAN.md 15.6, 15.11, 15.12 and 15.16 to 15.20.
 
 - Own keys are off unless `NER_SITE_OWN_PROVIDERS` lists providers, and a deployment
   without them does not read `DATABASE_URL` for the limiter, does not look at an
@@ -1439,10 +1451,24 @@ code after these fixes; the decisions are PLAN.md 15.6, 15.11, 15.12 and 15.16 t
 - Own-key failures are named in the log; a failed close no longer replaces a result;
   picks cut off by the deadline are counted with unknown tokens.
 
+A second review of these fixes found more, fixed the same day:
+
+- Response headers are no longer searched for the key but rebuilt from an allowlist:
+  an encoded charset still reached the codec cache, and an ordinary `Set-Cookie`
+  from Anthropic was replayed by the HTTP client and refused by the site's own
+  check, failing every pick after the first.
+- A refusal is attributed to the call that was refused and is logged for selection
+  too; the outgoing check compares `Content-Length` with the body.
+- A fault inside an adapter is no longer sealed as the provider's failure.
+- The page keeps the visitor's choice to pay with an own key apart from the key, so
+  a second reload cannot run on the site's keys unasked.
+- The tool resolves percent escapes before looking for a secret, and a burst in
+  which nothing started is `INCONCLUSIVE`.
+
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1153 passed, 23
-  deselected (1000 before these fixes).
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1203 passed, 23
+  deselected (1000 before these fixes, 1153 after the first round).
   The fixes were written test first. Reproduced as failing tests before the code
   changed: for each of the three providers, a 302 with the key in a relative
   `Location` left it in the `urlsplit` cache of `urllib.parse` after the client was
@@ -1459,8 +1485,12 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
   the fix both posted on the site's keys); the choice came back with health, or after
   "Try again"; "Use the site's models" forgot the key and then posted without one;
   a provider turned off between two runs was removed from "Run with", its key
-  forgotten, and nothing posted until a choice was made; only `POST /api/ner`
-  carried the key, and it was in no URL, body, document or console line.
+  forgotten, and nothing posted until a choice was made; three reloads in a row
+  with the provider gone, with and without a kept key, each held Run and asked
+  again (before the second round's fix the second reload posted on the site's
+  keys), and choosing the site's models left nothing in session storage; only
+  `POST /api/ner` carried the key, and it was in no URL, body, document or console
+  line.
 
 Not run, in addition to the list above: Python 3.10 (the changed files parse with the
 3.10 grammar and compile on 3.11 and 3.12; the suite ran on 3.13 only); Firefox and

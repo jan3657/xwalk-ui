@@ -115,8 +115,10 @@ def provider_error(exc: BaseException, provider: str) -> ServiceError
 ```
 
 - **Transport.** JSON body field `provider`: absent or `"site"`, or one of the own
-  providers. An own provider requires exactly one `Authorization: Bearer <key>` header;
-  a `site` request must not carry one. Violations are 400 `bad_credential` with a fixed
+  providers. An own provider requires exactly one `Authorization: Bearer <key>` header.
+  Where own keys are on, a `site` request must not carry one; where they are off, the
+  header is not looked at on a `site` request (amended after the final review: basic
+  auth and authenticating proxies add one). Violations are 400 `bad_credential` with a fixed
   message: missing, duplicated or malformed header; a key outside 20..512 printable
   ASCII characters without spaces; a provider that is not enabled; the key also present
   in `text` or `prompt`. `/api/health` never receives or reads a credential.
@@ -316,13 +318,19 @@ points marked "final review" were changed after two reviews of the whole branch.
   not enough: with redirects not followed the HTTP libraries still parse a
   redirect's `Location`, and a relative one that echoed the key stayed in Python's
   `urlsplit` cache after the request. Every own-key client now sends through a
-  transport wrapper that replaces a 3xx response with a bare one and drops any
-  response header that carries the key, before the library reads it.
-- **Own-path failures (section 5, final review).** Only a failed provider call or a
-  timeout is a provider error; any other exception is 500 `internal` and is logged
-  with its type and frames. The log line of a provider error names the class of
-  what failed (`own_error`); a client that fails to close is logged
-  (`own_close_error`) and does not replace the result.
+  transport wrapper that replaces a 3xx response with a bare one, before the
+  library reads it. Second round: searching the other headers for the key was not
+  enough either (a charset can arrive encoded and is decoded by the library, and a
+  `Set-Cookie` is stored and sent back), so every response gets a new header set:
+  one of two fixed content types, and `content-length`, `content-encoding`,
+  `retry-after` and `retry-after-ms` only in a strict form.
+- **Own-path failures (section 5, final review).** Only a failure of the provider,
+  the SDK, the HTTP library or a timeout is a provider error, also inside the
+  clients themselves; any other exception is a fault of the site's code: 500
+  `internal`, logged with its type and frames, during extraction, and a failed pick
+  during selection. The log line names the class of what failed in either stage
+  (`own_error`); a client that fails to close is logged (`own_close_error`) and
+  does not replace the result.
 - **Selector usage (section 6, final review).** `selector_calls` counts every call
   the request's call budgets dispatched during selection, also one the deadline
   cut off; the selector's tokens and cost are then null.
@@ -341,7 +349,9 @@ points marked "final review" were changed after two reviews of the whole branch.
   the own-key limit and the day's Opus step-down have sentences the spec does not
   give (PLAN.md 15.15). Final review: Run is held until a saved own-key choice is
   restored; when it cannot be (health failed, or the provider is no longer offered)
-  the page says so and uses the site's models only after the visitor chooses that;
+  the page says so and uses the site's models only after the visitor chooses that,
+  and the choice (the provider id, not the key) is kept so that the question is
+  asked again after every reload until then;
   each health read reconciles the providers offered; the hour-blocked sentence
   names the own-key way out where own keys are on (PLAN.md 15.20).
 - **The check tool (rollout).** `tools/claude_check.py --provider ... --key-env ...`;
