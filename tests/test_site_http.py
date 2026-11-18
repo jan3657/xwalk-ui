@@ -43,6 +43,8 @@ EXAMPLE_TEXT = (
 POST_HEADERS = {"content-type": "application/json", "x-requested-with": "xwalk-ner"}
 
 Handled = tuple[int, dict[str, str], bytes]
+# The real one: the conftest fixture swaps it for a refusal in every site test.
+REAL_LIMITS_EXECUTOR = http_mod.make_limits_executor
 
 
 @pytest.fixture(autouse=True)
@@ -1750,3 +1752,31 @@ def test_health_with_only_the_anthropic_key(cache_dir: Path, tmp_path: Path) -> 
     assert health["llm"]["status"] == "unavailable"
     assert "OPENROUTER_API_KEY is not set" in health["llm"]["reason"]
     assert "503" not in health["llm"]["reason"]  # the site runs, on Claude alone
+
+
+def test_the_limiter_has_its_own_executor_that_never_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counting a visit is not idempotent and the indexes' executor retries; a slow
+    database must become "limits unavailable" within a few seconds, not a slow request."""
+    built: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(http_mod, "NeonHTTPExecutor", lambda url, **kw: built.append((url, kw)))
+    REAL_LIMITS_EXECUTOR(DB_URL)
+    assert built == [(DB_URL, {"timeout": http_mod.LIMITS_TIMEOUT_S, "max_retries": 0})]
+    assert http_mod.LIMITS_TIMEOUT_S <= 5 < indexes_mod.NEON_TIMEOUT_S
+
+
+def test_the_limiter_is_kept_per_warm_instance_and_reset_forgets_it(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    assert _ask(s)[0] == 200 and _ask(s)[0] == 200
+    assert visits.opened == [DB_URL] and visits.tags().count("site_visits_table") == 1
+    http_mod.reset()
+    assert _ask(s)[0] == 200 and visits.opened == [DB_URL, DB_URL]
+    # A connection string the executor cannot use is "limits unavailable", not a 500.
+    bad = _open_site(cache_dir, tmp_path, DATABASE_URL="postgresql:///nohost")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(http_mod, "make_limits_executor", REAL_LIMITS_EXECUTOR)
+        out = _json(_ask(bad))
+    assert out["fallbacks"][0]["reason"] == "limits_unavailable"
