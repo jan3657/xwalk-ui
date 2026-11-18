@@ -12,15 +12,31 @@ Usage (from the repository root, with the venv active)::
 ``ner[-SCENARIO].json``, or ``error.json`` with HTTP 400 when the posted text contains
 ``ERROR`` (to exercise the error UI). A scenario needs at least one file of its own; the
 others fall back to the plain ``health.json`` / ``ner.json``. When
-``error-SCENARIO.json`` exists, every POST is answered with it (HTTP 429 for
-``visitor_limit_reached``, otherwise 400). Scenarios in ``fixtures/``:
+``error-SCENARIO.json`` exists, POSTs are answered with it, with the HTTP status of its
+code (``CANNED_ERROR_STATUS``, otherwise 400): an error about the visitor's own key
+answers the own-key POSTs only, any other error the POSTs on the site's keys only, as
+the real API would. Scenarios in ``fixtures/``:
 
-- (none): Claude Opus 5.5 ran, the visitor is on the Opus allowance.
+- (none): Claude Opus 5.5 ran, the visitor is on the Opus allowance, own keys offered.
 - ``sonnet``: the hour's Opus allowance is used; requests start on Claude Sonnet 5.5.
-- ``blocked``: the hour's requests are used; every POST answers 429.
+- ``blocked``: the hour's requests are used; every site-key POST answers 429.
+- ``day``: the day's requests are used; every site-key POST answers 429 (day wording).
+- ``unavailable``: the limiter cannot be consulted; every site-key POST answers 503
+  ``limits_unavailable``. Own-key POSTs still run.
+- ``own-refused``: the provider refuses the visitor's key (401 ``provider_key_refused``).
+- ``own-bad``: the API refuses the credential (400 ``bad_credential``).
+- ``own-off``: own keys turned off (``own_keys.enabled`` false).
 - ``fallback``: Opus stepped down mid-request (``fallbacks`` and ``notices`` set).
 - ``degraded``: offline mode, dense retrieval unavailable, and the response shape of
-  an API from before the Claude change (no ``claude``, ``visitor``, ``notices``).
+  an API from before the Claude change (no ``claude``, ``visitor``, ``notices``,
+  ``own_keys``).
+
+A POST whose body names an own-key ``provider`` is answered with ``ner-own.json`` (its
+``provider`` and model fields set from the request). As the real API does, the canned
+one answers 400 ``bad_credential`` when such a POST lacks a well-formed
+``Authorization: Bearer`` header or a POST on the site's keys carries one. Each canned
+API request is logged with whether it carried an ``Authorization`` header (``present``
+or ``absent``, never its value), which is how to check that only ``POST /api/ner`` does.
 
 Without ``--canned``, requests go through
 ``ner_site.http.handle`` exactly as the Vercel functions do; ``--offline`` sets
@@ -76,21 +92,77 @@ def load_header_rules(path: Path = VERCEL_JSON) -> HeaderRules:
 
 
 # HTTP status for a canned error envelope, by error code; anything else answers 400.
-CANNED_ERROR_STATUS = {"visitor_limit_reached": 429}
+CANNED_ERROR_STATUS = {
+    "visitor_limit_reached": 429,
+    "bad_credential": 400,
+    "provider_key_refused": 401,
+    "provider_rate_limited": 429,
+    "provider_error": 502,
+    "limits_unavailable": 503,
+}
+# Errors about the visitor's own key: a scenario with one refuses the own-key POSTs and
+# lets the site-key ones through; a scenario with any other error does the opposite.
+OWN_KEY_ERRORS = frozenset(
+    {"bad_credential", "provider_key_refused", "provider_rate_limited", "provider_error"}
+)
+BAD_CREDENTIAL = "the API key is missing or is not in the expected form"
+# 20 to 512 printable ASCII characters without spaces, as the real API requires.
+BEARER = re.compile(r"Bearer ([\x21-\x7e]{20,512})")
 
 
 def _load_fixture(file: Path) -> object:
     return json.loads(file.read_text(encoding="utf-8"))
 
 
-def _error_response(envelope: object) -> Response:
+def _error_code(envelope: object) -> str | None:
     error = envelope.get("error") if isinstance(envelope, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
-    status = CANNED_ERROR_STATUS.get(code, 400) if isinstance(code, str) else 400
-    response = _json_response(status, envelope)
-    if status == 429:
-        response[1]["Retry-After"] = "1380"
+    return code if isinstance(code, str) else None
+
+
+def _error_response(envelope: object, health: object) -> Response:
+    """The envelope with its code's status. ``Retry-After`` as the real API sends it:
+    the seconds to the reset health reports for a used allowance (the day's when the
+    day is the window), 30 for a limiter that cannot be consulted."""
+    code = _error_code(envelope)
+    response = _json_response(CANNED_ERROR_STATUS.get(code or "", 400), envelope)
+    if code == "visitor_limit_reached":
+        visitor = health.get("visitor") if isinstance(health, dict) else None
+        visitor = visitor if isinstance(visitor, dict) else {}
+        field = "day_resets_in_s" if visitor.get("window") == "day" else "resets_in_s"
+        seconds = visitor.get(field)
+        response[1]["Retry-After"] = str(seconds) if isinstance(seconds, int) else "1380"
+    elif code == "limits_unavailable":
+        response[1]["Retry-After"] = "30"
     return response
+
+
+def _own_provider_ids(health: object) -> set[str]:
+    own = health.get("own_keys") if isinstance(health, dict) else None
+    if not isinstance(own, dict) or own.get("enabled") is not True:
+        return set()
+    providers = own.get("providers")
+    return {
+        p["id"]
+        for p in (providers if isinstance(providers, list) else [])
+        if isinstance(p, dict) and isinstance(p.get("id"), str)
+    }
+
+
+def _own_result(template: object, request: dict[str, Any]) -> object:
+    """``ner-own.json`` saying what this request asked for: the provider and its models."""
+    if not isinstance(template, dict):
+        return template
+    result = dict(template)
+    result["provider"] = request["provider"]
+    result["credential_source"] = "visitor"
+    for field, names in (
+        ("model", ("model", "requested_model")),
+        ("selector", ("selector", "requested_selector")),
+    ):
+        if isinstance(request.get(field), str) and request[field]:
+            result.update(dict.fromkeys(names, request[field]))
+    return result
 
 
 def canned_backend(directory: Path, scenario: str) -> Backend:
@@ -107,10 +179,19 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
         raise SystemExit(f"serve_local: fixture {directory / f'{kind}.json'} not found")
 
     health, ner, error = pick("health"), pick("ner"), pick("error")
-    # A scenario with an error file of its own refuses every POST (e.g. the 429 state).
+    own_file = directory / "ner-own.json"
+    own_ner = _load_fixture(own_file) if own_file.is_file() else ner
+    own_ids = _own_provider_ids(health)
+    # A scenario with an error file of its own refuses every POST of the kind the error
+    # is about (e.g. the 429 state for the site's keys, a refused key for an own key).
     always_error = bool(scenario) and (directory / f"error{suffix}.json").is_file()
+    error_is_own = _error_code(error) in OWN_KEY_ERRORS
 
     def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
+        authorization = headers.get("authorization")
+        # Whether a credential came, never the credential.
+        seen = "absent" if authorization is None else "present"
+        print(f"canned: {method} {path} authorization={seen}", file=sys.stderr, flush=True)
         if path == "/api/health":
             return _json_response(200, health) if method == "GET" else _method_not_allowed()
         if path != "/api/ner":
@@ -123,12 +204,19 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _envelope(400, "bad_json", "the request body is not valid JSON")
-        if always_error:
-            return _error_response(error)
+        provider = request.get("provider") if isinstance(request, dict) else None
+        own = provider is not None and provider != "site"
+        known = isinstance(provider, str) and provider in own_ids
+        if own and not (known and authorization and BEARER.fullmatch(authorization)):
+            return _envelope(400, "bad_credential", BAD_CREDENTIAL)
+        if not own and authorization is not None:
+            return _envelope(400, "bad_credential", BAD_CREDENTIAL)
+        if always_error and own == error_is_own:
+            return _error_response(error, health)
         text = request.get("text") if isinstance(request, dict) else None
         if isinstance(text, str) and "ERROR" in text:
             return _json_response(400, error)
-        return _json_response(200, ner)
+        return _json_response(200, _own_result(own_ner, request) if own else ner)
 
     return backend
 
@@ -275,7 +363,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--scenario",
         default="",
-        help="with --canned: use the NAME fixtures (sonnet, blocked, fallback, degraded)",
+        help="with --canned: use the NAME fixtures (sonnet, blocked, day, unavailable, "
+        "own-refused, own-bad, own-off, fallback, degraded)",
     )
     parser.add_argument(
         "--delay", type=float, default=0.0, help="seconds to wait before answering a POST"

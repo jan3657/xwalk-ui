@@ -57,6 +57,23 @@
         </div>
       </details>
 
+      <div class="run-with" id="run-with" hidden>
+        <div class="field">
+          <label for="provider">Run with</label>
+          <select id="provider"></select>
+        </div>
+        <div class="field key-field" id="own-key-field" hidden>
+          <label for="own-key" id="own-key-label">Your API key</label>
+          <div class="key-row">
+            <input id="own-key" type="password" autocomplete="off" spellcheck="false"
+              autocapitalize="off" autocorrect="off" data-1p-ignore data-lpignore="true"
+              aria-describedby="own-key-note">
+            <button type="button" id="forget-key" class="ghost">Forget key</button>
+          </div>
+        </div>
+        <p id="own-key-note" class="hint key-note" hidden></p>
+      </div>
+
       <div class="options">
         <div class="field" id="model-field">
           <label for="model">Extraction model</label>

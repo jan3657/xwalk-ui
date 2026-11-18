@@ -19,8 +19,16 @@
   const MODEL_NAMES = {
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    "claude-haiku-5-5": "Claude Haiku 5.5",
   };
   const PASSCODE_KEY = "xwalk-ner-passcode";
+  // A visitor's own provider key: one session storage entry, {provider, key}. It is
+  // removed on "Forget key" and whenever the provider changes, and it leaves the page
+  // only as the Authorization header of POST /api/ner.
+  const OWN_KEY_ENTRY = "xwalk-ner-own-key";
+  const PROVIDER_NAMES = { anthropic: "Anthropic", openai: "OpenAI", openrouter: "OpenRouter" };
+  // What the server accepts as a key: 20 to 512 printable ASCII characters, no spaces.
+  const KEY_SHAPE = /^[\x21-\x7e]{20,512}$/;
   const REQUEST_TIMEOUT_MS = 130000;
 
   const $ = (id) => document.getElementById(id);
@@ -33,6 +41,13 @@
     prompt: $("prompt"),
     promptHint: $("prompt-hint"),
     promptReset: $("prompt-reset"),
+    runWith: $("run-with"),
+    provider: $("provider"),
+    ownKeyField: $("own-key-field"),
+    ownKeyLabel: $("own-key-label"),
+    ownKey: $("own-key"),
+    forgetKey: $("forget-key"),
+    ownKeyNote: $("own-key-note"),
     modelField: $("model-field"),
     model: $("model"),
     selectorField: $("selector-field"),
@@ -64,6 +79,7 @@
     limits: { ...DEFAULT_LIMITS },
     defaultPrompt: "",
     ontologyNames: {},
+    providers: [], // own-key providers the API offers; empty when it offers none
     running: false,
   };
 
@@ -110,7 +126,7 @@
       if (value) window.sessionStorage.setItem(key, value);
       else window.sessionStorage.removeItem(key);
     } catch (_) {
-      /* storage blocked: the passcode simply is not remembered */
+      /* storage blocked: the value simply is not remembered */
     }
   }
 
@@ -147,11 +163,17 @@
     }
   }
 
-  async function api(method, path, payload) {
+  // `bearer` is a visitor's own provider key. Only the POST /api/ner call may carry it;
+  // any other request that tried to would be a bug, so it is refused here.
+  async function api(method, path, payload, bearer) {
     const headers = { "X-Requested-With": "xwalk-ner" };
     if (payload !== undefined) headers["Content-Type"] = "application/json";
     const pass = storageGet(PASSCODE_KEY);
     if (pass) headers["X-Passcode"] = pass;
+    if (bearer) {
+      if (method !== "POST" || path !== "/api/ner") throw new ApiError("Internal error: a key was attached to the wrong request.", "internal", 0);
+      headers.Authorization = `Bearer ${bearer}`;
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -164,6 +186,8 @@
         signal: controller.signal,
         credentials: "same-origin",
         cache: "no-store",
+        // A request that carries a key is never followed to another address.
+        redirect: bearer ? "error" : "follow",
       });
     } catch (err) {
       const aborted = err && err.name === "AbortError";
@@ -215,6 +239,10 @@
     if (err && (err.code === "passcode_required" || err.code === "passcode_invalid")) {
       el.passField.hidden = false;
       el.passcode.focus();
+    }
+    // A key the server or the provider refused stays in the field, to be corrected.
+    if (err && (err.code === "provider_key_refused" || err.code === "bad_credential") && !el.ownKeyField.hidden && !el.runWith.hidden) {
+      el.ownKey.focus();
     }
   }
 
@@ -283,16 +311,7 @@
     el.promptReset.disabled = !state.defaultPrompt;
     el.promptHint.textContent = `Up to ${state.limits.max_prompt_chars.toLocaleString()} characters. Edits apply to this run only; the output format is fixed.`;
 
-    const selectors = Array.isArray(health.selectors) ? health.selectors : [];
-    clear(el.selector);
-    for (const s of selectors) el.selector.append(h("option", { value: s, text: selectorName(s) }));
-    if (selectors.includes(health.default_selector)) el.selector.value = health.default_selector;
-    el.selectorField.hidden = selectors.length <= 1;
-
-    const models = Array.isArray(health.models) ? health.models : [];
-    clear(el.model);
-    for (const m of models) el.model.append(h("option", { value: m, text: modelName(m) }));
-    if (health.default_model) el.model.value = health.default_model;
+    fillProviders(health);
 
     fillTopK(state.limits.top_k_max || 10);
 
@@ -306,8 +325,118 @@
     renderIntro(health);
     renderLegend();
     renderBanner(health.mode, health.retrieval);
-    renderAllowance();
+    applyProvider();
     updateCounter();
+  }
+
+  // ---------- own keys ----------
+
+  // The own-key providers health offers, cleaned. An API from before own keys sends no
+  // `own_keys`, and one with them turned off sends none: both give an empty list.
+  function ownProviders(health) {
+    const own = health && health.own_keys;
+    if (!own || typeof own !== "object" || own.enabled !== true || !Array.isArray(own.providers)) return [];
+    const found = [];
+    for (const p of own.providers) {
+      if (!p || typeof p !== "object" || typeof p.id !== "string" || !p.id || p.id === "site") continue;
+      const models = (Array.isArray(p.models) ? p.models : []).filter((m) => typeof m === "string" && m);
+      if (!models.length || found.some((f) => f.id === p.id)) continue;
+      found.push({
+        id: p.id,
+        name: typeof p.name === "string" && p.name ? p.name : providerName(p.id),
+        models,
+        defaultModel: models.includes(p.default_model) ? p.default_model : models[0],
+      });
+    }
+    return found;
+  }
+
+  function providerName(id) {
+    const known = state.providers.find((p) => p.id === id);
+    if (known) return known.name;
+    return Object.prototype.hasOwnProperty.call(PROVIDER_NAMES, id) ? PROVIDER_NAMES[id] : id;
+  }
+
+  // The own-key provider chosen under "Run with", or null for the site's models.
+  function currentProvider() {
+    if (el.runWith.hidden) return null;
+    return state.providers.find((p) => p.id === el.provider.value) || null;
+  }
+
+  function storedKey() {
+    const raw = storageGet(OWN_KEY_ENTRY);
+    if (!raw) return null;
+    try {
+      const entry = JSON.parse(raw);
+      if (entry && typeof entry.provider === "string" && typeof entry.key === "string" && entry.key) return entry;
+    } catch (_) {
+      /* not ours: treated as no key */
+    }
+    return null;
+  }
+
+  function rememberKey() {
+    const provider = currentProvider();
+    const key = provider ? el.ownKey.value.trim() : "";
+    storageSet(OWN_KEY_ENTRY, key ? JSON.stringify({ provider: provider.id, key }) : "");
+  }
+
+  function forgetKey() {
+    el.ownKey.value = "";
+    storageSet(OWN_KEY_ENTRY, "");
+  }
+
+  // The "Run with" choice. A key kept from earlier in this tab (a reload) brings its
+  // provider back with it; a kept key for a provider no longer offered is dropped.
+  function fillProviders(health) {
+    state.providers = ownProviders(health);
+    clear(el.provider);
+    el.provider.append(h("option", { value: "site", text: "The site's models (free, limited)" }));
+    for (const p of state.providers) el.provider.append(h("option", { value: p.id, text: `My ${p.name} key` }));
+    el.runWith.hidden = state.providers.length === 0;
+    const kept = storedKey();
+    if (kept && state.providers.some((p) => p.id === kept.provider)) {
+      el.provider.value = kept.provider;
+      el.ownKey.value = kept.key;
+    } else {
+      el.provider.value = "site";
+      forgetKey();
+    }
+  }
+
+  // Models, selectors and the key field for the current "Run with" choice.
+  function applyProvider() {
+    const health = state.health || {};
+    const provider = currentProvider();
+    clear(el.model);
+    clear(el.selector);
+    if (provider) {
+      for (const m of provider.models) el.model.append(h("option", { value: m, text: modelName(m) }));
+      el.model.value = provider.defaultModel;
+      // Picks run on the same key or not at all: Jev and the site's models bill the site.
+      el.selector.append(h("option", { value: "retrieval", text: "Retrieval only" }));
+      for (const m of provider.models) el.selector.append(h("option", { value: m, text: modelName(m) }));
+      el.selector.value = "retrieval";
+      el.selectorField.hidden = false;
+      el.ownKeyLabel.textContent = `Your ${provider.name} API key`;
+      el.ownKeyNote.textContent =
+        `Your key stays in this browser tab and is sent with each run to this site, which passes it to ${provider.name} ` +
+        `for that run and does not store or log it. ${provider.name} bills you for the model calls. ` +
+        "The site still pays for term lookup. Use a restricted key with a spending limit if you can.";
+    } else {
+      const selectors = Array.isArray(health.selectors) ? health.selectors : [];
+      for (const s of selectors) el.selector.append(h("option", { value: s, text: selectorName(s) }));
+      if (selectors.includes(health.default_selector)) el.selector.value = health.default_selector;
+      el.selectorField.hidden = selectors.length <= 1;
+
+      const models = Array.isArray(health.models) ? health.models : [];
+      for (const m of models) el.model.append(h("option", { value: m, text: modelName(m) }));
+      if (health.default_model) el.model.value = health.default_model;
+      el.ownKeyNote.textContent = "";
+    }
+    el.ownKeyField.hidden = !provider;
+    el.ownKeyNote.hidden = !provider;
+    renderAllowance();
   }
 
   // The selector a request would use: the chosen one, or the server's default when the
@@ -317,19 +446,39 @@
     return state.health && typeof state.health.default_selector === "string" ? state.health.default_selector : "";
   }
 
-  // What the next request will meet, from health.visitor. An older API sends no
-  // `visitor`, and then nothing is shown.
+  // "in N minutes", rounded up, or "later" when the server gave no usable time.
+  function tryAgain(s) {
+    if (typeof s !== "number" || !Number.isFinite(s)) return "try again later";
+    const minutes = Math.max(1, Math.ceil(s / 60));
+    return `try again in ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+
+  // What the next request will meet, from health.visitor, for the chosen "Run with".
+  // An older API sends no `visitor`, and then nothing is shown.
   function allowanceMessage() {
     const health = state.health;
     const visitor = health && health.visitor && typeof health.visitor === "object" ? health.visitor : null;
     if (!visitor) return null;
-    if (visitor.tier === "blocked") {
-      const s = visitor.resets_in_s;
-      if (typeof s !== "number" || !Number.isFinite(s)) {
-        return { blocked: true, text: "You have used this hour's requests; try again later." };
+    if (currentProvider()) {
+      // An own key is outside the site's allowance; only its own flood limit can stop it.
+      if (visitor.own_left_today === 0) {
+        return { blocked: true, text: "Too many requests with your own key today. They reset at midnight UTC." };
       }
-      const minutes = Math.max(1, Math.ceil(s / 60));
-      return { blocked: true, text: `You have used this hour's requests; try again in ${minutes} minute${minutes === 1 ? "" : "s"}.` };
+      if (visitor.own_left === 0) {
+        return { blocked: true, text: `Too many requests with your own key; ${tryAgain(visitor.resets_in_s)}.` };
+      }
+      return null;
+    }
+    // The own-key way out is only named where it exists.
+    const ownOffered = state.providers.length > 0;
+    if (visitor.tier === "blocked") {
+      if (visitor.limits === "unavailable") {
+        return { blocked: true, text: "The site cannot count requests right now. Try again shortly" + (ownOffered ? ", or use your own API key." : ".") };
+      }
+      if (visitor.window === "day") {
+        return { blocked: true, text: "You have used today's requests. They reset at midnight UTC" + (ownOffered ? ", or you can use your own API key." : ".") };
+      }
+      return { blocked: true, text: `You have used this hour's requests; ${tryAgain(visitor.resets_in_s)}.` };
     }
     // The Sonnet sentence is only true when the allowance is counted, Claude can be
     // reached and the request would use Claude at all.
@@ -337,7 +486,8 @@
     const claudeDown = health.claude && health.claude.status === "unavailable";
     const wantsClaude = isClaude(el.model.value) || isClaude(effectiveSelector());
     if (visitor.tier === "sonnet" && counted && !claudeDown && wantsClaude) {
-      return { blocked: false, text: "Your Opus allowance for this hour is used; requests run on Claude Sonnet 5.5." };
+      const span = visitor.opus_left_today === 0 ? "today" : "this hour";
+      return { blocked: false, text: `Your Opus allowance for ${span} is used; requests run on Claude Sonnet 5.5.` };
     }
     return null;
   }
@@ -347,9 +497,10 @@
     el.allowance.textContent = message ? message.text : "";
     el.allowance.classList.toggle("blocked", Boolean(message && message.blocked));
     el.allowance.hidden = !message;
-    // A single model needs no dropdown, unless the line under it has something to say.
+    // A single model needs no dropdown, unless the line under it has something to say
+    // or the visitor is paying for it and should see which model that is.
     const count = el.model.options.length;
-    el.modelField.hidden = count === 0 || (count === 1 && !message);
+    el.modelField.hidden = count === 0 || (count === 1 && !message && !currentProvider());
   }
 
   // Health is read again after each request so the allowance line stays current. Only
@@ -634,6 +785,9 @@
       el.ranOn.append("Extracted by the offline stand-in.");
     } else if (typeof data.model === "string" && data.model) {
       el.ranOn.append("Extracted by ", h("strong", { text: modelName(data.model) }));
+      if (data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site") {
+        el.ranOn.append(` on your ${providerName(data.provider)} key`);
+      }
       if (typeof data.requested_model === "string" && data.requested_model && data.requested_model !== data.model) {
         el.ranOn.append(h("span", { class: "asked", text: ` (you asked for ${modelName(data.requested_model)})` }));
         askedShown = data.requested_model;
@@ -738,6 +892,23 @@
       showError(new ApiError(`The prompt is longer than ${state.limits.max_prompt_chars.toLocaleString()} characters.`, "prompt_too_long"));
       return;
     }
+    const provider = currentProvider();
+    if (provider) {
+      const typed = el.ownKey.value.trim();
+      if (!typed || !KEY_SHAPE.test(typed)) {
+        showError(
+          new ApiError(
+            typed
+              ? "That does not look like an API key: it should be 20 to 512 characters with no spaces."
+              : `Enter your ${provider.name} API key first, or choose the site's models under "Run with".`,
+            "bad_credential",
+          ),
+        );
+        el.ownKey.focus();
+        return;
+      }
+      rememberKey();
+    }
     if (!el.passField.hidden) storageSet(PASSCODE_KEY, el.passcode.value);
 
     const payload = {
@@ -747,12 +918,15 @@
       top_k: Number(el.topK.value) || 5,
       selector: el.selectorField.hidden ? null : el.selector.value || null,
     };
+    // An API from before own keys never sees the field.
+    if (provider) payload.provider = provider.id;
 
     setRunning(true);
     setStatus(["Extracting entities, then matching them against the samples…"]);
     const started = performance.now();
     try {
-      const data = await api("POST", "/api/ner", payload);
+      // The key is read here, for this call, and held nowhere else.
+      const data = await api("POST", "/api/ner", payload, provider ? el.ownKey.value.trim() : undefined);
       renderResults(text, data);
     } catch (err) {
       el.results.hidden = true;
@@ -795,6 +969,17 @@
     el.prompt.focus();
   });
   el.passcode.addEventListener("change", () => storageSet(PASSCODE_KEY, el.passcode.value));
+  // A key belongs to one provider: changing the choice forgets it, in the field and in
+  // session storage, before anything else happens.
+  el.provider.addEventListener("change", () => {
+    forgetKey();
+    applyProvider();
+  });
+  el.ownKey.addEventListener("input", rememberKey);
+  el.forgetKey.addEventListener("click", () => {
+    forgetKey();
+    el.ownKey.focus();
+  });
   $("error-dismiss").addEventListener("click", () => {
     hideError();
     el.text.focus();

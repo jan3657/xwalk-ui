@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "visitor_limit_reached",
+    "message": "you have used today's requests; they reset at midnight UTC, or use your own API key"
+  }
+}

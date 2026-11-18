@@ -69,6 +69,44 @@
     "tier": "blocked",
     "opus_left": 0,
     "sonnet_left": 0,
-    "resets_in_s": 1380
+    "resets_in_s": 1380,
+    "opus_left_today": 10,
+    "sonnet_left_today": 20,
+    "window": "hour",
+    "own_left": 30,
+    "own_left_today": 60,
+    "day_resets_in_s": 30180
+  },
+  "own_keys": {
+    "enabled": true,
+    "providers": [
+      {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "models": [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-haiku-5-5"
+        ],
+        "default_model": "claude-opus-5-5"
+      },
+      {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": [
+          "gpt-6-luna"
+        ],
+        "default_model": "gpt-6-luna"
+      },
+      {
+        "id": "openrouter",
+        "name": "OpenRouter",
+        "models": [
+          "google/gemini-3.1-flash-lite",
+          "openai/gpt-6-luna"
+        ],
+        "default_model": "google/gemini-3.1-flash-lite"
+      }
+    ]
   }
 }

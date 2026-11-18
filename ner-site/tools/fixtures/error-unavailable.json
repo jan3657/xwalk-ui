@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "limits_unavailable",
+    "message": "the site cannot count requests right now; try again shortly, or use your own API key"
+  }
+}
