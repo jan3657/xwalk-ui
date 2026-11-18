@@ -620,7 +620,7 @@ call was made by the implementing sessions: the rollout and its open checks are 
 | 14.3 | The site is open: no passcode in production. `NER_SITE_PASSCODE` keeps working for private deployments. | The request of 18 November. |
 | 14.4 | Limits are counters in the existing Neon database (`<schema>.site_visits`). There is no dollar budget in the site: the prepaid balance, with auto-reload off, is the hard ceiling. | Serverless instances share no memory; the Console already shows spend. |
 | 14.5 | Chain: Opus 5.5, then Sonnet 5.5, then an OpenRouter model (`NER_SITE_FALLBACK_MODEL`, default `google/gemini-3.1-flash-lite`) as the last resort, for extraction and for selection. One chain serves a whole request; a step-down is sticky. Without an OpenRouter key the chain ends at Sonnet. | A rate limit met while extracting should not be met again by every pick. The last step is the fallback model as an LLM selector, not Jev, so the chain has one interface. |
-| 14.6 | Step down at once on `rate_limited`, `overloaded`, `balance_exhausted`, `key_refused`, `refused` and on the step's call cap (`call_limit`); once more on the same step and then down on `transient` (5xx, 408, 409, connection errors, timeouts). Never on a request the API rejects (`bad_request`) or an unreadable answer: those would fail on every step. `balance_exhausted` and `key_refused` are remembered for 300 s per warm instance. | A malformed request must surface, not be hidden by a fallback. |
+| 14.6 | Step down at once on `rate_limited`, `overloaded`, `balance_exhausted`, `key_refused`, `refused` and on the step's call cap (`call_limit`); once more on the same step and then down on `transient` (5xx, 408, 409, connection errors). Never on a request the API rejects (`bad_request`) or an unreadable answer: those would fail on every step. `balance_exhausted` and `key_refused` are remembered for 300 s per warm instance. **[amended after review, 18 November]** A timeout is its own reason, `timeout`, and steps down at once (14.17); `balance_exhausted` and `key_refused` move past Sonnet (14.18). | A malformed request must surface, not be hidden by a fallback. |
 | 14.7 | Allowance per visitor and UTC clock hour: 10 requests starting on Opus, then 20 starting on Sonnet, then 429 until the hour rolls over (`NER_SITE_OPUS_PER_HOUR`, `NER_SITE_SONNET_PER_HOUR`, 0 to 1000). The sum is the hour's total for every kind of request. | Keeps one visitor from spending the balance. |
 | 14.8 | A visitor is `HMAC-SHA256(salt, ip)`, first 32 hex characters; `ip` from `x-real-ip`, `x-vercel-forwarded-for`, then the first entry of `x-forwarded-for`. The salt is `NER_SITE_VISITOR_SALT`, or the SHA-256 of `DATABASE_URL`. Raw addresses are never stored; neither they nor the visitor ids are logged or returned; rows older than a day are deleted. | The table and the logs hold nothing that identifies a visitor without the salt. |
 | 14.9 | Haiku 5.5 is not in the chain. | Unreliable for extraction on 4 November 2026. |
@@ -628,15 +628,23 @@ call was made by the implementing sessions: the rollout and its open checks are 
 | 14.11 | Schema-enforced output (`output_config.format`) together with the server-side refusal fallback (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). **[as built]** The schema sent is a normalised copy: all properties required and no others allowed, formerly optional properties nullable, list-valued `type` and `oneOf` as `anyOf`, unsupported keywords (numeric bounds, lengths, patterns) moved into `description`. The site still validates every answer. | Opus 5.5 has a `bio` classifier and the site is fed biomedical text. A keyword the API rejects would be a `bad_request` on every call. Not verified against the live API. |
 | 14.12 | **[as built]** The limiter runs only where Claude is offered (the Anthropic key is set, not offline), not wherever `DATABASE_URL` is set as the spec says. | Otherwise the production deployment of 4 November (OpenRouter key, passcode, Neon) would start refusing a visitor's 31st request before any Anthropic key exists. A passcode deployment with the key and a database is metered. |
 | 14.13 | **[as built]** Only ids whose key is set are offered, and the defaults are the first offered ones. With only an OpenRouter key and no `NER_SITE_SELECTOR` the default selector is therefore `jev` (it was `retrieval`). A configured `NER_SITE_SELECTOR` whose key is missing falls back the same way instead of failing. | The spec's "the defaults become the first remaining entries", applied to selectors. |
-| 14.14 | **[as built]** One visitor's concurrent requests are serialised: every `admit` first takes `pg_advisory_xact_lock` on a hash of the visitor id, as a statement of its own in the same transaction as the visit. The limiter has its own Neon executor (3 s timeout, no retries). `opus_left` and `sonnet_left` are capped by what remains of the hour's total. | Without the lock a parallel burst reads one snapshot and is granted N times; a retried increment could count a visit twice; `other` requests use up the total too. The guarantee depends on READ COMMITTED on Neon's batch endpoint, verified on a local Postgres only. |
-| 14.15 | When the limiter cannot be asked (unreachable, or no `DATABASE_URL` on a deployment without a passcode) a request for Opus starts on Sonnet and is not counted. With no `DATABASE_URL` and a passcode, Claude is unmetered and starts on Opus. | An outage of the limiter should not take the site down; the price is unmetered Sonnet for as long as it lasts. |
+| 14.14 | **[as built]** One visitor's concurrent requests are serialised: every `admit` first takes `pg_advisory_xact_lock` on a hash of the visitor id, as a statement of its own in the same transaction as the visit. The limiter has its own Neon executor (3 s timeout, no retries). `opus_left` and `sonnet_left` are capped by what remains of the hour's total. **[amended after review, 18 November]** The wait for the lock is bounded at 1.5 s (14.19). | Without the lock a parallel burst reads one snapshot and is granted N times; a retried increment could count a visit twice; `other` requests use up the total too. The guarantee depends on READ COMMITTED on Neon's batch endpoint, verified on a local Postgres only. |
+| 14.15 | When the limiter cannot be asked (unreachable, or no `DATABASE_URL` on a deployment without a passcode) a request for Opus starts on Sonnet and is not counted. With no `DATABASE_URL` and a passcode, Claude is unmetered and starts on Opus. **[amended after review, 18 November]** A contended visitor lock is not this case: it is a 429 (14.19). | An outage of the limiter should not take the site down; the price is unmetered Sonnet for as long as it lasts. |
 | 14.16 | **[as built]** When the model and the selector are two different Claude ids, selection runs on the request's one chain, wherever extraction left it, and the response says so with a `fallbacks` entry of stage `select` and reason `follows_extraction` (a reason the spec does not list). A Claude selector with an OpenRouter extraction model gets a chain of its own, and decides the request's tier. | One chain per request (14.5), and nothing substitutes silently. |
+| 14.17 | **[amended after review, 18 November]** No answer within a Claude call's timeout (`anthropic.APITimeoutError`) is the reason `timeout`, and the chain steps down at once instead of trying the same model again. A Claude extraction call has 40 s (`CLAUDE_EXTRACT_TIMEOUT_S`); selection calls keep 60 s. | As `transient`, a hung Opus was waited for twice (60 s, then what was left of 90 s) and the request ended as a 502 without Sonnet ever being tried. Two waits of 40 s fit inside the 90 s the extraction has. |
+| 14.18 | **[amended after review, 18 November]** On `balance_exhausted` or `key_refused` the chain moves straight to its OpenRouter step (to its last step when it has none) and records that one move. | Opus and Sonnet share the key and the balance: trying Sonnet is a second failed call that can only fail the same way. |
+| 14.19 | **[amended after review, 18 November]** The `admit` transaction sets `lock_timeout` to 1500 ms ahead of the visitor's lock. A wait that runs out (SQLSTATE `55P03`, carried as `LimitsUnavailable.code`) is answered 429 `visitor_limit_reached` with "too many requests at once; try again in a few seconds" and `Retry-After: 5`; nothing is recorded. Every other limiter failure is still 14.15. | One visitor's parallel requests queue on the lock; those that outlasted the executor's 3 s became "limits unavailable", so a large scripted burst got unmetered Sonnet. |
+| 14.20 | **[amended after review, 18 November]** Notices do not claim what did not happen: of the departures that decided where the extraction ran (those at admission included), and of those that decided where the picks ran, only the last says "this ran on" or "the remaining picks ran on"; earlier ones say "moved on to". The block reason in a `claude_unavailable` notice is the one read at admission, carried with the request. | After Opus and Sonnet both failed, the first sentence said the request ran on Sonnet. The process-wide block can change or expire while a request runs. |
+| 14.21 | **[amended after review, 18 November]** When a Claude step's answer names a model that is no step of the chain (Anthropic's server-side refusal fallback answered), that is a `fallbacks` entry: stage `extract` or `select`, from the step's model to the answering model, reason `refused`, once per stage and answering model, with its notice. The adapter takes the answering model from the `fallback_message` entry of `usage.iterations` when the response has one, else from its `model`. | Otherwise the response named a model nobody asked for with no entry and no notice. Whether the live API echoes the requested id letter for letter on an ordinary answer is a rollout check. |
+| 14.22 | **[amended after review, 18 November]** `DATABASE_URL` is read and validated only with `NER_SITE_BACKEND=neon`, or where Claude is offered (the Anthropic key is set, not offline); otherwise it is ignored unread. | A bundled deployment without the Anthropic key ignored it before this change and must not start failing on whatever a platform integration put there. |
+| 14.23 | **[amended after review, 18 November]** A Claude key check that could not be completed (Anthropic unreachable, or any answer other than 401 or 403) reports `claude` as `ok` with a "key not checked" reason, remembered for 60 s. Only a missing key, a refused key or a remembered block is `unavailable`. | A failed probe is not an outage; the OpenRouter check already worked this way. |
+| 14.24 | **[amended after review, 18 November]** The indexes are opened (once per warm instance) before admission. | A request that fails because the indexes cannot be opened must not have been counted as a visit. |
 
 Variables added (defaults in `ner-site/README.md`): `ANTHROPIC_API_KEY`,
 `NER_SITE_CLAUDE_EFFORT`, `NER_SITE_FALLBACK_MODEL`, `NER_SITE_OPUS_PER_HOUR`,
-`NER_SITE_SONNET_PER_HOUR`, `NER_SITE_VISITOR_SALT`. `DATABASE_URL` is now read on every
-backend (the indexes still use it only with `NER_SITE_BACKEND=neon`). `configured` is
-true with either key.
+`NER_SITE_SONNET_PER_HOUR`, `NER_SITE_VISITOR_SALT`. `DATABASE_URL` is now also read on
+the bundled backend where Claude is offered (14.22; the indexes still use it only with
+`NER_SITE_BACKEND=neon`). `configured` is true with either key.
 
 ### Wire contract additions (section 14)
 
@@ -656,19 +664,29 @@ true with either key.
 - `fallbacks` lists every departure in order, empty when there was none. `stage` is
   `admit` (decided before any call), `extract` or `select`. Reasons: `opus_allowance_used`,
   `limits_unavailable`, `claude_unavailable` (stage `admit`); `rate_limited`, `overloaded`,
-  `balance_exhausted`, `key_refused`, `refused`, `transient`, `call_limit` (from the
-  chain); `follows_extraction` (stage `select`, 14.16). **[as built]** `transient`,
-  `call_limit` and `follows_extraction` are not in the spec's list.
-- `notices` has one sentence for the visitor per distinct departure.
+  `balance_exhausted`, `key_refused`, `refused`, `timeout`, `transient`, `call_limit`
+  (from the chain); `follows_extraction` (stage `select`, 14.16). **[as built]**
+  `transient`, `call_limit`, `follows_extraction` and `timeout` (14.17) are not in the
+  spec's list. `refused` is also the reason of an answer that Anthropic's refusal
+  fallback served from a model outside the chain (14.21); `to` is then that model's id.
+- `notices` has one sentence for the visitor per distinct departure. Only the last
+  departure of the extraction, and the last of the selection, says what ran on the
+  model it led to; earlier ones end "moved on to <model>." (14.20).
+- `selector` (top level) is the selector the request asked for, the same value as
+  `requested_selector`, kept for pages written before that field.
 - `entities[].pick.selector` is the model that made that pick (after a step-down during
   selection, picks of one response name different models).
 - A request for an OpenRouter model with a non-Claude selector has no chain: `fallbacks`
   and `notices` are empty and it behaves as before.
 
 New error: 429 `visitor_limit_reached`, message "you have used this hour's requests; try
-again in N minutes", with `Retry-After` in seconds to the next clock hour. Order of
-checks on `POST /api/ner`: as in 3.1, then admission last, so a refused request is never
-counted. 503 `not_configured` now means neither key is set.
+again in N minutes", with `Retry-After` in seconds to the next clock hour. The same
+code with the message "too many requests at once; try again in a few seconds" and
+`Retry-After: 5` answers a request that waited too long for the visitor's lock (14.19).
+Order of checks on `POST /api/ner`: as in 3.1, then the indexes are opened, then
+admission last, so a request that is refused or cannot run is never counted (one that
+fails after admission, with 502 or 422, is). 503 `not_configured` now means neither
+key is set.
 
 `GET /api/health`, additions only (neither is a `HealthResponse` field):
 
@@ -678,9 +696,10 @@ counted. 503 `not_configured` now means neither key is set.
 ```
 
 - `claude`: `ok`, or `unavailable` with a reason ("key not set", "key refused", "balance
-  exhausted", "Anthropic answered HTTP n", "Anthropic unreachable (...)"). The key is
-  checked with a free Models API call, remembered like the OpenRouter check. Absent in
-  offline mode.
+  exhausted"). The key is checked with a free Models API call; a check that could not
+  be completed is `ok` with the reason "key not checked (Anthropic answered HTTP n)" or
+  "key not checked (Anthropic unreachable: ...)" (14.23). An accepted key is remembered
+  for 300 s, any other result for 60 s. Absent in offline mode.
 - `visitor`: the caller's allowance, read without recording anything. `limits` is `on`,
   `off` or `unavailable`; `tier` is where a request for Opus would start (`opus`,
   `sonnet`, `blocked`). **[as built]** Present only where Claude is offered. With the
@@ -692,10 +711,11 @@ counted. 503 `not_configured` now means neither key is set.
   `passcode_required` is unchanged.
 
 The request log line gains `tier`, `fallbacks`, `ran` (the model that extracted) and,
-when the limiter could not be asked, `limits` (the error's class and SQLSTATE only).
+when the limiter could not be asked or the visitor's lock was contended, `limits` (the
+error's class and SQLSTATE only).
 
 Tests: `tests/test_site_claude.py`, `tests/test_site_fallback.py`,
-`tests/test_site_limits.py` (offline with a fake executor; six `-m integration` cases
+`tests/test_site_limits.py` (offline with a fake executor; seven `-m integration` cases
 run the real SQL on the Postgres in `NER_SITE_TEST_DATABASE_URL` through `psql`),
 `tests/test_site_claude_check.py`, and additions to the HTTP, service, select and schema
 tests. All offline; no test reaches Anthropic, OpenRouter or Neon.

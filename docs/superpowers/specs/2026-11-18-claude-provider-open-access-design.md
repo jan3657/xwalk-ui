@@ -323,3 +323,34 @@ service, select and schema tests.
 `ner-site/README.md`: the variables table, the deploy steps and a section for this
 change. `docs/ner-site/PLAN.md`: a new section 14 with the decisions above and the wire
 contract additions.
+
+## Amendments after review, 18 November 2026
+
+The final review of the implementation changed six things; the code follows these, and
+the sections named are to be read with them. As built, with reasons:
+`docs/ner-site/PLAN.md` section 14 (14.17 to 14.24).
+
+- **A contended lock is a 429 (section 3.3).** The `admit` transaction bounds its wait
+  for the visitor's lock at 1500 ms, and a request whose turn does not come in that
+  time is answered 429 `visitor_limit_reached` ("too many requests at once; try again
+  in a few seconds", `Retry-After: 5`) with nothing recorded, instead of running
+  uncounted on Sonnet; every other limiter failure keeps the behaviour of section 3.3.
+- **A timeout steps down (sections 3.1, 3.2 and 5).** `anthropic.APITimeoutError` is the
+  reason `timeout`, not `transient`: the chain leaves the step at once without trying
+  the same model again, and a Claude extraction call has a 40 s timeout (not 60 s) so
+  that Opus and then Sonnet both fit inside the 90 s extraction bound.
+- **A balance or key failure skips the other Claude step (section 3.2).** On
+  `balance_exhausted` or `key_refused` the chain moves straight to its OpenRouter step
+  (its last step when it has none) and records one fallback, because Opus and Sonnet
+  share the key and the balance.
+- **A server-side refusal fallback is recorded (sections 3.1 and 6).** When a Claude
+  step's answer names a model that is not a step of the chain, the response carries a
+  `fallbacks` entry (stage `extract` or `select`, from the step's model to the answering
+  model, reason `refused`, once per stage and model) and its notice.
+- **`DATABASE_URL` is read only where it is used (section 4).** It is read and validated
+  with `NER_SITE_BACKEND=neon`, or where `ANTHROPIC_API_KEY` is set and the site is not
+  offline; anywhere else it is ignored, as it was before this change.
+- **A failed key probe is not an outage (section 6).** When the Anthropic key check
+  could not be completed (unreachable, or an HTTP error other than 401 or 403), health
+  reports `claude` as `ok` with a reason saying the key was not checked; only a missing
+  key, a refused key or a remembered block is `unavailable`.

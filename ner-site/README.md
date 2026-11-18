@@ -106,9 +106,9 @@ colour scheme.
 
 The code for this is merged but, as of 18 November 2026, nothing below has been done:
 no deployment, no change to a production variable, no request to the Anthropic API.
-Five things could not be checked offline. They are marked **Check** below, each with
-what to look for, and all five come before the passcode is removed (step 8). Until
-then the passcode is what stands between the public and the key.
+Several things could not be checked offline. They are marked **Check** below, each
+with what to look for, and all of them come before the passcode is removed (step 8).
+Until then the passcode is what stands between the public and the key.
 
 `tools/claude_check.py` is the measuring tool. It GETs `/api/health` and POSTs
 `/api/ner` on the URL it is given and nothing else; every text is a real request that
@@ -119,7 +119,9 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
 1. **Anthropic Console.** Create a workspace for the site and a key in it.
    **Check (auto-reload):** auto-reload must be off. The site has no dollar budget of
    its own: the prepaid balance is the only ceiling on what open access can spend, and
-   auto-reload removes it.
+   auto-reload removes it. While there, note the workspace's rate limits for Opus 5.5
+   and Sonnet 5.5 (requests, input tokens and output tokens per minute); step 5
+   compares them with what one request sends.
 2. **Vercel, production variables.** Add `ANTHROPIC_API_KEY` (sensitive). Remove
    `NER_SITE_MODELS`, `NER_SITE_SELECTORS` and `NER_SITE_SELECTOR`, or set them to the
    new defaults: production has `NER_SITE_MODELS=google/gemini-3.1-flash-lite,openai/gpt-6-luna`
@@ -133,9 +135,25 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    `default_model` and `default_selector` both `claude-opus-5-5`, and
    `passcode_required: true`. This first call also creates the table
    `<NER_SITE_NEON_SCHEMA>.site_visits`. `visitor.limits: "unavailable"` means the
-   limiter could not query Neon: do not go on (see step 7).
+   limiter could not query Neon: do not go on (see step 7). `claude` may also be
+   `{"status": "ok", "reason": "key not checked (...)"}`: Anthropic did not answer the
+   key check, which says nothing about the key; ask again after a minute and go on
+   only once it is `ok` without a reason.
    From here on the allowance is counted even with the passcode set, your own requests
-   included: 10 an hour start on Opus, the next 20 on Sonnet.
+   included: 10 an hour start on Opus, the next 20 on Sonnet. A request is counted when
+   it is admitted, before any model is called, so one that then fails with 502 or 422
+   has already been counted against the allowance; one refused earlier (400, 401, 413,
+   or the 429 `visitor_limit_reached` of the allowance itself) has not.
+   **Check (a cold database answers in time).** The limiter gives Neon 3 s for its one
+   round trip. Leave the site alone until the Neon compute has suspended (the Neon
+   console shows it as idle; five minutes by default), then `GET /api/health` once:
+   `visitor.limits` must be `on`. If it is `unavailable` on that first call and `on`
+   on the next, waking the database takes longer than 3 s, and after every quiet
+   spell the first requests would run on Sonnet uncounted (step 7): keep the compute
+   from suspending, or accept that knowingly, before going on. Try it a few times.
+   With `NER_SITE_BACKEND=neon`, a function instance that is itself cold opens the
+   indexes first, which wakes the database and hides the wait, so an `on` from a slow
+   first answer proves nothing.
 4. **Check (the live API accepts the requests).** Every Claude request sends the
    server-side refusal fallback (`fallbacks: "default"`, beta
    `server-side-fallback-2026-07-01`) together with schema-enforced output
@@ -150,10 +168,19 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    ```
 
    Accepted looks like `200`, `model claude-opus-5-5 -> claude-opus-5-5`, picks
-   `by claude-opus-5-5`, `fallbacks none`. Rejected looks like `502 FAILED
-   provider_error` naming an Anthropic HTTP 400 (the extraction request was refused),
-   or a 200 whose picks are all `failed` with a `failed picks:` reason naming an
-   Anthropic HTTP 400 (the selection schema was refused). The chain does not step down
+   `by claude-opus-5-5`, `fallbacks none`.
+   **Check (the model the API names).** The id after the arrow is the `model` the API
+   echoes, and it must equal the id that was requested, letter for letter. The site
+   takes any other name to mean that Anthropic's refusal fallback answered from
+   another model: if a harmless text shows, say, `claude-opus-5-5 -> claude-opus-5-5-<date>`
+   with `extract:claude-opus-5-5>...:refused`, the API reports the model under another
+   spelling and every request would carry a false "declined this text" notice. That
+   needs a code change (`_served_elsewhere` in `ner_site/service.py`) before going
+   further.
+   Rejected looks like `502 FAILED provider_error` naming an Anthropic HTTP 400 (the
+   extraction request was refused), or a 200 whose picks are all `failed` with a
+   `failed picks:` reason naming an Anthropic HTTP 400 (the selection schema was
+   refused). The chain does not step down
    on a rejected request (`bad_request`), so nothing hides it and nothing works around
    it: every Claude request would fail the same way. That needs a code change in
    `ner_site/claude.py` before going further (the design says that if the two cannot
@@ -167,14 +194,29 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    ```
 
    The request deadline is 100 s (extraction has 90 s of it, selection what is left,
-   8 picks at a time). Look at the `most entities` and `slowest` lines: `total` in
-   `timing_ms` should be well under 100000, and no line should show `failed picks: cut
-   off by the request deadline`. The `tokens` lines give the input and output tokens
-   per request for extraction and for selection; the site computes no dollars, so
-   multiply by the prices of the models yourself and compare with the usage the
+   8 picks at a time). One Claude extraction call has 40 s: if Opus has not answered
+   by then the request moves to Sonnet (`extract:claude-opus-5-5>claude-sonnet-5-5:timeout`),
+   so a text whose extraction needs longer than that on Opus never runs on Opus. Look
+   at the `most entities` and `slowest` lines: `total` in `timing_ms` should be well
+   under 100000, `extract` well under 40000, no line should show `failed picks: cut
+   off by the request deadline`, and `step-downs by reason` should show no `timeout`.
+   **Check (dollars per request).** The `tokens` lines give the input and output
+   tokens per request for extraction and for selection; the site computes no dollars,
+   so multiply by the prices of the models yourself and compare with the usage the
    Console shows (whether the reported tokens include an attempt the refusal fallback
-   replaced was not checked). If selection on Opus is too slow or too dear, set
-   `NER_SITE_SELECTOR=jev`: Opus then extracts and Jev picks.
+   replaced was not checked). Do this sum again from the measured tokens before the
+   passcode goes, because the allowance sets a rate, it is not a budget: one address
+   may make 10 requests an hour starting on Opus and 20 on Sonnet, and with Claude
+   picking every entity (up to 25 calls a request) that can be on the order of ten
+   dollars an hour from a single address, against a balance of about $180. If the sum
+   says so, set `NER_SITE_SELECTOR=jev` (Opus then extracts and Jev picks) or lower
+   `NER_SITE_OPUS_PER_HOUR` and `NER_SITE_SONNET_PER_HOUR` for the open site. The
+   same applies when selection on Opus is too slow.
+   **Check (the workspace's rate limits).** One 25-entity request sends its picks 8
+   at a time, so its selection tokens arrive within a few seconds. Compare the tokens
+   of the largest request with the per-minute limits noted in step 1: if one request,
+   or two visitors at once, can exceed them, requests will step down to Sonnet with
+   `rate_limited` as a matter of course (`step-downs by reason` shows it).
    More than 10 texts in one clock hour start on Sonnet from the 11th (the line shows
    `admit:claude-opus-5-5>claude-sonnet-5-5:opus_allowance_used`). To measure them all
    on Opus, run 10 an hour (`visitor.resets_in_s` in the health block says when the
@@ -191,20 +233,44 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    ```
 
    The tool compares where the requests started with the `opus_left` and `sonnet_left`
-   health reported just before. Good: `within the allowance`, for example 10 on Opus
-   and 5 on Sonnet in a fresh hour. Bad: `OVER THE ALLOWANCE` (exit code 1), more
-   starts on a tier than were left; do not open the site. Requests reported as
-   `uncounted (limits_unavailable)` waited more than 3 s for the lock or the database
-   and ran on Sonnet outside the count; a few in a large burst are expected, and a
-   burst that is mostly uncounted proves nothing, so repeat it smaller.
+   health reported just before. Good: `within the allowance` and exit code 0, for
+   example 10 on Opus and 5 on Sonnet in a fresh hour. A request that waits more than
+   1.5 s for its turn at the visitor's lock is refused with 429 "too many requests at
+   once; try again in a few seconds" and is not counted; the tool reports these as
+   `429 too many at once`. That is what the tail of a large burst should get, and it
+   is not a failure. Bad, each with exit code 1 and without the `within the allowance`
+   line; do not open the site:
+
+   - `OVER THE ALLOWANCE`: more starts on a tier than were left.
+   - `THE LIMITER IS FAILING`: more than a fifth of the burst came back as `uncounted
+     (limits_unavailable)`. Those requests ran on Sonnet outside the count because the
+     limiter's database call failed for them. Waiting for the lock no longer explains
+     them (that is the 429 above), so do not dismiss them: repeat with `--burst 3`,
+     and if uncounted requests persist in a burst that small, the limiter does not
+     work under concurrency. The reason is the SQLSTATE in the `limits` field of each
+     such request's log line. `40001` means the isolation level is wrong: Neon's
+     batch endpoint is not running the transaction at READ COMMITTED, and concurrent
+     visits fail instead of taking turns. That needs a code change before the site
+     opens.
+   - `NOTHING TO COMPARE WITH`: health showed no `visitor` block with `limits: "on"`
+     before the burst (step 3 was not met).
+
+   One or two uncounted requests in a burst of 15 whose `limits` field has no
+   SQLSTATE (the call did not come back from the database in time) are the database
+   being slow for those calls (step 7); the tool says how many there were.
 7. **Check (know what a Neon outage does, by design).** When the limiter cannot query
    its database (unreachable, or no answer within 3 s), no request is refused and none
    is counted: a request for Opus starts on Sonnet, with the notice "Visitor limits are
    unavailable; this ran on Claude Sonnet 5.5.". So for as long as Neon is down,
    Sonnet is unmetered for everyone and only the prepaid balance bounds it. It shows as
    `visitor.limits: "unavailable"` in `/api/health` and as a `limits` field (error
-   class and SQLSTATE) in the request log. If it lasts, set `NER_SITE_PASSCODE` again
-   or remove `ANTHROPIC_API_KEY` until it is over.
+   class and SQLSTATE) in the request log. (The one database answer that does refuse a
+   request is the contended lock of step 6, SQLSTATE `55P03`: a 429, not an outage.)
+   If it lasts, set `NER_SITE_PASSCODE` again until it is over. Removing
+   `ANTHROPIC_API_KEY` stops the spending on Claude, but do not do that alone: the
+   allowance runs only where Claude is offered, so without the key and without a
+   passcode the site is public and uncounted on the OpenRouter key. Remove the key
+   only together with setting `NER_SITE_PASSCODE` again.
 8. **Open the site.** Remove `NER_SITE_PASSCODE`, redeploy, and check
    `passcode_required: false`. Then confirm the allowance from one address in one
    clock hour (31 short requests; `--selector retrieval` keeps each to one call, and
@@ -223,9 +289,14 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    `429 ... FAILED visitor_limit_reached`.
 9. Record what was verified in the "Verified" section, as for earlier deployments.
 
-Going back: removing `ANTHROPIC_API_KEY` and redeploying takes Claude out of the lists
-and switches the allowance off; the site then runs on OpenRouter as before, with Jev
-as the default selector unless `NER_SITE_SELECTOR` says otherwise.
+Going back: set `NER_SITE_PASSCODE` again, remove `ANTHROPIC_API_KEY`, and redeploy.
+Do both, and never the second without the first: removing the key takes Claude out of
+the lists and switches the allowance off with it, so once the passcode is gone,
+removing the key alone would leave a public site that counts nothing and spends the
+OpenRouter key.
+With the passcode back, the site runs on OpenRouter as before, with Jev as the default
+selector unless `NER_SITE_SELECTOR` says otherwise. Check `passcode_required: true` and
+`"claude": {"status": "unavailable", "reason": "key not set"}` in `/api/health`.
 
 ### Environment variables (function runtime)
 
@@ -249,7 +320,7 @@ as the default selector unless `NER_SITE_SELECTOR` says otherwise.
 | `NER_SITE_DENSE_DIR` | `<project root>/indexes` | Where the committed dense indexes live. |
 | `NER_SITE_CACHE_DIR` | `/tmp/xwalk-ner-site` | Where BM25 indexes are built at cold start. |
 | `NER_SITE_BACKEND` | `bundled` | `neon` reads the records, BM25 and vectors from Neon Postgres instead of building BM25 in `/tmp` and opening the committed dense indexes (see "Neon backend" below). |
-| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is read on every backend, because the visitor allowance is counted there too; a value that is not a Postgres URL is refused. |
+| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, where Claude is offered (`ANTHROPIC_API_KEY` is set and the site is not offline), because the visitor allowance is counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key, or offline) it is ignored unread, as before. |
 | `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` is created in it; the schema itself must already exist. |
 | `NER_SITE_NEON_DIMENSIONS` | 1024 | The loaded vector dimension (`load_neon.py --dimensions`); a different value makes dense stale. |
 | `NER_SITE_NEON_CATALOG` | `samples` | `full` serves the full catalogs (`chebi`, `ctd-disease`, `ncbi-gene`, `foodon`) once they are loaded; needs `NER_SITE_BACKEND=neon`. |
@@ -271,29 +342,48 @@ the default selector is `jev` (it was `retrieval` before this change; set
 Opus, Sonnet, then `NER_SITE_FALLBACK_MODEL` through OpenRouter (the fallback model
 does the picking too when selection reaches that step, not Jev). One chain serves the
 whole request, so a step-down while extracting also moves selection, and a step that
-was left is not tried again in that request.
+was left is not tried again in that request. One Claude call has a timeout of 40 s
+while extracting (so that Opus and then Sonnet both fit inside the 90 s the extraction
+has) and 60 s while selecting.
 
 | What happened on a step | What the chain does | `reason` in `fallbacks` |
 |---|---|---|
 | Anthropic rate limit (429) | next step at once | `rate_limited` |
 | Anthropic overloaded (529) | next step at once | `overloaded` |
-| Balance exhausted (402, or a 400 naming the credit balance) | next step at once; remembered for 300 s on that warm instance | `balance_exhausted` |
-| Key refused (401, 403) | next step at once; remembered for 300 s | `key_refused` |
+| Balance exhausted (402, or a 400 naming the credit balance) | straight to the OpenRouter step, past Sonnet (the two Claude models share the key and the balance); the last step when the chain has no OpenRouter step; remembered for 300 s on that warm instance | `balance_exhausted` |
+| Key refused (401, 403) | the same, past Sonnet; remembered for 300 s | `key_refused` |
 | Claude declined the text, after the server-side refusal fallback | next step at once | `refused` |
+| No answer within the call's timeout | next step at once, with no second wait on the same model | `timeout` |
 | The step's call cap for the request was reached | next step at once | `call_limit` |
-| 5xx, 408, 409, connection error, timeout | the same step once more, then the next | `transient` |
-| A request the API rejects (other 4xx), or an unreadable answer | no step-down: extraction answers 502 `provider_error`, a pick is `failed` | none |
+| 5xx, 408, 409, connection error | the same step once more, then the next | `transient` |
+| A request the API rejects (other 4xx) | no step-down: extraction answers 502 `provider_error`, a pick is `failed` | none |
+| An answer that cannot be read as the JSON asked for | no step-down: extraction answers 422 (`extraction_unparseable`, or `extraction_schema` without an `entities` list), a pick is `failed` | none |
 
-On the last step the error is returned as it is. Steps decided before any call have
-stage `admit`: `opus_allowance_used` (the visitor's Opus allowance), `limits_unavailable`
-(the limiter could not be asked) and `claude_unavailable` (a remembered exhausted
-balance or refused key: the request starts on the OpenRouter step). One more reason,
+On the last step the error is returned as it is: a failed provider request while
+extracting is 502 `provider_error`. Steps decided before any call have stage `admit`:
+`opus_allowance_used` (the visitor's Opus allowance), `limits_unavailable` (the limiter
+could not be asked) and `claude_unavailable` (a remembered exhausted balance or refused
+key: the request starts on the OpenRouter step). One more reason,
 `follows_extraction` (stage `select`), is not a failure: when the model and the selector
 are two different Claude ids, selection runs on the request's one chain, that is where
 extraction ended, and the response says so. A Claude selector with an OpenRouter
 extraction model gets a chain of its own for the picks. Every departure is in
 `fallbacks` and, as a sentence, in `notices`; `model` is the model that extracted and
 each `pick.selector` the model that made that pick.
+
+The refusal fallback on Anthropic's side can also answer from a model nobody asked for.
+When the answer of a Claude step names a model that is no step of the chain, that is
+recorded like any other departure: stage `extract` or `select`, from the model asked to
+the model that answered, reason `refused`, once per stage and answering model.
+
+A notice says what ran only where that is known. Of the departures that decided where
+the extraction ran (those of stage `admit` included), and again of those that decided
+where the picks ran, only the last sentence ends "this ran on ..." or "the remaining
+picks ran on ..."; an earlier one ends "moved on to ...", for example "Claude Opus 5.5
+is rate limited; moved on to Claude Sonnet 5.5." followed by "Claude Sonnet 5.5 is rate
+limited; this ran on Gemini 3.1 Flash Lite through OpenRouter.". The sentence for
+`timeout` is "... did not answer in time; ...". A `claude_unavailable` notice names the
+reason that was known when the request was admitted.
 
 **What is sent to Claude.** One Messages request per call through the `anthropic` SDK
 with no retries of its own, no sampling parameters and no `thinking` parameter;
@@ -318,8 +408,10 @@ address header share one allowance.
   tier, count), created on first use; rows older than a day are deleted by about one
   request in fifty.
 - A request is counted after every check that can refuse it (size, header, passcode,
-  JSON, field limits), under the tier it starts on: `opus`, `sonnet`, or `other` for an
-  OpenRouter model with a non-Claude selector. The tier wanted comes from the model,
+  JSON, field limits) and after the indexes are open, so a request that cannot run for
+  one of those reasons costs the visitor nothing. One that fails later (502, 422) stays
+  counted. It is counted under the tier it starts on: `opus`, `sonnet`, or `other` for
+  an OpenRouter model with a non-Claude selector. The tier wanted comes from the model,
   or from the selector when only the selector is Claude.
 - Opus is granted while fewer than 10 Opus starts are recorded for the hour, then
   Sonnet while fewer than 20 Sonnet starts are. When the hour's total (all three tiers)
@@ -328,17 +420,24 @@ address header share one allowance.
   nothing is recorded.
 - One visitor's concurrent requests are serialised with a Postgres advisory lock taken
   in the same transaction, so a parallel burst cannot be granted more than the
-  allowance. The limiter has its own Neon executor: 3 s timeout and no retries (a
-  retried increment could count one visit twice).
-- When the limiter cannot be asked, the request is not counted and a request for Opus
-  starts on Sonnet (`limits_unavailable`). The same happens with no `DATABASE_URL` and
-  no passcode; with no `DATABASE_URL` and a passcode (a private deployment) Claude is
-  unmetered and starts on Opus.
+  allowance. The wait for that lock is bounded (`SET LOCAL lock_timeout = '1500ms'`
+  in the same transaction): a request whose turn does not come in time (SQLSTATE
+  `55P03`) is answered 429 `visitor_limit_reached` with the message "too many requests
+  at once; try again in a few seconds" and `Retry-After: 5`, and nothing is recorded.
+  The limiter has its own Neon executor: 3 s timeout and no retries (a retried
+  increment could count one visit twice).
+- When the limiter cannot be asked for any other reason, the request is not counted
+  and a request for Opus starts on Sonnet (`limits_unavailable`). The same happens with
+  no `DATABASE_URL` and no passcode; with no `DATABASE_URL` and a passcode (a private
+  deployment) Claude is unmetered and starts on Opus.
 
-`/api/health` reports `claude` (`{"status": "ok"}`, or `unavailable` with the reason:
-"key not set", "key refused", "balance exhausted", "Anthropic answered HTTP n",
-"Anthropic unreachable (...)"; the key is checked with a free Models API call,
-remembered for 300 s when ok and 60 s otherwise) and, where the allowance applies,
+`/api/health` reports `claude`: `{"status": "ok"}`, or `unavailable` with the reason
+"key not set", "key refused" (from the key check, or from a request of that warm
+instance in the last 300 s) or "balance exhausted" (from such a request). The key is
+checked with a free Models API call. A check that could not be completed is not an
+outage: `claude` is then `ok` with the reason "key not checked (Anthropic unreachable:
+...)" or "key not checked (Anthropic answered HTTP n)". An accepted key is remembered
+for 300 s, any other result for 60 s. Where the allowance applies, health also reports
 `visitor` for the caller: `limits` (`on`, `off`, `unavailable`), `tier` (where a request
 for Opus would start: `opus`, `sonnet`, `blocked`), `opus_left`, `sonnet_left` (each
 capped by what remains of the hour's total) and `resets_in_s`. Offline mode reports
@@ -347,7 +446,8 @@ neither.
 Tests for the limiter's SQL need a real Postgres and are not part of the default suite.
 With a Postgres URL in `NER_SITE_TEST_DATABASE_URL` and the `psql` client (16 or later)
 on the path, they run the real statements, including 40 overlapping requests of one
-visitor, each test in a schema of its own that it drops; without either they skip:
+visitor and a visitor's lock held past the lock timeout, each test in a schema of its
+own that it drops; without either they skip:
 
 ```bash
 NER_SITE_TEST_DATABASE_URL=postgresql://user@localhost:5432/postgres \
@@ -382,7 +482,7 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   prepaid balance, with auto-reload off in the Anthropic Console. These are the only
   caps that hold across all function instances. Per request the service allows at most
   3 extraction calls on a step of the chain (retries included; a Claude step makes one
-  call, or two after a transient error), selection calls up to twice the entity limit
+  call, or two after a transient error, each of at most 40 s), selection calls up to twice the entity limit
   on a step (normally one per entity) and 25 entities (query embeddings are never
   retried), and a request finishes by about 105 s (90 s for the extraction, one
   deadline for the rest; Vercel cuts a run off at 120 s), but nothing stops many
@@ -394,8 +494,12 @@ re-pinning `requirements.txt` to an xwalk commit that contains
 - **With the Anthropic key, the visitor allowance is what makes an open deployment
   bounded per visitor** (30 requests an hour by default, 10 of them starting on Opus).
   It bounds one address, not the total: many addresses can still spend the balance,
-  which is why the balance must be the ceiling. It needs `DATABASE_URL`; when the
-  database cannot be asked, requests run on Sonnet uncounted (rollout step 7).
+  which is why the balance must be the ceiling. It is a rate, not a budget: what one
+  address can spend in an hour is the allowance times the cost of a request (rollout
+  step 5). It needs `DATABASE_URL`; when the database cannot be asked, requests run on
+  Sonnet uncounted (rollout step 7). It exists only with the Anthropic key: removing
+  the key from an open deployment without setting the passcode again leaves the site
+  public and uncounted on the OpenRouter key.
 - The keys live only in the function environment. `/api/health` never returns them, and
   error messages pass URLs through redaction. Do not put a key in `NER_SITE_BASE_URL`.
 - `vercel.json` sends `Content-Security-Policy: default-src 'self'; connect-src
@@ -635,19 +739,21 @@ docs/ner-site/PLAN.md section 14):
 What was run, and nothing more (Python 3.13, the repository venv, no key in the
 environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 490 passed, 7
-  deselected. Offline only: a fake SDK client for the adapter, scripted clients for
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 533 passed, 8
+  deselected (after the review fixes below; 490 before them). Offline only: a fake SDK client for the adapter, scripted clients for
   the chain, a fake SQL executor for the limiter, `httpx.MockTransport` for OpenRouter,
   a local `http.server` stub for `claude_check.py`. They cover the request the adapter
   sends (no sampling parameters, effort, token limits, the schema format and its
   normalisation, the fallback parameter), every row of its error table and that no
-  message carries the key; each step-down trigger, the single transient retry,
+  message carries the key; each step-down trigger, the single transient retry, a
+  timeout stepping down after one call, a balance or key failure skipping Sonnet,
   stickiness under concurrent calls, the usage of failed attempts and the 300 s block;
   the allowance at its boundaries (10th and 11th, 30th and 31st visit), the hour
-  rolling over, the lock statement ahead of every visit, the unreachable and off
-  states, and that no raw address reaches a SQL parameter; through `handle`, Opus by
-  default, Sonnet after the allowance with its notice, 429 with `Retry-After`, health
-  `claude` and `visitor`, no Claude without the key, and a deployment with only the
+  rolling over, the lock timeout and the lock statement ahead of every visit, the
+  unreachable and off states, and that no raw address reaches a SQL parameter; through
+  `handle`, Opus by default, Sonnet after the allowance with its notice, 429 with
+  `Retry-After` (for a used hour and for a contended lock), health `claude` and
+  `visitor`, an index failure counting no visit, no Claude without the key, and a deployment with only the
   OpenRouter key and a passcode running without limiter or chain; and that the keys,
   the database URL, the salt, the client address and the visitor id appear in no body,
   header or log line.
@@ -656,11 +762,25 @@ environment):
   `fallback` scenario, one text and a burst of 3): it printed the canned health blocks,
   the step-downs and the totals. Canned answers, so this shows the tool's output and
   nothing about the service.
-- By the implementing sessions, on a throwaway local Postgres 16 (not Neon): the six
-  `-m integration` tests of `tests/test_site_limits.py` passed, among them 40
-  overlapping requests of one visitor giving exactly 10 Opus, 20 Sonnet and 10 refused.
-  They were skipped in the final run (no `NER_SITE_TEST_DATABASE_URL`). The page was
-  rendered in headless Chromium against the canned scenarios at 1280 and 390 px.
+- By the implementing sessions, on a throwaway local Postgres 16 (not Neon): the
+  seven `-m integration` tests of `tests/test_site_limits.py` passed, with the lock
+  timeout in the transaction. Among them: 40 overlapping requests of one visitor, of
+  which those that got their turn within the lock timeout were granted in order (Opus
+  up to 10, then Sonnet) and counted once each, the others failing with SQLSTATE
+  `55P03` and counting nothing; and a visitor's lock held by another session, which
+  made `admit` give up after about 1.5 s with `55P03` while another visitor was
+  admitted at once. They are skipped in a run without `NER_SITE_TEST_DATABASE_URL`.
+  The page was rendered in headless Chromium against the canned scenarios at 1280 and
+  390 px (before the review fixes; the page itself did not change in them).
+
+Changed after the final review, 18 November 2026 (all offline, same tests): a timeout
+steps down at once and a Claude extraction call has 40 s; a balance or key failure
+skips Sonnet; only the last notice of a part of a request says what ran; an answer
+from Anthropic's refusal fallback model is recorded as a departure; a contended
+visitor lock is a 429, not an uncounted request; the indexes are opened before a visit
+is counted; `DATABASE_URL` is ignored where nothing uses it; a key check that could
+not be completed is not an outage; `claude_check.py --burst` fails when the limiter is
+failing.
 
 Not run, and therefore not known:
 
@@ -671,7 +791,12 @@ Not run, and therefore not known:
   request costs in tokens (step 5). Whether the reported tokens include an attempt
   that the server-side refusal fallback replaced.
 - Whether Neon's batch endpoint runs the limiter's transaction at READ COMMITTED, on
-  which the advisory lock's guarantee depends (step 6).
+  which the advisory lock's guarantee depends, and whether it honours `SET LOCAL
+  lock_timeout` there as a plain Postgres does (step 6).
+- Whether the `model` the API echoes is the id that was requested (step 4), how the
+  workspace's per-minute limits compare with one 25-entity request (step 5), and
+  whether a suspended Neon compute answers inside the limiter's 3 s (step 3).
+- Whether Opus answers a 25-entity extraction inside the 40 s one call now has.
 - The Anthropic Console settings: workspace, key, auto-reload (step 1).
 - Any Vercel build or deployment with `anthropic` installed, Python 3.12 or 3.10, and
   the cold-start time with the SDK imported.
