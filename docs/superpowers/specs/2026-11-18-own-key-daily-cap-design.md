@@ -137,8 +137,10 @@ def provider_error(exc: BaseException, provider: str) -> ServiceError
   claude-sonnet-5-5,claude-haiku-5-5`), `NER_SITE_OWN_MODELS_OPENAI` (default
   `gpt-6-luna`), `NER_SITE_OWN_MODELS_OPENROUTER` (default
   `google/gemini-3.1-flash-lite,openai/gpt-6-luna`); the first is the default.
-  `NER_SITE_OWN_PROVIDERS` (default all three; empty turns own keys off). With an own
-  provider the request's `model` must be in that provider's list, and `selector` is
+  `NER_SITE_OWN_PROVIDERS` lists the providers that are on. Own keys are off unless it
+  lists at least one: unset or empty means off. (Amended after the final review; the
+  first version of this section had all three on by default.) With an own provider
+  the request's `model` must be in that provider's list, and `selector` is
   `retrieval` (the default) or a model in the same list.
 - **Errors**, fixed text with the provider's display name and nothing from upstream:
   - 401 `provider_key_refused`: "<Provider> refused this key. It may be mistyped,
@@ -233,7 +235,12 @@ carry no credential.
 
 1. In Vercel, confirm request headers are not written to logs, log drains or error
    reporting (the key is in `Authorization`). Do not enable own keys until this is
-   checked; `NER_SITE_OWN_PROVIDERS=` (empty) keeps them off.
+   checked: they stay off while `NER_SITE_OWN_PROVIDERS` is unset. After deploying
+   with the variable unset, health shows `own_keys.enabled: false` and the deployment
+   behaves as before. Also confirm that `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG`,
+   `ANTHROPIC_BASE_URL` and proxy variables are unset (own-key requests ignore them,
+   the site's own Claude client does not) and that nothing in front of production
+   adds an `Authorization` header.
 2. With a real key for each provider, one run each: the model answers, the result names
    the provider, and the operator's dashboards show no Claude or chat usage for it.
    OpenAI direct is untested offline in particular: confirm the default model id exists
@@ -242,9 +249,14 @@ carry no credential.
    or the function log.
 4. After 20 Opus starts in a day, the next request starts on Sonnet; after 60 site
    requests in a day, 429 with the day wording.
-5. Stop the limiter (a wrong `DATABASE_URL` in a preview deployment): site-key requests
-   answer 503 `limits_unavailable`, own-key requests still run.
+5. Stop the limiter (a wrong `DATABASE_URL` in a preview deployment on the bundled
+   backend with the sample catalog): site-key requests answer 503
+   `limits_unavailable`, own-key requests still run. Restore the preview afterwards.
 6. Submit OpenAI's interest form if ChatGPT sign-in on the hosted site is wanted.
+7. Turn own keys on by setting `NER_SITE_OWN_PROVIDERS` to the providers that passed
+   check 2, by name. Going back is removing the variable.
+8. The `anthropic` SDK is pinned to the version the own-key client was audited
+   against. On any change of that pin, repeat the audit and check 2 for Anthropic.
 
 ## 11. Documentation
 
@@ -255,7 +267,8 @@ in the earlier spec pointing here for decision 7.
 ## As built, 18 November 2026
 
 Where the code departs from this document, or settles what it left open. The code
-follows these; reasons are in `docs/ner-site/PLAN.md` section 15 (15.1 to 15.16).
+follows these; reasons are in `docs/ner-site/PLAN.md` section 15 (15.1 to 15.20). The
+points marked "final review" were changed after two reviews of the whole branch.
 
 - **The day is the visitor's whole UTC day (section 3.1).** The scan is `hour >=
   midnight AND hour < midnight + 24 hours`, not "through the current hour", and the
@@ -287,14 +300,38 @@ follows these; reasons are in `docs/ner-site/PLAN.md` section 15 (15.1 to 15.16)
   environment reaches the request: `ANTHROPIC_CUSTOM_HEADERS` is stripped (through a
   private attribute of the SDK, with a check that refuses to build the client
   otherwise), and the SDK's other environment inputs (keys, profile, base URL,
-  telemetry, proxies) do not reach the request.
-- **A site request with an `Authorization` header (section 5)** is refused with 400
-  `bad_credential` also where own keys are off.
+  telemetry, proxies) do not reach the request. Final review: every request is also
+  checked as it leaves (the host, the visitor's bearer once, and each header name
+  and value against what SDK 2.10.0 sends on its own) and is not sent otherwise, and
+  `anthropic` is pinned to 2.10.0, with a test that fails on any other version.
+- **Own keys are off by default (section 5, final review).** Unset or empty
+  `NER_SITE_OWN_PROVIDERS` means off; the operator turns them on by listing
+  providers (any case, spaces and empty items ignored, unknown names refused). An
+  own model list is read only for a provider that is on, and empty counts as unset.
+- **A site request with an `Authorization` header (section 5, final review)** is
+  refused with 400 `bad_credential` where own keys are on. Where they are off the
+  header is not looked at on a site request, so that a deployment from before own
+  keys (basic auth, an authenticating proxy) behaves as it did.
+- **Redirects and echoing headers (section 5, final review).** "No redirects" was
+  not enough: with redirects not followed the HTTP libraries still parse a
+  redirect's `Location`, and a relative one that echoed the key stayed in Python's
+  `urlsplit` cache after the request. Every own-key client now sends through a
+  transport wrapper that replaces a 3xx response with a bare one and drops any
+  response header that carries the key, before the library reads it.
+- **Own-path failures (section 5, final review).** Only a failed provider call or a
+  timeout is a provider error; any other exception is 500 `internal` and is logged
+  with its type and frames. The log line of a provider error names the class of
+  what failed (`own_error`); a client that fails to close is logged
+  (`own_close_error`) and does not replace the result.
+- **Selector usage (section 6, final review).** `selector_calls` counts every call
+  the request's call budgets dispatched during selection, also one the deadline
+  cut off; the selector's tokens and cost are then null.
 - **Where requests are metered (section 4).** On an OpenRouter-only deployment (no
   Anthropic key) site requests are still not metered, while own-key requests use the
   flood limit when a database is configured. Health has a `visitor` block only where
-  Claude is offered. Because own keys are on by default, `DATABASE_URL` is read on
-  every deployment that is not offline unless `NER_SITE_OWN_PROVIDERS` is empty.
+  Claude is offered. `DATABASE_URL` is read with the Neon backend, or on a
+  deployment that is not offline and has the Anthropic key or lists own providers;
+  one with only the OpenRouter key and no own providers does not read it, as before.
   Offline mode has no own keys. A contended lock is a 429 for own-key requests too.
 - **Health without counters (section 4).** `own_left` and `own_left_today` are null
   and `window` is `hour`; with a passcode and no database, `limits` is `off` and the
@@ -302,7 +339,14 @@ follows these; reasons are in `docs/ner-site/PLAN.md` section 15 (15.1 to 15.16)
 - **The page (section 7).** The session entry holds the provider with the key and a
   reload in the same tab restores both; the key's shape is checked before sending;
   the own-key limit and the day's Opus step-down have sentences the spec does not
-  give (PLAN.md 15.15).
+  give (PLAN.md 15.15). Final review: Run is held until a saved own-key choice is
+  restored; when it cannot be (health failed, or the provider is no longer offered)
+  the page says so and uses the site's models only after the visitor chooses that;
+  each health read reconciles the providers offered; the hour-blocked sentence
+  names the own-key way out where own keys are on (PLAN.md 15.20).
 - **The check tool (rollout).** `tools/claude_check.py --provider ... --key-env ...`;
-  it does not send a key to a site whose health does not offer the provider, nor over
-  plain http to another machine.
+  it sends a key only to a site whose health answered 200 with own keys enabled and
+  the provider listed, and no secret over plain http to another machine or through
+  a proxy to this one. Final review: a response that echoes a secret fails the run,
+  and a burst passes only when the balances before and after account for its starts
+  (PLAN.md 15.16).

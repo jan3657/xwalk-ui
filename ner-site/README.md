@@ -103,10 +103,9 @@ colour scheme.
    sensitive). Optionally add `NER_SITE_PASSCODE` and `NER_SITE_MODELS`; see the table
    below. Redeploy after changing variables. `ANTHROPIC_API_KEY` puts Claude first and
    switches on the visitor allowance: follow "Rollout: Claude by default and open
-   access" below before adding it to a public deployment. Since 18 November 2026 the
-   code also offers visitors' own API keys by default on every deployment that is not
-   offline: add `NER_SITE_OWN_PROVIDERS` with an empty value before deploying, and
-   leave it so until "Rollout: own keys and the daily cap" below is done.
+   access" below before adding it to a public deployment. Visitors' own API keys are
+   off unless `NER_SITE_OWN_PROVIDERS` lists providers: leave that variable unset until
+   "Rollout: own keys and the daily cap" below is done.
 3. Open `https://<deployment>/api/health` and check `"mode": "live"`,
    `"retrieval": {"dense": {"status": "ok"}}` and the model list. `dense: unavailable`
    with a reason means the committed indexes under `indexes/` are missing or stale, or
@@ -152,8 +151,8 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    for extraction and Jev stays the default selector. Keep `NER_SITE_PASSCODE` for now.
    Keep `OPENROUTER_API_KEY` (Jev, query embeddings, the last step of the chain) and
    `DATABASE_URL` (the allowance is counted there). Optionally set
-   `NER_SITE_VISITOR_SALT`. Add `NER_SITE_OWN_PROVIDERS` with an empty value, which keeps
-   visitors' own keys off until their own rollout below is done.
+   `NER_SITE_VISITOR_SALT`. Leave `NER_SITE_OWN_PROVIDERS` unset: visitors' own keys
+   stay off until their own rollout below is done.
 3. **Deploy, then `GET /api/health`.** Look for `"claude": {"status": "ok"}`,
    `"visitor": {"limits": "on", "tier": "opus", "opus_left": 10, "sonnet_left": 20,
    "opus_left_today": 20, "sonnet_left_today": 40, "window": "hour", ...}`,
@@ -270,10 +269,14 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
        --passcode-env NER_SITE_PASSCODE --selector retrieval --burst 15 short.txt
    ```
 
-   The tool compares where the requests started with the `opus_left` and `sonnet_left`
-   health reported just before (each is what can still start this hour, already capped
-   by what is left of the day). Good: `within the allowance` and exit code 0, for
-   example 10 on Opus and 5 on Sonnet in a fresh hour of a fresh day. A request that waits more than
+   The tool checks the limiter from both sides, with the `opus_left` and `sonnet_left`
+   health reported just before and just after (each is what can still start this hour,
+   already capped by what is left of the day): no more requests may have started on a
+   tier than it had left, and each balance must have fallen by the starts on its tier.
+   So run the burst alone: nothing else from that address in the same minute, and not
+   across the turn of a clock hour. Good: `within the allowance`, then `and counted:
+   opus_left 10 -> 0, sonnet_left 20 -> 15`, and exit code 0, for example 10 on Opus
+   and 5 on Sonnet in a fresh hour of a fresh day. A request that waits more than
    1.5 s for its turn at the visitor's lock is refused with 429 "too many requests at
    once; try again in a few seconds" and is not counted; the tool reports these as
    `429 too many at once`. That is what the tail of a large burst should get, and it
@@ -294,9 +297,15 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
      change before the site opens. A `limits` field with no SQLSTATE means the call
      did not come back from the database in time (step 7): the database was slow for
      those calls, and the visitors behind them would have seen an error.
-   - `NOTHING TO COMPARE WITH`: health showed no `visitor` block with `limits: "on"`
-     before the burst (step 3 was not met). Requests that ran all the same are
-     reported as `not counted`, under no tier.
+   - `NOT COUNTED`: a balance fell by less than the starts on its tier. Requests ran
+     that the limiter did not record.
+   - `INCONCLUSIVE`: the run could not establish the count, and proves nothing either
+     way. Health showed no `visitor` block with `limits: "on"` and whole-number
+     balances before the burst (step 3 was not met; requests that ran all the same
+     are reported as `not counted`, under no tier) or after it; the hour or the day
+     ended during the burst; a balance fell by more than the starts (something else
+     used that address's allowance: run it alone); or the requests used no Claude
+     model, for which health has no balance. Fix what it names and run it again.
 7. **Check (know what a Neon outage does, by design).** When the limiter cannot query
    its database (unreachable, or no answer within 3 s), nothing runs uncounted on the
    site's keys: every request on them, whatever the model, is refused with 503
@@ -318,7 +327,10 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    lasts and the site must answer, the choices are a private site (set
    `NER_SITE_PASSCODE` and remove `DATABASE_URL`: with a passcode and no database the
    site's models run unmetered, and with `NER_SITE_BACKEND=neon` the indexes need
-   that URL too, so this also means the bundled backend) or the site without Claude
+   that URL too, so this also means the bundled backend: remove `NER_SITE_BACKEND`
+   and `NER_SITE_NEON_CATALOG` as well, or set them to `bundled` and `samples`,
+   because production's `NER_SITE_NEON_CATALOG=full` is refused without the Neon
+   backend, 503 `not_configured` on every request) or the site without Claude
    (remove `ANTHROPIC_API_KEY`: site-key requests are then not counted at all). Never
    the second without a passcode: without the key and without a passcode the site is
    public and uncounted on the OpenRouter key.
@@ -348,7 +360,7 @@ Do both, and never the second without the first: removing the key takes Claude o
 the lists and switches the allowance off with it, so once the passcode is gone,
 removing the key alone would leave a public site that counts nothing and spends the
 OpenRouter key. The passcode also stands in front of own-key requests; to take own
-keys away as well, set `NER_SITE_OWN_PROVIDERS` to an empty value.
+keys away as well, remove `NER_SITE_OWN_PROVIDERS`.
 With the passcode back, the site runs on OpenRouter as before, with Jev as the default
 selector unless `NER_SITE_SELECTOR` says otherwise. Check `passcode_required: true` and
 `"claude": {"status": "unavailable", "reason": "key not set"}` in `/api/health`.
@@ -363,32 +375,60 @@ in "The daily cap", "When the limiter cannot be asked" and "Own keys" further do
 checks that could not be made offline are marked **Check** here, each with what to look
 for.
 
-Deploying this code changes three things at once, with no variable touched:
+Deploying this code changes two things at once, with no variable touched, and both
+only where Claude is offered (a deployment with `ANTHROPIC_API_KEY`):
 
-- where Claude is offered, the allowance gains a daily cap;
-- where Claude is offered, a limiter that cannot be asked refuses requests on the
-  site's keys with 503 instead of letting them run on Sonnet uncounted;
-- on every deployment that is not offline, visitors' own keys are offered for all three
-  providers, because that is the default of `NER_SITE_OWN_PROVIDERS`. This includes the
-  production deployment of 4 November (OpenRouter key, passcode, Neon), where the
-  passcode still stands in front of every request.
+- the allowance gains a daily cap;
+- a limiter that cannot be asked refuses requests on the site's keys with 503 instead
+  of letting them run on Sonnet uncounted.
+
+Visitors' own keys are a third change, and that one waits for a variable: they are off
+until `NER_SITE_OWN_PROVIDERS` lists the providers to allow (step 9). Until then a
+deployment without the Anthropic key behaves as it did before this code, apart from
+fields that are added: `own_keys` (off) in health, `provider: "site"` and
+`credential_source: "site"` in a response and in the log line. That includes the
+production deployment of 4 November (OpenRouter key, passcode, Neon): the same
+models, no "Run with" field, `DATABASE_URL` read only for the Neon backend, and an
+`Authorization` header on a request (HTTP basic auth, `curl -u`, a proxy that adds
+one) not looked at.
 
 `tools/claude_check.py` runs on a key of your own with `--provider anthropic|openai|openrouter
 --key-env NAME`: the key is read from the environment variable NAME only, sent as
 `Authorization: Bearer` on the `POST /api/ner` requests, and replaced by `[redacted]`
 in everything the tool prints. Such a run bills that key for the model calls. The tool
-sends nothing when `/api/health` does not list the provider under `own_keys`, and it
-refuses to send a key over plain http to another machine.
+sends the key only after `/api/health` answered 200 with `own_keys.enabled: true` and
+the provider listed. It sends neither the key nor the passcode over plain http to
+another machine, and asks a URL on this machine directly, never through a proxy the
+environment names. Because its report is redacted, it says itself whether a response
+contained the key or the passcode: such a response is marked `CREDENTIAL ECHO` and
+fails the run, and a run that sent a secret ends with a `credential echo check:` line.
 
-1. **Keep own keys off while checking.** Before deploying this code anywhere, add
-   `NER_SITE_OWN_PROVIDERS` with an empty value to the Vercel environment (production
-   and preview). After the deployment `GET /api/health` must show
-   `"own_keys": {"enabled": false, "providers": []}` and the page must show no "Run
-   with" field. **Check:** that Vercel stores an empty value. A value of only spaces
-   is read the same way; any other value that is not a list of `anthropic`, `openai`,
-   `openrouter` makes every request answer 503 `not_configured`, `/api/health`
-   included. With own keys off, a POST that names an own provider answers 400
-   `bad_credential`.
+The examples below are written for a preview deployment that has the passcode, which
+a preview has unless its environment says otherwise (it inherits `NER_SITE_PASSCODE`
+from the shared variables): export the passcode as `NER_SITE_PASSCODE` in your shell
+first. On a preview without a passcode leave `--passcode-env NER_SITE_PASSCODE` out.
+Without the flag a protected preview answers every POST with 401 `passcode_required`,
+and the check has checked nothing.
+
+1. **Deploy with own keys off, and see that nothing changed.** Deploy this code with
+   no `NER_SITE_OWN_PROVIDERS` in the Vercel environment (production and preview:
+   check that neither has one). After the deployment `GET /api/health` must show
+   `"own_keys": {"enabled": false, "providers": []}`, the page must show no "Run
+   with" field, and production must behave as before: the same model and selector
+   lists, the passcode asked for, a run of the example text answering as it did. A
+   POST that names an own provider answers 400 `bad_credential`. **Check** in the
+   Vercel environment, before going on:
+   - `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG`, `ANTHROPIC_BASE_URL` and the proxy
+     variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, in either case) are unset.
+     Requests on a visitor's own key ignore all of them. The site's own Claude client
+     does not: it would send the operator's Claude requests with those headers, to
+     that base URL or through that proxy, and with `ANTHROPIC_LOG` the SDK writes its
+     requests to the function log.
+   - Nothing in front of production adds an `Authorization` header to requests (an
+     authenticating proxy, basic auth on the domain). While own keys are off the
+     site does not look at that header; once they are on, a request on the site's
+     keys that carries one is refused with 400 `bad_credential`, for every visitor
+     behind that proxy.
 2. **Check (Vercel records no request headers).** A visitor's key arrives in the
    `Authorization` header of `POST /api/ner`. The site's own log line never holds it,
    and the SDK and HTTP client loggers are silenced for an own-key run, but what the
@@ -399,19 +439,24 @@ refuses to send a key over plain http to another machine.
    by name. This check is made with step 3: do not turn own keys on for the public
    before both are done.
 3. **Check (a wrong key is refused and appears nowhere).** On a preview deployment
-   with own keys on for it (`NER_SITE_OWN_PROVIDERS` removed or set to the provider),
-   send a made-up key that you can search for:
+   with own keys on for it (`NER_SITE_OWN_PROVIDERS=anthropic,openai,openrouter` in
+   the preview environment only), send a made-up key that you can search for:
 
    ```bash
    export CHECK_KEY=sk-rollout-sentinel-4f9a71c2d08b4e5a   # made up, not a real key
    python ner-site/tools/claude_check.py --url https://<preview> \
-       --provider openai --key-env CHECK_KEY one.txt
+       --passcode-env NER_SITE_PASSCODE --provider openai --key-env CHECK_KEY one.txt
    ```
 
    The made-up key travels to the provider, which refuses it. Expected line:
    `401 ... FAILED provider_key_refused: OpenAI refused this key. It may be mistyped,
    revoked, out of credit, or not allowed to use this model. (sent as provider
-   openai)`, exit code 1. Then search the function log and every sink of step 2 for
+   openai)`, exit code 1 (the POST failed, as it should), and as the last line
+   `credential echo check: none of the 3 responses contained the API key or the
+   passcode this run sent`. A line with `CREDENTIAL ECHO`, or `credential echo check:
+   FAILED`, means a response carried the key or the passcode back: the tool prints
+   every copy as `[redacted]`, so only those lines show it. Stop, and do not turn
+   own keys on. Then search the function log and every sink of step 2 for
    the whole key, for its middle part (`sentinel-4f9a71c2`; providers echo keys
    masked, as in `sk-ro...4e5a`) and for the word `Authorization`: nothing. The
    request's log line shows `"provider": "openai", "credential": "visitor"`,
@@ -426,9 +471,10 @@ refuses to send a key over plain http to another machine.
    ```bash
    read -rs MY_OPENAI_KEY && export MY_OPENAI_KEY          # typed, not in history
    python ner-site/tools/claude_check.py --url https://<preview> \
-       --provider openai --key-env MY_OPENAI_KEY one.txt
+       --passcode-env NER_SITE_PASSCODE --provider openai --key-env MY_OPENAI_KEY one.txt
    python ner-site/tools/claude_check.py --url https://<preview> \
-       --provider openai --key-env MY_OPENAI_KEY --selector gpt-6-luna one.txt
+       --passcode-env NER_SITE_PASSCODE --provider openai --key-env MY_OPENAI_KEY \
+       --selector gpt-6-luna one.txt
    ```
 
    Good: `200`, `provider openai (credential visitor)`, `model gpt-6-luna ->
@@ -473,7 +519,8 @@ refuses to send a key over plain http to another machine.
 
    ```bash
    python ner-site/tools/claude_check.py --url https://<preview> \
-       --selector retrieval --sequential-delay 1 $(printf 'short.txt %.0s' {1..7})
+       --passcode-env NER_SITE_PASSCODE --selector retrieval --sequential-delay 1 \
+       $(printf 'short.txt %.0s' {1..7})
    ```
 
    Lines 1 to 3 read `model claude-opus-5-5 -> claude-opus-5-5`; lines 4 to 6 carry
@@ -491,15 +538,26 @@ refuses to send a key over plain http to another machine.
    the day wording; every request after it, in any hour, is refused the same way
    until midnight UTC.
 6. **Check (a failing limiter fails closed, and own keys still run).** On a preview
-   deployment that has the Anthropic key, set `DATABASE_URL` to a Postgres URL that
-   cannot work (the right host with a wrong password). Use the bundled backend for this: with
-   `NER_SITE_BACKEND=neon` the indexes read the same URL and retrieval fails too.
-   `/api/health` shows `"visitor": {"limits": "unavailable", "tier": "blocked", ...}`
-   and the page says "The site cannot count requests right now. Try again shortly, or
-   use your own API key." A request on the site's keys answers `503 ... FAILED
-   limits_unavailable` with `Retry-After: 30`; `--burst 3` prints `THE LIMITER IS
-   FAILING` and exits 1. A run with `--provider ... --key-env ...` still answers
-   200: it is not counted, and its log line has `"tier": "own"` and a `limits` field.
+   deployment that has the Anthropic key and own keys on, set `DATABASE_URL` to a
+   Postgres URL that cannot work (the right host with a wrong password). Use the
+   bundled backend for this: with `NER_SITE_BACKEND=neon` the indexes read the same
+   URL and retrieval fails too. A preview that starts from production's variables
+   has `NER_SITE_BACKEND=neon` and `NER_SITE_NEON_CATALOG=full`, so set both for the
+   preview, to `bundled` and `samples` (or remove both there): changing the backend
+   alone leaves `full`, which is refused without the Neon backend, and every request,
+   health included, then answers 503 `not_configured` instead of what this step is
+   about. `/api/health` shows `"visitor": {"limits": "unavailable", "tier":
+   "blocked", ...}` and the page says "The site cannot count requests right now. Try
+   again shortly, or use your own API key." A request on the site's keys (with
+   `--passcode-env NER_SITE_PASSCODE` on a preview that has the passcode) answers
+   `503 ... FAILED limits_unavailable` with `Retry-After: 30`; `--burst 3` prints
+   `THE LIMITER IS FAILING` and exits 1. A run with `--provider ... --key-env ...`
+   still answers 200: it is not counted, and its log line has `"tier": "own"` and a
+   `limits` field. Afterwards put the preview back: restore the working
+   `DATABASE_URL`, `NER_SITE_BACKEND` and `NER_SITE_NEON_CATALOG` (or delete the
+   preview's overrides), redeploy, and see `"visitor": {"limits": "on", ...}` and
+   the catalog you expect in `/api/health` before using that preview for anything
+   else.
 7. **Check (the browser's password manager).** In Chrome and in Safari, choose "My
    ... key" on the page, type a key and run. The field is a password field without a
    name and with `autocomplete="off"`, in the same form as the passcode field, and
@@ -508,22 +566,41 @@ refuses to send a key over plain http to another machine.
    browser tab ...") denies: say so on the page (a change in `public/`), or accept it
    knowingly. Also press "Forget key", change "Run with", and reload: the field must
    be empty after the first two and hold the key after a reload in the same tab.
-8. **`ANTHROPIC_CUSTOM_HEADERS` does not reach own-key requests.** The site's own
-   Claude client honours that variable as before. A client built for a visitor's
-   Anthropic key drops it (a header there could replace the visitor's key with the
-   operator's), so nothing that depends on such a header, a gateway or an
-   attribution header, applies to own-key requests: do not rely on it. The same
-   holds for `ANTHROPIC_BASE_URL`, `NER_SITE_BASE_URL` and proxy variables: own-key
-   requests go to the provider's own host. The drop relies on a private attribute of
-   the `anthropic` SDK and is checked on every request: after an SDK upgrade that
-   moves it, own-key Anthropic requests fail with `502 provider_error ... (error)`
-   instead of sending the header, so repeat step 4 for Anthropic after upgrading.
-9. **Turn own keys on.** Remove `NER_SITE_OWN_PROVIDERS` (all three providers), or
-   list the providers that passed step 4 (for example `anthropic,openrouter`), and
-   redeploy. `/api/health` shows `own_keys.enabled: true` with each provider's
-   models, and the page shows "Run with". The flood limit can be confirmed at your
-   own key's expense: the 31st own-key request of an hour answers 429 "too many
-   requests with your own key; try again in N minutes".
+8. **`ANTHROPIC_CUSTOM_HEADERS` does not reach own-key requests, and the SDK is
+   pinned.** The site's own Claude client honours that variable as before (which is
+   why step 1 wants it unset). A client built for a visitor's Anthropic key drops it
+   (a header there could replace the visitor's key with the operator's), so nothing
+   that depends on such a header, a gateway or an attribution header, applies to
+   own-key requests: do not rely on it. The same holds for `ANTHROPIC_BASE_URL`,
+   `NER_SITE_BASE_URL` and proxy variables: own-key requests go to the provider's
+   own host. The drop goes through a private attribute of the `anthropic` SDK, so it
+   is not what the site relies on: every own-key Anthropic request is looked at as
+   it leaves, and one that is not for `api.anthropic.com` with the visitor's key
+   once and exactly the headers and values SDK 2.10.0 sends on its own is not sent
+   (`502 provider_error ... (error)` for the visitor, `"own_error": "WireRefused"`
+   in the log line). That check, and the reading of what the SDK takes from the
+   environment, are of one version, so `anthropic` is pinned to `2.10.0` in
+   `requirements.txt` and in the `dev` extra of `pyproject.toml`, and a test fails
+   on any other version. An upgrade does not announce itself otherwise: a new
+   version whose requests look the same passes the check, and whatever else it
+   reads from the environment has not been looked at. So on any bump, before
+   deploying it: go through the list in that test's message
+   (`tests/test_site_providers.py`), move both pins and `AUDITED_SDK` together, and
+   repeat step 4 for Anthropic.
+9. **Turn own keys on.** Set `NER_SITE_OWN_PROVIDERS` to the providers that passed
+   step 4, by name, for example `anthropic,openrouter` or
+   `anthropic,openai,openrouter` (there is no word for all of them; case and spaces
+   do not matter), and redeploy. A name that is not one of the three makes every
+   request answer 503 `not_configured`, `/api/health` included. With own keys on,
+   `DATABASE_URL` is read on that deployment (the flood limit is counted there) and
+   must be a Postgres URL, and a request on the site's keys may no longer carry an
+   `Authorization` header (step 1). `/api/health` shows `own_keys.enabled: true`
+   with each provider's models, and the page shows "Run with". The flood limit can
+   be confirmed at your own key's expense: the 31st own-key request of an hour
+   answers 429 "too many requests with your own key; try again in N minutes". A
+   burst of the tool with `--provider` checks it too where health has a `visitor`
+   block (a deployment with the Anthropic key); elsewhere it reports `INCONCLUSIVE`,
+   because nothing in health shows the own-key count.
 10. **Sign-in with ChatGPT is not built.** OpenAI's programme covers loopback
     callbacks only and a hosted app has to apply: submit OpenAI's interest form if
     sign-in on the hosted site is wanted. Nothing changes on the site until then;
@@ -531,10 +608,13 @@ refuses to send a key over plain http to another machine.
     token) and nothing more.
 11. Record what was verified in the "Verified" section.
 
-Turning own keys off again: set `NER_SITE_OWN_PROVIDERS` to an empty value and
-redeploy. Health reports `own_keys.enabled: false`, the page drops the field and
-forgets a key kept in the tab the next time it loads, and a POST with an own
-provider answers 400 `bad_credential`.
+Turning own keys off again: remove `NER_SITE_OWN_PROVIDERS` and redeploy (to take
+one provider away, take its name out of the list). Health reports
+`own_keys.enabled: false`, and a POST with an own provider answers 400
+`bad_credential`. A page that is open learns it at its next health read (at load, and
+after every run): it drops the provider from "Run with", forgets a key kept in the
+tab, says that the key can no longer be used, and runs nothing on the site's models
+until the visitor chooses that.
 
 ### Environment variables (function runtime)
 
@@ -551,9 +631,9 @@ provider answers 400 `bad_credential`.
 | `NER_SITE_OPUS_PER_HOUR` / `NER_SITE_SONNET_PER_HOUR` | 10 / 20 | The per-visitor allowance for a clock hour (UTC): requests that start on Opus, then requests that start on Sonnet. Their sum is the hour's total for every kind of request on the site's keys. Whole numbers 0 to 1000; anything else is refused. |
 | `NER_SITE_OPUS_PER_DAY` / `NER_SITE_SONNET_PER_DAY` | 20 / 40 | The same for a UTC calendar day, on top of the hourly allowance: their sum is the day's total for every kind of request on the site's keys. Whole numbers 0 to 10000; anything else is refused. |
 | `NER_SITE_OWN_PER_HOUR` / `NER_SITE_OWN_PER_DAY` | 30 / 60 | The flood limit for requests on a visitor's own key, per visitor and clock hour and per UTC day. Counted apart from the allowance above. Whole numbers 0 to 10000; anything else is refused. 0 refuses every own-key request where the limiter can be asked. |
-| `NER_SITE_OWN_PROVIDERS` | `anthropic,openai,openrouter` | The providers a visitor may bring an own key for. An empty value turns own keys off; an unknown name is refused (503 `not_configured`). Offline mode turns them off whatever this says. |
-| `NER_SITE_OWN_MODELS_ANTHROPIC` | `claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5` | The models an own Anthropic key may run; the first is the default. Only these three ids are accepted. |
-| `NER_SITE_OWN_MODELS_OPENAI` | `gpt-6-luna` | The models an own OpenAI key may run on `https://api.openai.com/v1`; the first is the default. Any ids except `jev` and `retrieval`; an empty list is refused. Not checked against the live API. |
+| `NER_SITE_OWN_PROVIDERS` | unset (own keys off) | The providers a visitor may bring an own key for: a comma-separated list of `anthropic`, `openai` and `openrouter` (case and spaces are ignored, as are empty items such as a trailing comma). Unset or empty, own keys are off; an unknown name is refused (503 `not_configured`). Offline mode turns them off whatever this says. |
+| `NER_SITE_OWN_MODELS_ANTHROPIC` | `claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5` | The models an own Anthropic key may run; the first is the default. Only these three ids are accepted. Read only while `anthropic` is in `NER_SITE_OWN_PROVIDERS`; an empty value counts as unset. |
+| `NER_SITE_OWN_MODELS_OPENAI` | `gpt-6-luna` | The models an own OpenAI key may run on `https://api.openai.com/v1`; the first is the default. Any ids except `jev` and `retrieval`; an empty item in the list (a trailing comma) is refused. Read only while `openai` is listed; an empty value counts as unset. Not checked against the live API. |
 | `NER_SITE_OWN_MODELS_OPENROUTER` | `google/gemini-3.1-flash-lite,openai/gpt-6-luna` | The models an own OpenRouter key may run; the first is the default. The same rules. |
 | `NER_SITE_VISITOR_SALT` | derived | Salt for the visitor ids (a keyed hash of the client address). Unset, it is the SHA-256 of `DATABASE_URL`. Changing it, or the database URL when it is unset, gives every visitor a new id, which resets the current hour's and day's counts. |
 | `NER_SITE_PASSCODE` | unset | When set, every `/api/ner` request must send it as `X-Passcode`; the page asks for it and keeps it in `sessionStorage`. ASCII only (8 characters or more recommended): header values arrive as Latin-1, so a non-ASCII passcode could never match and is refused with 503 `not_configured`. It does not exempt anyone from the visitor allowance, and a request on a visitor's own key needs it too. |
@@ -564,7 +644,7 @@ provider answers 400 `bad_credential`.
 | `NER_SITE_DENSE_DIR` | `<project root>/indexes` | Where the committed dense indexes live. |
 | `NER_SITE_CACHE_DIR` | `/tmp/xwalk-ner-site` | Where BM25 indexes are built at cold start. |
 | `NER_SITE_BACKEND` | `bundled` | `neon` reads the records, BM25 and vectors from Neon Postgres instead of building BM25 in `/tmp` and opening the committed dense indexes (see "Neon backend" below). |
-| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (which they are unless `NER_SITE_OWN_PROVIDERS` is empty), because the visitor allowance and the own-key flood limit are counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. |
+| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (`NER_SITE_OWN_PROVIDERS` lists a provider), because the visitor allowance and the own-key flood limit are counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. |
 | `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` is created in it; the schema itself must already exist. |
 | `NER_SITE_NEON_DIMENSIONS` | 1024 | The loaded vector dimension (`load_neon.py --dimensions`); a different value makes dense stale. |
 | `NER_SITE_NEON_CATALOG` | `samples` | `full` serves the full catalogs (`chebi`, `ctd-disease`, `ncbi-gene`, `foodon`) once they are loaded; needs `NER_SITE_BACKEND=neon`. |
@@ -753,17 +833,23 @@ neither. `own_keys` is reported on every deployment: `{"enabled": true, "provide
 **Own keys.** A visitor may run the demo on their own API key for Anthropic, OpenAI or
 OpenRouter instead of the site's keys (binding design:
 [the spec of 18 November 2026](../docs/superpowers/specs/2026-11-18-own-key-daily-cap-design.md),
-with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). On by
-default for all three providers on a site that is not offline.
+with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). Off unless
+`NER_SITE_OWN_PROVIDERS` lists the providers to allow, and always off in offline mode.
 
 *What travels where.*
 
 - The page keeps the key in the tab's session storage (one entry, with the provider),
   puts it back in the field after a reload in the same tab, and removes it on "Forget
-  key", on any change of "Run with", and at load when its provider is no longer
-  offered. It sends it only as `Authorization: Bearer <key>` on `POST /api/ner`, with
-  `redirect: "error"`, and with `"provider": "<id>"` in the body. Health requests carry
-  nothing.
+  key", on any change of "Run with", and when a health read (at load, and after every
+  run) no longer offers its provider. It sends it only as `Authorization: Bearer
+  <key>` on `POST /api/ner`, with `redirect: "error"`, and with `"provider": "<id>"`
+  in the body. Health requests carry nothing.
+- The page never moves a run from the visitor's key to the site's keys on its own.
+  After a reload the saved choice comes back only when health has answered, so until
+  then Run (the button and the keyboard shortcut) is held. If health cannot be
+  loaded, or no longer offers the provider, the page says so and runs on the site's
+  models only after the visitor presses "Use the site's models" (or picks another
+  key under "Run with").
 - The API reads the key from that one header, builds a client for that request, and
   closes it after. The key is not written to the settings, a cache, the database, a log
   line or a response, and no length or digest of it is kept. For the length of the
@@ -772,9 +858,14 @@ default for all three providers on a site that is not offline.
 - The key goes to the provider's own host and nowhere else: `https://api.anthropic.com`,
   `https://api.openai.com/v1` or `https://openrouter.ai/api/v1`. These are constants:
   `NER_SITE_BASE_URL`, `ANTHROPIC_BASE_URL`, proxy variables, `.netrc` and
-  `ANTHROPIC_CUSTOM_HEADERS` do not apply, and redirects are not followed. The text
-  and the prompt go to that provider with the key. An own OpenRouter request carries
-  the site's `HTTP-Referer` and `X-Title` headers, as the site's own do.
+  `ANTHROPIC_CUSTOM_HEADERS` do not apply, and redirects are not followed. Each
+  request is checked as it leaves (the pinned host, the visitor's key once; for
+  Anthropic every header and its value) and is not sent otherwise. A redirect's
+  `Location`, and any response header that carries the key, is removed before the
+  HTTP client reads the response, so a provider that echoes the key there leaves it
+  in no cache of the warm instance. The text and the prompt go to that provider
+  with the key. An own OpenRouter request carries the site's `HTTP-Referer` and
+  `X-Title` headers, as the site's own do.
 - A provider's error text is never repeated (it can echo the key, whole or masked):
   the visitor gets a fixed sentence with the provider's name, and the log the error
   code.
@@ -819,7 +910,7 @@ table above), and then nothing bounds it but the function's own limits.
 
 | Status and code | When |
 |---|---|
-| 400 `bad_credential` | An own provider without exactly one `Authorization: Bearer <key>` header; a key that is not 20 to 512 printable ASCII characters without spaces; a provider that is unknown or not enabled; the key also present in the text or the prompt; or a request on the site's keys that carries an `Authorization` header at all (also where own keys are off). |
+| 400 `bad_credential` | An own provider without exactly one `Authorization: Bearer <key>` header; a key that is not 20 to 512 printable ASCII characters without spaces; a provider that is unknown or not enabled; the key also present in the text or the prompt; or, where own keys are on, a request on the site's keys that carries an `Authorization` header at all. Where own keys are off, that header is not looked at on a request for the site's keys. |
 | 401 `provider_key_refused` | "<Provider> refused this key. It may be mistyped, revoked, out of credit, or not allowed to use this model." The provider answered 401, 402, 403 or 404 (a model the key may not use, or one that does not exist, is a 404), Anthropic named the credit balance, or OpenAI answered 429 "exceeded your current quota". |
 | 429 `provider_rate_limited` | "<Provider> is rate limiting this key; try again shortly." No `Retry-After`. |
 | 502 `provider_error` | "<Provider> could not complete the request (<word>)." The word is one of `timeout`, `overloaded`, `http_5xx`, `bad_request`, `refused`, `unreachable`, `bad_answer`, `call_limit`, `error`. The request deadline and the call cap are reported this way too (`timeout`, `call_limit`), not as the site-key codes. |
@@ -828,10 +919,26 @@ An extraction answer that cannot be read is 422 as on the site's keys. A pick th
 failed carries one of the same words as its explanation (also `key_refused` and
 `rate_limited`), never the provider's text.
 
-*Turning it off.* `NER_SITE_OWN_PROVIDERS` with an empty value turns own keys off; a
-list keeps only the providers named. Offline mode has none. The log line of a `POST /api/ner`
-that passed the passcode and JSON checks says `provider` and `credential` (`site` or
-`visitor`), also when the credential was then refused.
+*In the log.* The log line of a `POST /api/ner` that passed the passcode and JSON
+checks says `provider` and `credential` (`site` or `visitor`), also when the
+credential was then refused. One of the three provider errors above also has
+`own_error`, the class name of what failed (`LLMFatalError` or `LLMRetryableError`
+for a provider's answer, `TimeoutError` for the deadline, `CallLimitExceeded`,
+`WireRefused` for a request the site did not send, or the class of whatever kept a
+client from being built). Only a failed provider call or a timeout is reported as the
+provider's error: any other exception on that path is a fault of the site's code
+and answers 500 `internal`, with `exception` and `where` in the log line as for any
+request. A client that fails to close after the run changes nothing for the visitor
+and adds `own_close_error` (a class name) to the line. No part of the key is in any
+of these.
+
+*The Anthropic SDK is pinned.* `anthropic==2.10.0`, in `requirements.txt` and in the
+`dev` extra. What keeps the operator's environment out of a visitor's Anthropic
+request was written against that version's source; see step 8 of the own-key rollout
+before changing it.
+
+*Turning it off.* Own keys are off while `NER_SITE_OWN_PROVIDERS` is unset or empty; a
+list keeps only the providers named. Offline mode has none.
 
 Tests for the limiter's SQL need a real Postgres and are not part of the default suite.
 With a Postgres URL in `NER_SITE_TEST_DATABASE_URL` and the `psql` client (16 or later)
@@ -897,7 +1004,7 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   logs or returns it ("Own keys" above), but the platform in front of the code must
   not either: confirm that Vercel's logs, log drains and integrations record no
   request headers before turning own keys on (own-key rollout, steps 2 and 3), and
-  keep `NER_SITE_OWN_PROVIDERS` empty until then. The page keeps the key in session
+  leave `NER_SITE_OWN_PROVIDERS` unset until then. The page keeps the key in session
   storage, which any script of the origin can read: the Content-Security-Policy
   below, which allows scripts from the site only, is what protects it, so do not
   loosen it. Own-key requests cost the operator the term lookup; the flood limit (30
@@ -1287,24 +1394,77 @@ Not run, and therefore not known:
 - Whether Vercel, its log drains or an integration record request headers (step 2).
 - Whether Chrome or Safari offer to save the key field; Firefox, Safari and a screen
   reader on the changed page at all (step 7).
-- The daily cap and the 503 on Neon and on a deployment (steps 5 and 6); whether Vercel
-  stores an empty `NER_SITE_OWN_PROVIDERS` (step 1).
+- The daily cap and the 503 on Neon and on a deployment (steps 5 and 6).
 - Python 3.10 and 3.12 (no such interpreter was at hand; the code is checked by ruff
   against the 3.10 target only), and any Vercel build.
 
 Known and accepted:
 
-- Deploying this code turns own keys on wherever `NER_SITE_OWN_PROVIDERS` is not set
-  to an empty value, and makes `DATABASE_URL` read (and refused when it is not a
-  Postgres URL) on every such deployment that is not offline.
-- A request on the site's keys that carries any `Authorization` header is refused
-  with 400 `bad_credential`. A proxy or client that adds one to every request would
-  break the site.
+- Turning own keys on (`NER_SITE_OWN_PROVIDERS` lists a provider) makes `DATABASE_URL`
+  read (and refused when it is not a Postgres URL) on that deployment unless it is
+  offline.
+- Where own keys are on, a request on the site's keys that carries any
+  `Authorization` header is refused with 400 `bad_credential`. A proxy or client that
+  adds one to every request would break such a site (own-key rollout, step 1).
+- A burst of the check tool cannot show the own-key count on a deployment without the
+  Anthropic key (no `visitor` block in health): it reports `INCONCLUSIVE`.
+- The page learns that a provider was turned off at its next health read, which is at
+  load and after a run: the run before it still carries the key, and the API refuses
+  it with 400 `bad_credential`.
 - An own Anthropic key gets no retry: one transient failure is a 502.
 - Own-key requests are not counted while the limiter cannot be asked, and a response
   does not say whether it was counted.
 - On a deployment without the Anthropic key, health has no `visitor` block, so the
   page cannot show an own-key flood limit before the 429 arrives.
+
+### Fixes after the final review, 18 November 2026
+
+Two reviews of the whole branch (one of them by another model) found the points below.
+**Still nothing deployed, no production variable changed, no request with a real key
+to any provider, to Neon or to https://www.xwalk.si.** The sections above describe the
+code after these fixes; the decisions are PLAN.md 15.6, 15.11, 15.12 and 15.16 to
+15.20.
+
+- Own keys are off unless `NER_SITE_OWN_PROVIDERS` lists providers, and a deployment
+  without them does not read `DATABASE_URL` for the limiter, does not look at an
+  `Authorization` header on a site request, and does not validate an own model list.
+- Own-key clients send through a transport wrapper that stops a request not built
+  for the visitor's key and removes a redirect's `Location`, and any header carrying
+  the key, before the HTTP client parses the response. `anthropic` is pinned to
+  2.10.0.
+- The page holds Run until a saved own-key choice is settled, and follows `own_keys`
+  on every health read.
+- The check tool keeps its secrets off proxies and plain http, reports a response
+  that echoes one, and passes a burst only when the balances account for it.
+- Own-key failures are named in the log; a failed close no longer replaces a result;
+  picks cut off by the deadline are counted with unknown tokens.
+
+What was run (Python 3.13.3, the repository venv, no key in the environment):
+
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1153 passed, 23
+  deselected (1000 before these fixes).
+  The fixes were written test first. Reproduced as failing tests before the code
+  changed: for each of the three providers, a 302 with the key in a relative
+  `Location` left it in the `urlsplit` cache of `urllib.parse` after the client was
+  closed, and a charset that echoed the key left it in the `encodings` cache; an
+  operator value under a header name the SDK uses reached the wire once the removal
+  of `ANTHROPIC_CUSTOM_HEADERS` was bypassed; the tool sent its requests for
+  127.0.0.1 to a configured proxy, printed a key with a quote in its JSON spelling,
+  and exited 0 for a burst whose balances had not moved.
+- `ruff check` and `ruff format --check` on `src tests scripts ner-site`: passing.
+- The page in headless Chromium against `tools/serve_local.py --canned` on 127.0.0.1,
+  at 1280 px light and 390 px dark, with a request listener and a made-up key: after a
+  reload with a kept key, with the health answer delayed, answering 503, or
+  unreachable, neither the button nor the keyboard shortcut posted anything (before
+  the fix both posted on the site's keys); the choice came back with health, or after
+  "Try again"; "Use the site's models" forgot the key and then posted without one;
+  a provider turned off between two runs was removed from "Run with", its key
+  forgotten, and nothing posted until a choice was made; only `POST /api/ner`
+  carried the key, and it was in no URL, body, document or console line.
+
+Not run, in addition to the list above: Python 3.10 (the changed files parse with the
+3.10 grammar and compile on 3.11 and 3.12; the suite ran on 3.13 only); Firefox and
+Safari; a real proxy in front of the tool; any SDK version but 2.10.0.
 
 ### For the operator after deploying
 
@@ -1315,7 +1475,9 @@ Known and accepted:
    `claude: {"status": "ok"}` and `visitor.limits: "on"`; `visitor.limits:
    "unavailable"` there means every request on the site's keys answers 503
    `limits_unavailable`. `own_keys` says whether visitors' own keys are on, and for
-   which providers and models.
+   which providers and models: `{"enabled": false, "providers": []}` on every
+   deployment where `NER_SITE_OWN_PROVIDERS` lists none, and such a deployment
+   behaves as it did before own keys existed.
 2. That Vercel passes `self.path` as `/api/ner` and `/api/health` (with any query
    string): anything else gets a 404 `not_found` from `handle`. Also that a POST from the
    page carries `Content-Length` (fetch does; a missing one gets 411 `length_required`).
@@ -1326,7 +1488,8 @@ Known and accepted:
    is offered it also has `tier`, `fallbacks` and `ran` (the model that extracted), and
    `limits` when the limiter could not be asked; never the visitor id or the address.
    A `POST /api/ner` also has `provider` and `credential` (`site` or `visitor`), and
-   for a visitor's own key `tier` is `own`; no part of that key is in the line.
+   for a visitor's own key `tier` is `own`; no part of that key is in the line. A
+   failed own-key request names the class of what failed in `own_error`.
    Also note the cold-start time (the first request builds four BM25 indexes in
    `/tmp`).
 5. With `NER_SITE_PASSCODE` set: 401 `passcode_required` without it, 401
