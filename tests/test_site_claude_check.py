@@ -23,6 +23,11 @@ import pytest
 TOOL = Path(__file__).resolve().parents[1] / "ner-site" / "tools" / "claude_check.py"
 OPUS, SONNET, GEMINI = "claude-opus-5-5", "claude-sonnet-5-5", "google/gemini-3.1-flash-lite"
 
+HAIKU, LUNA = "claude-haiku-5-5", "gpt-6-luna"
+# Sentinels in the shape the site accepts (20 to 512 printable ASCII, no spaces).
+OWN_KEY = "sk-stub-own-key-0123456789abcdef"
+KEY_ENV = "CHECK_TEST_OWN_KEY"
+
 DEADLINE = "cut off by the request deadline"  # ner_site.select.DEADLINE_NOTE
 
 Reply = tuple[int, dict[str, Any]]
@@ -53,6 +58,8 @@ def ok_response(
     fallbacks: tuple[dict[str, str], ...] = (),
     usage: dict[str, Any] | None = None,
     total_ms: int = 1500,
+    provider: str = "site",
+    credential: str = "site",
 ) -> Reply:
     entities = [{"id": f"e{i}", "pick": pick} for i, pick in enumerate(picks)]
     entities += [{"id": f"u{i}"} for i in range(unpicked)]
@@ -65,6 +72,8 @@ def ok_response(
         "entities": entities,
         "fallbacks": list(fallbacks),
         "notices": [],
+        "provider": provider,
+        "credential_source": credential,
         "usage": usage
         or {
             "llm_calls": 1,
@@ -103,6 +112,19 @@ class Stub:
                 "opus_left": 7,
                 "sonnet_left": 20,
                 "resets_in_s": 1380,
+                "opus_left_today": 17,
+                "sonnet_left_today": 40,
+                "own_left": 30,
+                "own_left_today": 60,
+                "day_resets_in_s": 30180,
+                "window": "hour",
+            },
+            "own_keys": {
+                "enabled": True,
+                "providers": [
+                    {"id": "anthropic", "name": "Anthropic", "models": [OPUS, HAIKU]},
+                    {"id": "openai", "name": "OpenAI", "models": [LUNA]},
+                ],
             },
         }
         self.answer: Callable[[dict[str, Any]], Reply] = lambda body: ok_response()
@@ -192,9 +214,12 @@ def test_health_blocks_come_first_and_each_file_gets_one_line(
     assert code == 0
     assert out[0].startswith("health: mode live, default model claude-opus-5-5")
     assert out[1] == '  claude: {"status": "ok"}'
-    assert out[2].startswith('  visitor: {"limits": "on", "opus_left": 7')
+    assert out[2].startswith('  visitor: {"day_resets_in_s": 30180, "limits": "on", "opus_left": 7')
+    assert out[3].startswith('  own_keys: {"enabled": true, "providers": [{"id": "anthropic"')
+    assert out[4] == "running as provider site: the site's keys"
     (line,) = [row for row in out if row.startswith("a.txt")]
     assert "  200  " in line
+    assert "provider site (credential site)" in line
     assert f"model {OPUS} -> {SONNET}" in line
     assert f"selector {OPUS}" in line
     assert "entities 5" in line
@@ -218,6 +243,7 @@ def test_health_blocks_come_first_and_each_file_gets_one_line(
     assert headers["x-requested-with"] == "xwalk-ner"
     assert headers["content-type"] == "application/json"
     assert "x-passcode" not in headers
+    assert "authorization" not in headers
 
 
 def test_totals_sum_the_requests_and_name_the_slowest_and_the_largest(
@@ -290,7 +316,7 @@ def test_a_failed_request_is_named_and_gives_exit_code_1(
     assert code == 1
     (line,) = [row for row in out.splitlines() if row.startswith("bad.txt")]
     assert "  502  " in line
-    assert "FAILED provider_error: the provider refused the request" in line
+    assert "FAILED provider_error: the provider refused the request (sent as provider site)" in line
     assert "totals: 2 requests, 1 ok, 1 failed" in out
 
 
@@ -455,20 +481,9 @@ def test_burst_counts_where_the_parallel_requests_started(
             ok_response(),
             ok_response(model=SONNET, fallbacks=(ADMIT_SONNET,)),
             ok_response(model=SONNET, fallbacks=(ADMIT_SONNET,)),
-            # Not counted by the limiter: reported apart, outside both tiers.
-            ok_response(
-                model=SONNET,
-                fallbacks=(
-                    {
-                        "stage": "admit",
-                        "from": OPUS,
-                        "to": SONNET,
-                        "reason": "limits_unavailable",
-                    },
-                ),
-            ),
-            error_response(429, "visitor_limit_reached", "try again in 23 minutes"),
-            error_response(429, "visitor_limit_reached", "try again in 23 minutes"),
+            error_response(429, "visitor_limit_reached", HOUR_USED),
+            error_response(429, "visitor_limit_reached", HOUR_USED),
+            error_response(429, "visitor_limit_reached", DAY_USED),
         ]
     )
     code = check.main(
@@ -485,16 +500,25 @@ def test_burst_counts_where_the_parallel_requests_started(
 
     assert code == 0
     assert (
-        "burst: 7 parallel requests of first.txt: started on Opus 2, on Sonnet 2, "
-        "on another model 0, 429 hour used 2, 429 too many at once 0, "
-        "uncounted (limits_unavailable) 1, failed 0"
+        "burst: 7 parallel requests of first.txt as provider site: started on Opus 2, "
+        "on Sonnet 2, on another model 0, on the own key 0, 429 hour used 2, "
+        "429 day used 1, 429 own-key limit 0, 429 too many at once 0, "
+        "503 limits_unavailable 0, not counted 0, failed 0"
     ) in out
-    assert "within the allowance health reported before the burst" in out
-    # One in seven is tolerated (a slow database for one request), and still said.
-    assert "1 of 7 requests ran on Sonnet uncounted" in out
+    assert (
+        "within the allowance health reported before the burst "
+        "(opus_left 2, sonnet_left 3, opus_left_today 17, sonnet_left_today 40)"
+    ) in out
     assert [body for _, body in posts(stub)] == [{"text": "first"}] * 7
 
 
+# The messages of ner_site.http._admit, with the own-key clause of a site that offers them.
+HOUR_USED = "you have used this hour's requests; try again in 23 minutes, or use your own API key"
+DAY_USED = "you have used today's requests; they reset at midnight UTC, or use your own API key"
+OWN_USED = "too many requests with your own key; try again in 23 minutes"
+CANNOT_COUNT = (
+    "the site cannot count requests right now; try again shortly, or use your own API key"
+)
 UNCOUNTED = {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "limits_unavailable"}
 TOO_MANY = "too many requests at once; try again in a few seconds"  # ner_site.http._admit
 
@@ -508,36 +532,58 @@ def test_burst_counts_a_contended_lock_apart_and_does_not_fail_on_it(
     stub.answer = _scripted(
         [ok_response()] * 3
         + [error_response(429, "visitor_limit_reached", TOO_MANY)] * 4
-        + [error_response(429, "visitor_limit_reached", "try again in 23 minutes")]
+        + [error_response(429, "visitor_limit_reached", HOUR_USED)]
     )
     code = check.main(["--url", stub.url, "--burst", "8", write(tmp_path, "a.txt", "a")])
     out = capsys.readouterr().out
 
     assert code == 0
     assert "started on Opus 3, on Sonnet 0" in out
-    assert "429 hour used 1, 429 too many at once 4, uncounted (limits_unavailable) 0" in out
+    assert "429 hour used 1, 429 day used 0, 429 own-key limit 0, 429 too many at once 4" in out
+    assert "503 limits_unavailable 0, not counted 0, failed 0" in out
     assert "within the allowance health reported before the burst" in out
     assert "refused because too many arrived at once" in out
 
 
-def test_burst_fails_when_most_of_it_ran_uncounted(
+def test_burst_fails_when_the_site_could_not_count_requests(
     stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """What a limiter that fails under concurrency looks like (Neon's batch endpoint not
-    at READ COMMITTED, SQLSTATE 40001): one start on Opus, the rest on Sonnet uncounted.
-    Nothing is over the allowance, and that is exactly why it must not pass."""
+    at READ COMMITTED, SQLSTATE 40001): one start on Opus, the rest refused with 503.
+    Nothing is over the allowance, and that is exactly why it must not pass. One 503 is
+    enough: the site ran nothing uncounted, but it did not serve the visitor either."""
     stub.health["visitor"].update(opus_left=10, sonnet_left=20)
     stub.answer = _scripted(
-        [ok_response()] + [ok_response(model=SONNET, fallbacks=(UNCOUNTED,))] * 2
+        [ok_response()] * 3 + [error_response(503, "limits_unavailable", CANNOT_COUNT)]
     )
-    code = check.main(["--url", stub.url, "--burst", "3", write(tmp_path, "a.txt", "a")])
+    code = check.main(["--url", stub.url, "--burst", "4", write(tmp_path, "a.txt", "a")])
     out = capsys.readouterr().out
 
     assert code == 1
-    assert "started on Opus 1, on Sonnet 0" in out and "uncounted (limits_unavailable) 2" in out
+    assert "started on Opus 3, on Sonnet 0" in out
+    assert "503 limits_unavailable 1, not counted 0, failed 0" in out
     assert "within the allowance" not in out
-    assert "THE LIMITER IS FAILING: 2 of 3 requests ran on Sonnet uncounted" in out
-    assert "40001" in out and "`limits`" in out
+    assert "THE LIMITER IS FAILING: 1 of 4 requests were refused with 503" in out
+    assert "limits_unavailable: the site cannot count requests right now" in out
+    assert "40001" in out and "`limits`" in out and "DATABASE_URL" in out
+
+
+def test_burst_fails_on_a_site_that_still_runs_requests_uncounted(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The code before 18 November 2026 ran such a request on Sonnet with a step-down
+    note instead of refusing it. It is not a start on Sonnet, and one is a failure."""
+    stub.health["visitor"].update(opus_left=10, sonnet_left=20)
+    stub.answer = _scripted(
+        [ok_response()] * 6 + [ok_response(model=SONNET, fallbacks=(UNCOUNTED,))]
+    )
+    code = check.main(["--url", stub.url, "--burst", "7", write(tmp_path, "a.txt", "a")])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "started on Opus 6, on Sonnet 0" in out and "not counted 1, failed 0" in out
+    assert "within the allowance" not in out
+    assert "THE LIMITER IS FAILING: 1 of 7 requests ran uncounted" in out
 
 
 @pytest.mark.parametrize(
@@ -563,8 +609,28 @@ def test_burst_fails_when_there_is_no_allowance_to_compare_with(
     out = capsys.readouterr().out
 
     assert code == 1
-    assert "started on Opus 2" in out
+    # Nothing counted them, so they are starts on no tier.
+    assert "started on Opus 0, on Sonnet 0" in out and "not counted 2, failed 0" in out
     assert "NOTHING TO COMPARE WITH" in out and "within the allowance" not in out
+    assert "the 2 requests that ran were not counted" in out
+
+
+@pytest.mark.parametrize("limits", ["unavailable", "off"])
+def test_a_sonnet_burst_nothing_counted_is_not_tallied_as_sonnet_starts(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str], limits: str
+) -> None:
+    """Asked for Sonnet, a request carries no step-down to tell a counted run from an
+    uncounted one: only the limiter's state before the burst does."""
+    stub.health["visitor"].update(limits=limits, tier="blocked", opus_left=0, sonnet_left=20)
+    stub.answer = lambda body: ok_response(model=SONNET, requested=SONNET)
+    code = check.main(
+        ["--url", stub.url, "--model", SONNET, "--burst", "3", write(tmp_path, "a.txt", "a")]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "on Sonnet 0" in out and "not counted 3" in out
+    assert "OVER THE ALLOWANCE" not in out and "within the allowance" not in out
 
 
 def test_started_on_falls_back_to_the_selector_when_the_model_is_not_claude() -> None:
@@ -620,7 +686,307 @@ def test_burst_fails_on_an_answer_that_is_neither_a_run_nor_the_visitor_limit(
 
     assert code == 1
     assert "FAILED provider_error: upstream" in out
-    assert "429 too many at once 0, uncounted (limits_unavailable) 0, failed 1" in out
+    assert "429 too many at once 0, 503 limits_unavailable 0, not counted 0, failed 1" in out
+
+
+# --- a visitor's own key -----------------------------------------------------------------
+
+
+def own_ok(provider: str = "anthropic", model: str = HAIKU, **kwargs: Any) -> Reply:
+    return ok_response(
+        model=model, requested=model, provider=provider, credential="visitor", **kwargs
+    )
+
+
+def own_argv(stub: Stub, provider: str = "anthropic") -> list[str]:
+    return ["--url", stub.url, "--provider", provider, "--key-env", KEY_ENV]
+
+
+def test_an_own_key_goes_out_as_bearer_on_the_post_only(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.answer = lambda body: own_ok()
+    code = check.main([*own_argv(stub), "--model", HAIKU, write(tmp_path, "a.txt", "a")])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    ((headers, body),) = posts(stub)
+    assert headers["authorization"] == f"Bearer {OWN_KEY}"
+    assert body == {"text": "a", "model": HAIKU, "provider": "anthropic"}
+    # Health is asked before and after, and never sees the key.
+    gets = [h for method, _, h, _ in stub.requests if method == "GET"]
+    assert len(gets) == 2 and all("authorization" not in h for h in gets)
+    assert OWN_KEY not in captured.out + captured.err
+    assert (
+        f"running as provider anthropic: your own key from the environment variable {KEY_ENV}, "
+        "which is billed for the model calls"
+    ) in captured.out
+    (line,) = [row for row in captured.out.splitlines() if row.startswith("a.txt")]
+    assert "provider anthropic (credential visitor)" in line
+    assert "totals: 1 requests, 1 ok, 0 failed" in captured.out
+
+
+def test_an_own_key_the_site_echoes_is_not_printed(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", "stub-passcode-value")
+    stub.health["claude"] = {"status": "unavailable", "reason": f"saw {OWN_KEY}"}
+    echoing = own_ok(
+        model=f"model-{OWN_KEY}",
+        picks=({"selector": HAIKU, "status": "failed", "explanation": f"said {OWN_KEY}"},),
+        fallbacks=({"stage": "extract", "from": HAIKU, "to": OWN_KEY, "reason": OWN_KEY},),
+    )
+    stub.answer = lambda body: (
+        error_response(401, "provider_key_refused", f"Anthropic refused {OWN_KEY}")
+        if "bad" in body["text"]
+        else echoing
+    )
+    argv = [*own_argv(stub), "--passcode-env", "CHECK_TEST_PASSCODE"]
+    files = [write(tmp_path, "good.txt", "good"), write(tmp_path, "bad.txt", "bad")]
+    assert check.main([*argv, *files]) == 1
+    assert check.main([*argv, "--burst", "2", files[1]]) == 1
+    captured = capsys.readouterr()
+
+    assert OWN_KEY not in captured.out + captured.err
+    assert "stub-passcode-value" not in captured.out + captured.err
+    assert "provider_key_refused: Anthropic refused [redacted] (sent as provider anthropic)" in (
+        captured.out
+    )
+    assert "failed picks: said [redacted] 1" in captured.out
+    assert '"reason": "saw [redacted]"' in captured.out
+    assert all(h["x-passcode"] == "stub-passcode-value" for h, _ in posts(stub))
+    # The next run in this process, on the site's keys, sends no key and redacts nothing.
+    stub.requests.clear()
+    stub.answer = lambda body: error_response(502, "provider_error", f"{OWN_KEY} again")
+    check.main(["--url", stub.url, files[0]])
+    assert f"{OWN_KEY} again" in capsys.readouterr().out
+    assert all("authorization" not in h for h, _ in posts(stub))
+
+
+@pytest.mark.parametrize(
+    ("argv", "value", "said"),
+    [
+        (["--provider", "openai"], OWN_KEY, "--provider openai needs --key-env"),
+        (["--key-env", KEY_ENV], OWN_KEY, "--key-env needs --provider"),
+        (["--provider", "site", "--key-env", KEY_ENV], OWN_KEY, "--key-env needs --provider"),
+        (["--provider", "openai", "--key-env", KEY_ENV], None, f"{KEY_ENV} is not set"),
+        (["--provider", "openai", "--key-env", KEY_ENV], "", f"{KEY_ENV} is not set"),
+        (["--provider", "openai", "--key-env", KEY_ENV], "too-short", "does not hold an API key"),
+        (
+            ["--provider", "openai", "--key-env", KEY_ENV],
+            "sk-with a space-0123456789abcdef",
+            "does not hold an API key",
+        ),
+        (
+            ["--provider", "openai", "--key-env", KEY_ENV],
+            "sk-not-ascii-\u017e-0123456789abcdef",
+            "does not hold an API key",
+        ),
+        (["--provider", "chatgpt", "--key-env", KEY_ENV], OWN_KEY, "invalid choice"),
+    ],
+)
+def test_own_key_usage_errors_exit_2_before_any_request(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    value: str | None,
+    said: str,
+) -> None:
+    if value is None:
+        monkeypatch.delenv(KEY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KEY_ENV, value)
+    with pytest.raises(SystemExit) as raised:
+        check.main(["--url", stub.url, *argv, write(tmp_path, "a.txt", "a")])
+    captured = capsys.readouterr()
+
+    assert raised.value.code == 2
+    assert said in " ".join(captured.err.split())
+    assert stub.requests == []
+    if value:  # a value that was refused is not shown either
+        assert value not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("url", ["http://example.invalid", "http://192.0.2.1:8765"])
+def test_an_own_key_is_not_sent_over_plain_http_to_another_machine(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    opened: list[object] = []
+    monkeypatch.setattr(check._OPENER, "open", lambda *a, **k: opened.append(a))
+    with pytest.raises(SystemExit) as raised:
+        check.main(
+            ["--url", url, "--provider", "openai", "--key-env", KEY_ENV, write(tmp_path, "a", "a")]
+        )
+    assert raised.value.code == 2
+    assert "--url must be https" in capsys.readouterr().err
+    assert opened == []
+
+
+@pytest.mark.parametrize("own_keys", [None, {"enabled": False, "providers": []}, "listed"])
+def test_an_own_key_is_not_sent_to_a_site_that_does_not_offer_the_provider(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    own_keys: object,
+) -> None:
+    """Own keys off (``NER_SITE_OWN_PROVIDERS=``), an API from before them, or this
+    provider not enabled: the key stays here."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    if own_keys is None:
+        del stub.health["own_keys"]
+    elif own_keys != "listed":  # the stub lists anthropic and openai, not openrouter
+        stub.health["own_keys"] = own_keys
+    file = write(tmp_path, "a.txt", "a")
+    assert check.main([*own_argv(stub, "openrouter"), file]) == 1
+    assert check.main([*own_argv(stub, "openrouter"), "--burst", "3", file]) == 1
+    captured = capsys.readouterr()
+
+    assert "does not offer own keys for openrouter" in captured.out
+    assert "nothing was sent" in captured.out
+    assert [(m, p) for m, p, _, _ in stub.requests] == [("GET", "/api/health")] * 2
+    assert OWN_KEY not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    ("provider", "reply", "said"),
+    [
+        # An own-key request that the site ran on its own keys: the operator paid.
+        ("openai", ok_response(), "the response says provider site, credential site"),
+        ("openai", own_ok("anthropic"), "the response says provider anthropic, credential visitor"),
+        # The reverse: a site request reported as a visitor's.
+        ("site", own_ok("openai", LUNA), "the response says provider openai, credential visitor"),
+    ],
+)
+def test_a_run_on_another_credential_than_asked_for_fails(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    reply: Reply,
+    said: str,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.answer = lambda body: reply
+    argv = ["--url", stub.url] if provider == "site" else own_argv(stub, provider)
+    file = write(tmp_path, "a.txt", "a")
+    assert check.main([*argv, file]) == 1
+    out = capsys.readouterr().out
+    assert f"FAILED wrong credential: asked for provider {provider}" in out and said in out
+    assert "totals: 1 requests, 0 ok, 1 failed" in out
+
+    assert check.main([*argv, "--burst", "2", file]) == 1
+    out = capsys.readouterr().out
+    assert "on the own key 0" in out and "started on Opus 0" in out and "failed 2" in out
+
+
+def test_a_site_response_from_before_the_credential_fields_is_not_a_wrong_credential(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, old = ok_response()
+    del old["provider"], old["credential_source"]
+    stub.answer = lambda body: (status, old)
+    assert check.main(["--url", stub.url, write(tmp_path, "a.txt", "a")]) == 0
+    assert "provider not reported (credential not reported)" in capsys.readouterr().out
+
+
+def test_an_own_key_burst_is_compared_with_the_own_key_balance(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    # No site allowance left at all: an own key is outside it. The day binds the own one.
+    stub.health["visitor"].update(
+        tier="blocked", opus_left=0, sonnet_left=0, own_left=3, own_left_today=3, window="day"
+    )
+    stub.answer = _scripted(
+        [own_ok()] * 3 + [error_response(429, "visitor_limit_reached", OWN_USED)] * 2
+    )
+    file = write(tmp_path, "a.txt", "a")
+    assert check.main([*own_argv(stub), "--burst", "5", file]) == 0
+    out = capsys.readouterr().out
+
+    assert (
+        "burst: 5 parallel requests of a.txt as provider anthropic: started on Opus 0, "
+        "on Sonnet 0, on another model 0, on the own key 3, 429 hour used 0, "
+        "429 day used 0, 429 own-key limit 2, 429 too many at once 0, "
+        "503 limits_unavailable 0, not counted 0, failed 0"
+    ) in out
+    assert (
+        "within the allowance health reported before the burst (own_left 3, own_left_today 3)"
+    ) in out
+    assert all(h["authorization"] == f"Bearer {OWN_KEY}" for h, _ in posts(stub))
+    assert [b for _, b in posts(stub)] == [{"text": "a", "provider": "anthropic"}] * 5
+    assert OWN_KEY not in out
+
+    # One more start than the balance had left.
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), "--burst", "4", file]) == 1
+    out = capsys.readouterr().out
+    assert "OVER THE ALLOWANCE: 4 requests started on own, but own_left was 3" in out
+    assert "within the allowance" not in out
+
+
+@pytest.mark.parametrize("visitor", [None, {"limits": "unavailable", "tier": "blocked"}])
+def test_an_own_key_burst_nothing_counts_has_nothing_to_compare_with(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    visitor: dict[str, Any] | None,
+) -> None:
+    """An own-key request runs when the limiter cannot be asked, uncounted, and health
+    has no ``visitor`` block on a deployment without the Anthropic key."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    if visitor is None:
+        del stub.health["visitor"]
+    else:
+        stub.health["visitor"] = visitor
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), "--burst", "2", write(tmp_path, "a.txt", "a")]) == 1
+    out = capsys.readouterr().out
+
+    assert "on the own key 0" in out and "not counted 2, failed 0" in out
+    assert "NOTHING TO COMPARE WITH" in out
+    assert ("only where Claude is offered on the site's keys" in out) == (visitor is None)
+
+
+def test_an_own_key_burst_fails_when_the_limiter_stopped_answering_during_it(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Such requests run uncounted and their responses do not say so."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+
+    def answer(body: dict[str, Any]) -> Reply:
+        stub.health["visitor"] = {"limits": "unavailable", "tier": "blocked"}
+        return own_ok()
+
+    stub.answer = answer
+    assert check.main([*own_argv(stub), "--burst", "2", write(tmp_path, "a.txt", "a")]) == 1
+    out = capsys.readouterr().out
+
+    assert "on the own key 2" in out
+    assert "THE LIMITER STOPPED ANSWERING" in out and "within the allowance" not in out
 
 
 def test_the_tool_follows_no_redirect(
@@ -686,3 +1052,5 @@ def test_help_says_what_a_run_costs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "counts against your hourly visitor allowance" in out
     assert "spends the balance of the operator's key" in out
     assert "--sequential-delay SECONDS" in out and "--burst N" in out
+    assert "a run with an own key bills that key" in out
+    assert "--provider {site,anthropic,openai,openrouter}" in out and "--key-env NAME" in out

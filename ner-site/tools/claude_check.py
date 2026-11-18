@@ -6,16 +6,27 @@ it.
 
 What it costs to run. Every text is one real ``POST /api/ner``: it spends the balance of
 the key behind the site (the operator's Anthropic balance when the model or the selector
-is Claude, the OpenRouter key otherwise) and it counts against the caller's hourly
-allowance on that site (by default 10 requests starting on Opus, then 20 on Sonnet, then
-429 until the clock hour ends). ``--burst N`` sends N such requests at once.
+is Claude, the OpenRouter key otherwise) and it counts against the caller's allowance on
+that site (by default 10 requests starting on Opus and then 20 on Sonnet in a clock
+hour, 20 and 40 in a UTC day, then 429 until the hour or the day ends). ``--burst N``
+sends N such requests at once.
+
+With ``--provider anthropic|openai|openrouter --key-env NAME`` the model calls run on
+the API key in the environment variable NAME instead, as a visitor's own key would: THAT
+KEY IS BILLED for every model call of the run (the site still pays for the term lookup),
+and the requests count against the own-key flood limit (by default 30 an hour and 60 a
+day) instead of the allowance. The key is sent to the URL you give, as ``Authorization:
+Bearer``, on the ``POST /api/ner`` requests only: use a URL you trust with it. The tool
+refuses to send it over plain http to anything but this machine, and sends nothing when
+``/api/health`` does not offer that provider.
 
 What it does, and nothing else: one ``GET <url>/api/health`` before and one after, and
 one ``POST <url>/api/ner`` per text, to the URL it is given. It follows no redirect,
 writes no file, and reads only the text files named on the command line and, with
-``--passcode-env NAME``, the environment variable NAME (sent as ``X-Passcode``; the
-passcode is never taken from an argument and never printed: should the site echo it,
-it is replaced by ``[redacted]`` in everything this tool prints).
+``--passcode-env NAME`` and ``--key-env NAME``, the environment variables so named (the
+passcode is sent as ``X-Passcode``). Neither secret is ever taken from an argument and
+neither is ever printed: should the site echo one, it is replaced by ``[redacted]`` in
+everything this tool prints.
 
 Usage (standard library only; any Python 3.10 or later)::
 
@@ -24,22 +35,32 @@ Usage (standard library only; any Python 3.10 or later)::
         --passcode-env NER_SITE_PASSCODE --sequential-delay 5 texts/*.txt
     python ner-site/tools/claude_check.py --url https://<deployment> \\
         --selector retrieval --burst 15 short.txt
+    python ner-site/tools/claude_check.py --url https://<deployment> \\
+        --provider openai --key-env MY_OPENAI_KEY one.txt
 
-It prints the health ``claude`` and ``visitor`` blocks, then one line per text: HTTP
-status, round-trip seconds, the model asked for and the model that extracted, the
-selector, the entity count, the picks by status and by the model that made them (and why
+It prints the health ``claude``, ``visitor`` and ``own_keys`` blocks, then one line per
+text: HTTP status, round-trip seconds, the provider and whose credential the site says
+it ran on, the model asked for and the model that extracted, the selector, the entity
+count, the picks by status and by the model that made them (and why
 any failed), every step-down (``stage:from>to:reason``), the server's ``timing_ms`` and
 the token counts; then the totals, the slowest request and the one with the most
-entities. Exit code 1 if any POST failed, 2 for a usage error.
+entities. Exit code 1 if any POST failed, or if a response says it ran on another
+provider or credential than the one asked for; 2 for a usage error.
 
 ``--burst N`` instead sends N copies of the first text in parallel and reports how many
-started on Opus, how many on Sonnet, how many were refused with 429 (the hour used, or
-too many at once: a request that waited too long for its turn at the visitor's lock,
-which is what the tail of a large burst should get) and how many ran uncounted, against
-the allowance ``/api/health`` reported just before. Exit code 1 when more started on a
-tier than that allowance had left (the limiter does not serialise one visitor's
-requests), when more than a fifth of the burst ran uncounted (the limiter is failing),
-when health reported no allowance to compare with, or when a request failed otherwise.
+started on Opus, on Sonnet, on another model or on the own key, how many were refused
+with 429 (the hour used, the day used, the own-key limit, or too many at once: a request
+that waited too long for its turn at the visitor's lock, which is what the tail of a
+large burst should get), how many with 503 ``limits_unavailable`` (the site could not
+count them and so did not run them on its own keys) and how many ran without being
+counted, against the balances ``/api/health`` reported just before (``opus_left``,
+``sonnet_left`` and ``own_left``, each already capped by what is left of the day). A
+start is put under a tier only when health reported the limiter ``on`` before the burst:
+otherwise nothing counted it, and it is reported as not counted. Exit code 1 when more
+started on a tier than its balance had left (the limiter does not serialise one
+visitor's requests), when any request got 503 ``limits_unavailable`` or ran uncounted
+(the limiter is failing), when health reported no balance to compare with, when the
+limiter stopped answering during an own-key burst, or when a request failed otherwise.
 """
 
 from __future__ import annotations
@@ -48,12 +69,13 @@ import argparse
 import http.client
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,14 +92,21 @@ REQUEST_DEADLINE_S = 100  # ner_site.service.REQUEST_DEADLINE_S
 DEFAULT_TIMEOUT_S = 130.0  # Vercel cuts a function off at 120 s
 MAX_BURST = 100
 MAX_MESSAGE_CHARS = 200
-# The message of the 429 a request gets when the visitor's lock was contended
-# (ner_site.http._admit); the code is visitor_limit_reached, as for a used hour.
-TOO_MANY_AT_ONCE = "too many requests at once"
-# The part of a burst that may run uncounted (limits_unavailable) before the limiter is
-# called failing: a single slow answer from its database, not a pattern.
-MAX_UNCOUNTED_SHARE = 0.2
+# How the messages of the 429s start (ner_site.http._admit); the code is
+# visitor_limit_reached for all of them, and anything else is the hour being used.
+TOO_MANY_AT_ONCE = "too many requests at once"  # the visitor's lock was contended
+DAY_USED = "you have used today's requests"
+OWN_KEY_LIMIT = "too many requests with your own key"
+LIMITS_UNAVAILABLE = "limits_unavailable"
+# ner_site.providers: who a request can run as, and what a key looks like.
+SITE = "site"
+OWN_PROVIDERS = ("anthropic", "openai", "openrouter")
+_KEY = re.compile(r"[\x21-\x7e]{20,512}")
+# Where a key may be sent without TLS: this machine (a local server, the tests).
+LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
-# What must never be printed (the passcode of this run), whoever sent it back.
+# What must never be printed (the passcode and the API key of this run), whoever sent
+# it back.
 _REDACTED: list[str] = []
 
 
@@ -172,12 +201,18 @@ def post_text(
     selector: str | None,
     passcode: str | None,
     timeout: float,
+    provider: str = SITE,
+    key: str | None = None,
 ) -> Answer:
+    """One ``POST /api/ner``, as the page sends it: ``provider`` is in the body and the
+    key in ``Authorization`` only for a run on an own key."""
     body: dict[str, Any] = {"text": text}
     if model:
         body["model"] = model
     if selector:
         body["selector"] = selector
+    if provider != SITE:
+        body["provider"] = provider
     headers = {
         "Content-Type": "application/json",
         "X-Requested-With": REQUESTED_WITH,
@@ -185,6 +220,8 @@ def post_text(
     }
     if passcode:
         headers["X-Passcode"] = passcode
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     request = urllib.request.Request(
         base + NER_PATH, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
     )
@@ -233,6 +270,9 @@ def describe(data: dict[str, Any]) -> str:
     usage = _block(data, "usage")
     timing = _block(data, "timing_ms")
     parts = [
+        # Whose key the site says paid for the model calls (absent before own keys).
+        f"provider {data.get('provider') or 'not reported'} "
+        f"(credential {data.get('credential_source') or 'not reported'})",
         f"model {data.get('requested_model') or '?'} -> {data.get('model')}",
         f"selector {data.get('requested_selector') or data.get('selector')}",
         f"entities {len(entities)}",
@@ -252,16 +292,37 @@ def describe(data: dict[str, Any]) -> str:
     return "  ".join(parts)
 
 
-def line(name: str, answer: Answer) -> str:
+def wrong_credential(answer: Answer, provider: str) -> str | None:
+    """Why a 200 is not the run that was asked for: the site says it ran on another
+    provider or on the other credential (an own-key request billed to the site, or the
+    reverse). None when it agrees, and for a site request to an API from before these
+    fields, which reports neither."""
+    if not answer.ok:
+        return None
+    data = answer.data or {}
+    asked = (provider, "site" if provider == SITE else "visitor")
+    said = (data.get("provider"), data.get("credential_source"))
+    if said == asked or (provider == SITE and said == (None, None)):
+        return None
+    return (
+        f"asked for provider {asked[0]} on the {asked[1]} credential, but the response "
+        f"says provider {said[0]}, credential {said[1]}"
+    )
+
+
+def line(name: str, answer: Answer, provider: str = SITE) -> str:
     head = f"{name}  {answer.status or '---'}  {answer.seconds:.1f}s"
     if answer.ok:
         assert answer.data is not None
-        return f"{head}  {describe(answer.data)}"
-    return f"{head}  FAILED {answer.failure()}"
+        wrong = wrong_credential(answer, provider)
+        flag = f"FAILED wrong credential: {wrong}  " if wrong else ""
+        return f"{head}  {flag}{describe(answer.data)}"
+    return f"{head}  FAILED {answer.failure()} (sent as provider {provider})"
 
 
 def print_health(label: str, health: Answer) -> None:
-    """The ``claude`` and ``visitor`` blocks of ``/api/health`` (absent ones say so)."""
+    """The ``claude``, ``visitor`` and ``own_keys`` blocks of ``/api/health`` (absent
+    ones say so)."""
     if health.status != 200 or health.data is None:
         say(f"{label}: FAILED {health.failure()}")
         return
@@ -271,7 +332,7 @@ def print_health(label: str, health: Answer) -> None:
         f"default selector {data.get('default_selector')}, "
         f"passcode_required {data.get('passcode_required')}"
     )
-    for block in ("claude", "visitor"):
+    for block in ("claude", "visitor", "own_keys"):
         value = data.get(block)
         shown = json.dumps(value, sort_keys=True) if value is not None else "absent"
         say(f"  {block}: {shown}")
@@ -301,11 +362,11 @@ class Totals:
         self.slowest: tuple[float, str, Answer] | None = None
         self.largest: tuple[int, str, Answer] | None = None
 
-    def add(self, name: str, answer: Answer) -> None:
+    def add(self, name: str, answer: Answer, provider: str = SITE) -> None:
         self.requests += 1
         if self.slowest is None or answer.seconds > self.slowest[0]:
             self.slowest = (answer.seconds, name, answer)
-        if not answer.ok:
+        if not answer.ok or wrong_credential(answer, provider):
             self.failed += 1
             return
         data = answer.data or {}
@@ -377,61 +438,80 @@ def started_on(data: dict[str, Any]) -> str:
     return "opus" if model == OPUS else "sonnet" if model == SONNET else "other"
 
 
-def run_burst(
-    base: str,
-    name: str,
-    text: str,
-    count: int,
-    before: Answer,
-    *,
-    model: str | None,
-    selector: str | None,
-    passcode: str | None,
-    timeout: float,
-) -> int:
-    """Send `count` copies of one text at once and compare what was granted with the
-    allowance `before` (the health answer just read) reported. Returns the exit code."""
+def offers(health: Answer, provider: str) -> bool:
+    """Whether ``/api/health`` lists `provider` among the own-key providers."""
+    listed = _block(health.data or {}, "own_keys").get("providers")
+    return isinstance(listed, list) and any(
+        isinstance(p, dict) and p.get("id") == provider for p in listed
+    )
 
-    def one(_: int) -> Answer:
-        return post_text(
-            base, text, model=model, selector=selector, passcode=passcode, timeout=timeout
-        )
 
+def send_burst(count: int, post: Callable[[], Answer]) -> list[Answer]:
+    """`count` requests at once."""
     with ThreadPoolExecutor(max_workers=count) as pool:
-        answers = list(pool.map(one, range(count)))
+        return list(pool.map(lambda _: post(), range(count)))
+
+
+def report_burst(
+    name: str, answers: Sequence[Answer], before: Answer, after: Answer, provider: str = SITE
+) -> int:
+    """Say where the parallel requests `answers` started and compare that with the
+    balances `before` (the health answer read just before them) reported; `after` is the
+    health answer read just after. Returns the exit code."""
+    count = len(answers)
+    own = provider != SITE
+    visitor = _block(before.data or {}, "visitor")
+    # Only a limiter that answered can have counted anything. Without this a request
+    # that ran while nothing counted it was tallied under the tier it asked for.
+    comparable = visitor.get("limits") == "on"
 
     tiers: Counter[str] = Counter()
-    uncounted = refused = contended = failed = 0
+    refusals: Counter[str] = Counter()
+    uncounted = legacy = unavailable = failed = 0
+    unavailable_message = ""
     for answer in answers:
         if answer.ok:
             assert answer.data is not None
-            if any(f.get("reason") == "limits_unavailable" for f in _fallbacks(answer.data)):
+            if wrong_credential(answer, provider):
+                failed += 1
+                say(line(name, answer, provider))
+            elif any(f.get("reason") == LIMITS_UNAVAILABLE for f in _fallbacks(answer.data)):
+                legacy += 1
+            elif not comparable:
                 uncounted += 1
             else:
-                tiers[started_on(answer.data)] += 1
+                tiers["own" if own else started_on(answer.data)] += 1
         elif answer.status == 429 and answer.code == "visitor_limit_reached":
-            error = _block(answer.data or {}, "error")
-            if str(error.get("message", "")).startswith(TOO_MANY_AT_ONCE):
-                contended += 1
-            else:
-                refused += 1
+            message = str(_block(answer.data or {}, "error").get("message", ""))
+            refusals[
+                "contended"
+                if message.startswith(TOO_MANY_AT_ONCE)
+                else "own"
+                if message.startswith(OWN_KEY_LIMIT)
+                else "day"
+                if message.startswith(DAY_USED)
+                else "hour"
+            ] += 1
+        elif answer.status == 503 and answer.code == LIMITS_UNAVAILABLE:
+            unavailable += 1
+            unavailable_message = answer.failure()
         else:
             failed += 1
-            say(line(name, answer))
+            say(line(name, answer, provider))
     say(
-        f"burst: {count} parallel requests of {name}: started on Opus {tiers['opus']}, "
-        f"on Sonnet {tiers['sonnet']}, on another model {tiers['other']}, "
-        f"429 hour used {refused}, 429 too many at once {contended}, "
-        f"uncounted (limits_unavailable) {uncounted}, failed {failed}"
+        f"burst: {count} parallel requests of {name} as provider {provider}: "
+        f"started on Opus {tiers['opus']}, on Sonnet {tiers['sonnet']}, "
+        f"on another model {tiers['other']}, on the own key {tiers['own']}, "
+        f"429 hour used {refusals['hour']}, 429 day used {refusals['day']}, "
+        f"429 own-key limit {refusals['own']}, 429 too many at once {refusals['contended']}, "
+        f"503 limits_unavailable {unavailable}, not counted {uncounted + legacy}, "
+        f"failed {failed}"
     )
 
-    visitor = (before.data or {}).get("visitor")
-    comparable = isinstance(visitor, dict) and visitor.get("limits") == "on"
-    failing = uncounted > count * MAX_UNCOUNTED_SHARE
+    balances = (("own", "own_left"),) if own else (("opus", "opus_left"), ("sonnet", "sonnet_left"))
     over = False
     if comparable:
-        assert isinstance(visitor, dict)
-        for tier, key in (("opus", "opus_left"), ("sonnet", "sonnet_left")):
+        for tier, key in balances:
             left = visitor.get(key)
             if isinstance(left, int) and tiers[tier] > left:
                 over = True
@@ -443,32 +523,54 @@ def run_burst(
         say(
             "  NOTHING TO COMPARE WITH: health reported no visitor block with limits on "
             "before the burst, so this run says nothing about the allowance"
+            + (f", and the {uncounted} requests that ran were not counted" if uncounted else "")
+            + (
+                " (health reports `visitor` only where Claude is offered on the site's keys)"
+                if own and not visitor
+                else ""
+            )
         )
-    if failing:
+    if unavailable:
         say(
-            f"  THE LIMITER IS FAILING: {uncounted} of {count} requests ran on Sonnet "
-            "uncounted (limits_unavailable). The reason is the SQLSTATE in the `limits` "
-            "field of each such request's log line; 40001 means the database endpoint "
-            "does not run the limiter's transaction at READ COMMITTED"
+            f"  THE LIMITER IS FAILING: {unavailable} of {count} requests were refused with "
+            f"503 ({unavailable_message}): the site could not count them, and it runs no "
+            "request on its own keys uncounted. `visitor limits are not configured` means "
+            "the deployment has no DATABASE_URL. Otherwise the reason is the error class "
+            "and SQLSTATE in the `limits` field of each such request's log line; 40001 "
+            "means the database endpoint does not run the limiter's transaction at READ "
+            "COMMITTED"
         )
-    elif uncounted:
+    if legacy:
         say(
-            f"  {uncounted} of {count} requests ran on Sonnet uncounted "
-            "(limits_unavailable): the limiter's database did not answer them; the "
-            "SQLSTATE is in the `limits` field of their log lines"
+            f"  THE LIMITER IS FAILING: {legacy} of {count} requests ran uncounted with a "
+            "`limits_unavailable` step-down. A site that does that runs code from before "
+            "18 November 2026 (the current code answers 503 instead); the reason is in "
+            "the `limits` field of their log lines"
         )
-    if contended:
+    stopped = False
+    if own and comparable and _block(after.data or {}, "visitor").get("limits") != "on":
+        stopped = True
         say(
-            f"  {contended} requests were refused because too many arrived at once: "
-            "expected for the tail of a large burst, and not counted against the hour"
+            "  THE LIMITER STOPPED ANSWERING: health reported no visitor block with limits "
+            "on after the burst. An own-key request runs uncounted when the limiter cannot "
+            "be asked, and its response does not say so: the starts above may not have "
+            "been counted"
         )
-    if comparable and not over and not failing:
-        assert isinstance(visitor, dict)
+    if refusals["contended"]:
         say(
-            "  within the allowance health reported before the burst "
-            f"(opus_left {visitor.get('opus_left')}, sonnet_left {visitor.get('sonnet_left')})"
+            f"  {refusals['contended']} requests were refused because too many arrived at "
+            "once: expected for the tail of a large burst, and not counted against the "
+            "allowance"
         )
-    return 1 if failed or over or failing or not comparable else 0
+    bad = bool(failed or over or unavailable or legacy or stopped or not comparable)
+    if comparable and not (over or unavailable or legacy or stopped):
+        # The hourly balances are what the starts are compared with; the day's are shown
+        # because they cap them (an API from before the daily cap reports none).
+        keys = [key for _, key in balances]
+        keys += [f"{key}_today" for key in keys if f"{key}_today" in visitor]
+        shown = ", ".join(f"{key} {visitor.get(key)}" for key in keys)
+        say(f"  within the allowance health reported before the burst ({shown})")
+    return 1 if bad else 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -480,8 +582,12 @@ def _parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Each run makes real requests: every text counts against your hourly visitor "
-            "allowance on that site and spends the balance of the operator's key behind "
-            "it (Anthropic for Claude models, OpenRouter for the others)."
+            "allowance on that site (and against the daily one) and spends the balance of "
+            "the operator's key behind it (Anthropic for Claude models, OpenRouter for "
+            "the others). With --provider and --key-env the model calls are billed to "
+            "the API key in that environment variable instead (a run with an own key "
+            "bills that key), and the requests count against the own-key flood limit. The "
+            "key is sent to the given URL as Authorization: Bearer; it is never printed."
         ),
     )
     parser.add_argument("--url", required=True, help="the site, e.g. http://127.0.0.1:8765")
@@ -490,9 +596,27 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="name of the environment variable that holds the passcode (sent as X-Passcode)",
     )
-    parser.add_argument("--model", help="extraction model id; default: the site's default")
     parser.add_argument(
-        "--selector", help="selector (retrieval, jev or a model id); default: the site's default"
+        "--provider",
+        choices=(SITE, *OWN_PROVIDERS),
+        default=SITE,
+        help="whose key runs the models: the site's (default), or your own key for that "
+        "provider, which needs --key-env and bills that key",
+    )
+    parser.add_argument(
+        "--key-env",
+        metavar="NAME",
+        help="name of the environment variable that holds your own API key for --provider "
+        "(sent as Authorization: Bearer on POST /api/ner; this key pays for the model calls)",
+    )
+    parser.add_argument(
+        "--model",
+        help="extraction model id; default: the site's default, or the provider's with an own key",
+    )
+    parser.add_argument(
+        "--selector",
+        help="selector (retrieval, jev or a model id; with an own key retrieval or one of "
+        "the provider's models); default: the site's default, or retrieval with an own key",
     )
     parser.add_argument(
         "--sequential-delay",
@@ -507,7 +631,7 @@ def _parser() -> argparse.ArgumentParser:
         default=0,
         metavar="N",
         help="send N copies of the first file in parallel and count where they started "
-        "(Opus, Sonnet, 429); the other files are not sent",
+        "(Opus, Sonnet, the own key, 429, 503); the other files are not sent",
     )
     parser.add_argument(
         "--timeout",
@@ -538,7 +662,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         passcode = os.environ.get(args.passcode_env) or None
         if passcode is None:
             parser.error(f"the environment variable {args.passcode_env} is not set")
-    _REDACTED[:] = [passcode] if passcode else []
+    key: str | None = None
+    if args.provider == SITE:
+        if args.key_env:
+            parser.error("--key-env needs --provider anthropic, openai or openrouter")
+    else:
+        if not args.key_env:
+            parser.error(f"--provider {args.provider} needs --key-env NAME (your own API key)")
+        key = os.environ.get(args.key_env) or None
+        if key is None:
+            parser.error(f"the environment variable {args.key_env} is not set")
+        if _KEY.fullmatch(key) is None:  # what the site accepts; the value is not shown
+            parser.error(
+                f"the environment variable {args.key_env} does not hold an API key of 20 to "
+                "512 printable ASCII characters without spaces"
+            )
+        if parts.scheme != "https" and parts.hostname not in LOOPBACK:
+            parser.error("--key-env sends an API key: --url must be https (or this machine)")
+    # Longest first, so that one secret inside the other leaves no remainder behind.
+    _REDACTED[:] = sorted((s for s in (passcode, key) if s), key=len, reverse=True)
     texts: list[tuple[str, str]] = []
     for file in args.files:
         try:
@@ -548,29 +690,55 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     before = get_health(base, timeout=args.timeout)
     print_health("health", before)
-    common = {
-        "model": args.model,
-        "selector": args.selector,
-        "passcode": passcode,
-        "timeout": args.timeout,
-    }
+    provider: str = args.provider
+    say(
+        f"running as provider {provider}: "
+        + (
+            f"your own key from the environment variable {args.key_env}, which is billed "
+            "for the model calls"
+            if key
+            else "the site's keys"
+        )
+    )
+    if key and not offers(before, provider):
+        # The key goes nowhere that has not said it takes one.
+        say(
+            f"FAILED: /api/health at this URL does not offer own keys for {provider} "
+            "(see own_keys above), so nothing was sent and the key did not leave this machine"
+        )
+        return 1
+
+    def post(text: str) -> Answer:
+        return post_text(
+            base,
+            text,
+            model=args.model,
+            selector=args.selector,
+            passcode=passcode,
+            timeout=args.timeout,
+            provider=provider,
+            key=key,
+        )
 
     if args.burst:
         name, text = texts[0]
-        code = run_burst(base, name, text, args.burst, before, **common)
+        answers = send_burst(args.burst, lambda: post(text))
+        after = get_health(base, timeout=args.timeout)
+        code = report_burst(name, answers, before, after, provider)
     else:
         totals = Totals()
         for index, (name, text) in enumerate(texts):
             if index and args.sequential_delay:
                 time.sleep(args.sequential_delay)
-            answer = post_text(base, text, **common)
-            totals.add(name, answer)
-            say(line(name, answer))
+            answer = post(text)
+            totals.add(name, answer, provider)
+            say(line(name, answer, provider))
             sys.stdout.flush()
         totals.print()
         code = 1 if totals.failed else 0
+        after = get_health(base, timeout=args.timeout)
 
-    print_health("health after", get_health(base, timeout=args.timeout))
+    print_health("health after", after)
     return code
 
 
