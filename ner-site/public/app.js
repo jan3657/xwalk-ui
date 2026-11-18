@@ -26,6 +26,11 @@
   // removed on "Forget key" and whenever the provider changes, and it leaves the page
   // only as the Authorization header of POST /api/ner.
   const OWN_KEY_ENTRY = "xwalk-ner-own-key";
+  // That the visitor chose to pay with an own key, and for which provider: the provider
+  // id alone, never the key. It outlives the key (which is forgotten when its provider
+  // is no longer offered), so that no number of reloads turns that choice into a run on
+  // the site's keys. Only the visitor choosing the site's models removes it.
+  const PAYER_ENTRY = "xwalk-ner-payer";
   const PROVIDER_NAMES = { anthropic: "Anthropic", openai: "OpenAI", openrouter: "OpenRouter" };
   // What the server accepts as a key: 20 to 512 printable ASCII characters, no spaces.
   const KEY_SHAPE = /^[\x21-\x7e]{20,512}$/;
@@ -395,6 +400,19 @@
     storageSet(OWN_KEY_ENTRY, "");
   }
 
+  // The own-key provider the visitor last chose in this tab ("" for the site's models).
+  // A key kept from before this entry existed counts as that choice.
+  function savedPayer() {
+    const chosen = storageGet(PAYER_ENTRY);
+    if (chosen && chosen !== "site") return chosen;
+    const kept = storedKey();
+    return kept ? kept.provider : "";
+  }
+
+  function rememberPayer(providerId) {
+    storageSet(PAYER_ENTRY, providerId && providerId !== "site" ? providerId : "");
+  }
+
   // ---------- who pays ----------
 
   // A run goes to the site's models unless an own-key provider is chosen, so a choice
@@ -402,21 +420,22 @@
   // (and the visitor's text to a model they did not pick). While a saved own-key
   // choice is unsettled nothing is submitted, by the button or by the keyboard, and
   // the visitor is told why. Only an explicit choice lifts it: the saved choice coming
-  // back, "Use the site's models", or another pick under "Run with".
+  // back, "Use the site's models", or another pick under "Run with". The choice is
+  // kept in PAYER_ENTRY, so the hold is back after every reload until then.
   function holdRuns(kind, providerId) {
     // Only a name this page knows is shown; session storage is not trusted further.
     const known = Object.prototype.hasOwnProperty.call(PROVIDER_NAMES, providerId);
     const key = known ? `${PROVIDER_NAMES[providerId]} key` : "API key";
     state.payer = { kind, provider: providerId };
     if (kind === "pending") {
-      el.payerMsg.textContent = `Checking whether your saved ${key} can still be used on this site. Runs wait for that.`;
+      el.payerMsg.textContent = `You chose to run on your own ${key}. Checking whether it can still be used on this site; runs wait for that.`;
     } else if (kind === "unknown") {
       el.payerMsg.textContent =
-        `The service status could not be loaded, so this page cannot tell whether your saved ${key} can still be used. ` +
+        `You chose to run on your own ${key}, but the service status could not be loaded, so this page cannot tell whether it can still be used. ` +
         'Nothing has run. Try again, or choose "Use the site\'s models" to forget the key and run on the site\'s models (free, limited).';
     } else {
       el.payerMsg.textContent =
-        `This site no longer accepts your own ${key}, so the saved key has been forgotten. Nothing has run on the site's models. ` +
+        `This site no longer accepts your own ${key}, so the key has been forgotten. Nothing has run on the site's models. ` +
         'Choose "Use the site\'s models" to run on them (free, limited)' +
         (state.providers.length ? ', or pick another key under "Run with".' : ".");
     }
@@ -443,22 +462,28 @@
     el.runWith.hidden = state.providers.length === 0;
   }
 
-  // The "Run with" choice. A key kept from earlier in this tab (a reload) brings its
-  // provider back with it. A kept key for a provider no longer offered is dropped, and
-  // the visitor is asked before anything runs on the site's models in its place.
+  // The "Run with" choice. An own-key choice made earlier in this tab comes back after
+  // a reload, with its key when one is kept. When its provider is no longer offered the
+  // key is dropped, the choice stays on record, and the visitor is asked (again after
+  // every reload) before anything runs on the site's models in its place.
   function fillProviders(health) {
     state.providers = ownProviders(health);
     fillProviderOptions();
+    const chosen = savedPayer();
     const kept = storedKey();
-    if (kept && state.providers.some((p) => p.id === kept.provider)) {
-      el.provider.value = kept.provider;
-      el.ownKey.value = kept.key;
+    if (chosen && state.providers.some((p) => p.id === chosen)) {
+      el.provider.value = chosen;
+      el.ownKey.value = kept && kept.provider === chosen ? kept.key : "";
+      if (!el.ownKey.value) forgetKey();
+      rememberPayer(chosen);
       releaseRuns();
     } else {
       el.provider.value = "site";
       forgetKey();
-      if (kept) holdRuns("lost", kept.provider);
-      else releaseRuns();
+      if (chosen) {
+        rememberPayer(chosen);
+        holdRuns("lost", chosen);
+      } else releaseRuns();
     }
   }
 
@@ -493,6 +518,7 @@
     forgetKey();
     el.provider.value = "site";
     applyProvider();
+    rememberPayer(chosen.id); // still the visitor's choice, until they make another
     holdRuns("lost", chosen.id);
   }
 
@@ -648,11 +674,11 @@
     }
   }
 
-  // Until health has answered, a key kept from earlier in this tab has no "Run with"
-  // choice to go with it, and a run would go to the site's models: runs are held.
+  // Until health has answered, an own-key choice made earlier in this tab has no "Run
+  // with" field to show it, and a run would go to the site's models: runs are held.
   async function loadHealth() {
-    const kept = storedKey();
-    if (kept) holdRuns("pending", kept.provider);
+    const chosen = savedPayer();
+    if (chosen) holdRuns("pending", chosen);
     try {
       applyHealth(await api("GET", "/api/health"));
     } catch (err) {
@@ -661,9 +687,9 @@
       el.modelField.hidden = true;
       renderLegend();
       updateCounter();
-      // Still kept (the visitor may have chosen the site's models while waiting).
-      const still = storedKey();
-      if (still) holdRuns("unknown", still.provider);
+      // Still chosen (the visitor may have picked the site's models while waiting).
+      const still = savedPayer();
+      if (still) holdRuns("unknown", still);
       else releaseRuns();
     }
   }
@@ -1080,11 +1106,13 @@
   // session storage, before anything else happens.
   el.provider.addEventListener("change", () => {
     forgetKey();
+    rememberPayer(el.provider.value);
     applyProvider();
     releaseRuns(); // the visitor has chosen who pays
   });
   el.payerSite.addEventListener("click", () => {
     forgetKey();
+    rememberPayer("site");
     el.provider.value = "site";
     if (state.health) applyProvider();
     releaseRuns();
