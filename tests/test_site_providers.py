@@ -1530,7 +1530,6 @@ async def test_only_a_fixed_set_of_response_headers_reaches_the_http_library(
         ("Retry-After", f"7; {KEY}"),
         ("Retry-After", "1e9"),
         ("Retry-After-Ms", "-1"),
-        ("Content-Encoding", "x-made-up"),
         ("Content-Length", "2, 2"),
         ("Content-Type", f"text/html; charset={KEY}"),
     ],
@@ -1642,3 +1641,174 @@ async def test_a_fault_inside_an_adapter_is_not_dressed_up_as_the_providers(
         await llm.complete(REQUEST)
     await llm.aclose()
     assert wire.requests == []
+
+
+# --- third review round: compressed answers, unreadable answers, the budget's memory ----
+
+
+def answer_body(provider: str) -> bytes:
+    model = MODELS[provider]
+    body = message_body(model) if provider == "anthropic" else chat_body(model)
+    return json.dumps(body).encode()
+
+
+def raw_answer(provider: str, content: bytes, **headers: str) -> Any:
+    """An answer as a real transport hands it over: an unread stream, still encoded."""
+    lib: Any = httpx2 if provider == "anthropic" else httpx
+    return lambda request: lib.Response(
+        200,
+        headers={"Content-Type": "application/json", **headers},
+        stream=lib.ByteStream(content),
+    )
+
+
+@pytest.mark.parametrize(
+    "coding", ["gzip", "GZip", "GZIP", " gzip ", "gzip, identity", "Identity,GZip"]
+)
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_compressed_answer_is_read_whatever_the_case_of_its_coding(
+    provider: str, coding: str
+) -> None:
+    """Coding names are case-insensitive (RFC 9110). A header kept only in one spelling
+    left the body compressed, and the bytes went to the JSON parser as they were."""
+    import gzip
+
+    wire = Wire(
+        provider,
+        raw_answer(provider, gzip.compress(answer_body(provider)), **{"Content-Encoding": coding}),
+    )
+    llm = build(wire)
+    response = await llm.complete(REQUEST)
+    await llm.aclose()
+    assert response.text == '{"entities": []}'
+
+
+@pytest.mark.parametrize("coding", ["deflate", "Deflate"])
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_deflated_answer_is_read(provider: str, coding: str) -> None:
+    import zlib
+
+    wire = Wire(
+        provider,
+        raw_answer(provider, zlib.compress(answer_body(provider)), **{"Content-Encoding": coding}),
+    )
+    llm = build(wire)
+    response = await llm.complete(REQUEST)
+    await llm.aclose()
+    assert response.text == '{"entities": []}'
+
+
+@pytest.mark.parametrize(
+    "coding", ["x-made-up", "gzip, x-made-up", "x-gzip", "compress", f"gzip, {KEY}", "gzip;q=1"]
+)
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_an_answer_in_a_coding_that_cannot_be_decoded_is_a_fixed_failure(
+    provider: str, coding: str
+) -> None:
+    """Not dropped in silence: the body would reach the parser still encoded."""
+    import gzip
+
+    wire = Wire(
+        provider,
+        raw_answer(provider, gzip.compress(answer_body(provider)), **{"Content-Encoding": coding}),
+    )
+    llm = build(wire, call_cap=1)
+    with pytest.raises(LLMError) as caught:
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert str(caught.value) == f"{PROVIDER_NAMES[provider]} request failed (bad_answer)"
+    assert failure_word(caught.value) == "bad_answer"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert provider_error(caught.value, provider).status == 502
+    assert len(wire.requests) == 1
+
+
+UNREADABLE = {
+    "malformed": b'{"id": "msg_1", "content": [',
+    "truncated": b'{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"te',
+    "empty": b"",
+    "not utf-8": b'\xff\xfe{"a":1}',
+    "echoing": ('{"error": "' + KEY + '", ').encode(),
+}
+WRONG_SHAPE = {
+    "a list": b"[1, 2]",
+    "a string": b'"hello"',
+    "null": b"null",
+    "content is a string": b'{"content": "x", "choices": "no"}',
+    "content of numbers": b'{"content": [1, 2], "choices": [1]}',
+}
+
+
+@pytest.mark.parametrize("body", list(UNREADABLE), ids=list(UNREADABLE))
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_200_that_is_not_json_is_the_providers_bad_answer(provider: str, body: str) -> None:
+    """Narrowing what is sealed (round 2) let the SDK's ``JSONDecodeError`` through for
+    Anthropic, and an extraction answered 500. What a provider sends that cannot be
+    decoded is the provider's failure; a bug in this code still is not."""
+    wire = Wire(provider, raw_answer(provider, UNREADABLE[body]))
+    llm = build(wire, call_cap=1)
+    with pytest.raises(LLMError) as caught:
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert str(caught.value) == f"{PROVIDER_NAMES[provider]} request failed (bad_answer)"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    error = provider_error(caught.value, provider)
+    assert (error.status, error.code) == (502, "provider_error")
+    assert leaks(strings(error) + str(caught.value)) == []
+
+
+@pytest.mark.parametrize("body", list(WRONG_SHAPE), ids=list(WRONG_SHAPE))
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_200_of_the_wrong_shape_is_never_an_unexpected_exception(
+    provider: str, body: str
+) -> None:
+    """JSON, but not an answer: a fixed failure, or an empty answer the stage refuses
+    (422), as before. Never something that leaves as a 500."""
+    wire = Wire(provider, raw_answer(provider, WRONG_SHAPE[body]))
+    llm = build(wire, call_cap=1)
+    try:
+        response = await llm.complete(REQUEST)
+    except LLMError as exc:
+        assert str(exc) == f"{PROVIDER_NAMES[provider]} request failed (bad_answer)"
+    else:
+        assert response.text == ""
+    await llm.aclose()
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_fault_in_an_adapter_leaves_no_message_in_the_call_budget(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine's budget remembers how its last call ended, as ``Class: message``, and
+    quotes it later. A fault that is not sealed still must not leave its message there."""
+    import gc
+
+    def broken(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise KeyError(f"diagnostic with {KEY}")
+
+    if provider == "anthropic":
+        monkeypatch.setattr(ClaudeClient, "_arguments", broken)
+    else:
+        monkeypatch.setattr(providers.OpenAICompatClient, "_headers", broken)
+    llm = build(Wire(provider), call_cap=2)
+    for _ in range(2):
+        with pytest.raises(KeyError):
+            await llm.complete(REQUEST)
+    budget = llm.budget
+    seen: set[int] = set()
+    stack: list[Any] = [budget]
+    while stack:
+        item = stack.pop()
+        if id(item) in seen or isinstance(item, type):
+            continue
+        seen.add(id(item))
+        if isinstance(item, (str, bytes)):
+            assert (KEY if isinstance(item, str) else KEY.encode()) not in item, item
+        elif isinstance(item, (dict, list, tuple, set)) or item is budget:
+            stack.extend(gc.get_referents(item))
+    assert KEY not in repr(vars(budget)) and KEY not in budget.limit_message()
+    assert "KeyError" in repr(vars(budget)) if provider == "anthropic" else True
+    with pytest.raises(LLMError) as caught:  # the limit, in fixed words
+        await llm.complete(REQUEST)
+    assert KEY not in str(caught.value)
+    await llm.aclose()

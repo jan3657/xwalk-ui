@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -489,18 +490,25 @@ class _NotSent(RuntimeError):
     """Raised inside the transport; replaced by :class:`WireRefused` before it leaves."""
 
 
-def _not_sent(exc: BaseException) -> bool:
-    """Whether `exc` is, or was raised because of, a request the wire refused. The SDK
-    and the adapter wrap what a transport raises, so the causes and contexts are
-    followed. This is asked of one call's own error: a client is shared by picks that
-    run at the same time, and a flag on the client would blame them all."""
+class _Unreadable(Exception):
+    """What a provider sent back cannot be decoded: a body in a coding the HTTP library
+    does not know (raised by the wire), or a 200 from Anthropic that is not JSON
+    (raised around the SDK call, ``_OwnClaude``). Replaced by a fixed ``bad_answer``
+    failure before it leaves. The message is fixed; nothing of the answer is in it."""
+
+
+def _raised_from(exc: BaseException, kind: type[BaseException]) -> bool:
+    """Whether `exc` is, or was raised because of, an exception of `kind`. The SDK and
+    the adapter wrap what a transport raises, so the causes and contexts are followed.
+    This is asked of one call's own error: a client is shared by picks that run at the
+    same time, and a flag on the client would blame them all."""
     seen: set[int] = set()
     stack: list[BaseException | None] = [exc]
     while stack:
         item = stack.pop()
         if item is None or id(item) in seen:
             continue
-        if isinstance(item, _NotSent):
+        if isinstance(item, kind):
             return True
         seen.add(id(item))
         stack += [item.__cause__, item.__context__]
@@ -525,16 +533,14 @@ _PROVIDER_FAILURES: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     TimeoutError,
     _NotSent,
+    _Unreadable,
 )
 
 # The response headers that reach the HTTP library, each only in this form. Everything
 # else a provider sends in a header is dropped at the wire.
 _RESPONSE_HEADERS: dict[bytes, re.Pattern[bytes]] = {
-    # The body's size and coding: the library needs the coding to read the body.
+    # The body's size. Its coding is handled apart (``_Wire._coding``).
     b"content-length": re.compile(rb"[0-9]{1,12}"),
-    b"content-encoding": re.compile(
-        rb"(?:gzip|deflate|br|zstd|identity)(?:, ?(?:gzip|deflate|br|zstd|identity))*"
-    ),
     # Read by the engine's client and the Claude adapter (seconds), and by the SDK.
     b"retry-after": re.compile(rb"[0-9]{1,6}(?:\.[0-9]{1,3})?"),
     b"retry-after-ms": re.compile(rb"[0-9]{1,9}"),
@@ -566,7 +572,8 @@ class _Wire:
       there on a warm instance after the client is closed.
     - any other response keeps its status and body and gets a new set of headers
       (``_headers_for``): a content type that is one of two fixed strings, and the
-      few headers of ``_RESPONSE_HEADERS`` that have exactly their strict form.
+      few headers of ``_RESPONSE_HEADERS`` that have exactly their strict form, and
+      the body's content coding in the spelling the library decodes (``_coding``).
       Searching the headers for the key is not enough: a charset is looked up through
       ``codecs``, and ``encodings`` remembers every name it did not find, also one
       that arrived encoded (``charset*=utf-8''%73%6B...``) and was decoded by the
@@ -619,7 +626,7 @@ class _Wire:
                 return False
         return True
 
-    def _headers_for(self, response: Any) -> Any:
+    def _headers_for(self, response: Any, request: Any) -> Any:
         """The headers the HTTP library is given for `response`."""
         seen: dict[bytes, list[bytes]] = {}
         for name, value in response.headers.raw:
@@ -636,7 +643,33 @@ class _Wire:
             values = seen.get(name, [])
             if len(values) == 1 and pattern.fullmatch(values[0]) is not None:
                 kept.append((name, values[0]))
+        coding = self._coding(seen.get(b"content-encoding", []), request)
+        if coding:
+            kept.append((b"content-encoding", coding))
         return self._headers(kept)
+
+    @staticmethod
+    def _coding(values: Sequence[bytes], request: Any) -> bytes:
+        """The body's content codings in the one spelling the HTTP library decodes:
+        lower case, comma and space between them. Coding names are case-insensitive
+        and the library compares them as they come, so ``GZip`` would leave the body
+        compressed. A coding the client did not offer in its own ``Accept-Encoding``
+        (that header is the library's list of what it can decode), or anything that
+        is not a plain list of names, cannot be decoded: ``_Unreadable``, not a body
+        handed on still encoded."""
+        offered = {"identity"}
+        for value in request.headers.get_list("accept-encoding", split_commas=True):
+            offered.add(value.split(";", 1)[0].strip().lower())
+        names: list[bytes] = []
+        for value in values:
+            for part in value.split(b","):
+                name = part.strip().lower()
+                if not name:
+                    continue
+                if name.decode("latin-1") not in offered:
+                    raise _Unreadable("the answer is in a content coding that cannot be decoded")
+                names.append(name)
+        return b", ".join(names)
 
     async def handle_async_request(self, request: Any) -> Any:
         if not self._allowed(request):
@@ -645,7 +678,11 @@ class _Wire:
         if 300 <= response.status_code < 400:
             await response.aclose()
             return self._response(response.status_code, request=request)
-        response.headers = self._headers_for(response)
+        try:
+            response.headers = self._headers_for(response, request)
+        except _Unreadable:
+            await response.aclose()
+            raise
         return response
 
     async def aclose(self) -> None:
@@ -720,7 +757,7 @@ class _Sealed:
             response = await self._inner.complete(request)
         except _PROVIDER_FAILURES as exc:
             failure = _seal(exc, self._provider)
-            if _not_sent(exc):
+            if _raised_from(exc, _NotSent):
                 # Not a provider's failure: the request never left (``_Wire``). The
                 # libraries report it as a dropped connection; say what it was.
                 failure = WireRefused(
@@ -728,6 +765,14 @@ class _Sealed:
                     usage=getattr(failure, "usage", None),
                 )
                 failure.reason = "error"  # type: ignore[attr-defined]
+            elif _raised_from(exc, _Unreadable):
+                # An answer arrived and could not be decoded; the libraries report
+                # that too as a dropped connection, or not at all.
+                failure = LLMRetryableError(
+                    f"{_name(self._provider)} request failed (bad_answer)",
+                    usage=getattr(failure, "usage", None),
+                )
+                failure.reason = "bad_answer"  # type: ignore[attr-defined]
         else:
             return self._clean(response)
         # Raised out here, not inside the handler, so that the original is neither the
@@ -746,6 +791,34 @@ class _SealedGated(_Sealed):
 
     def attach_call_budget(self, budget: CallBudget) -> None:
         self._inner.attach_call_budget(_QuietBudget(budget))  # type: ignore[attr-defined]
+
+
+class _NamesOnly(CallBudget):
+    """A call budget that remembers how a call ended by the class of its error and
+    nothing more. The engine's ``BudgetedLLM`` settles a failed call with ``Class:
+    message`` and the budget quotes that when it later refuses a call; the message of
+    an error that was not sealed (a fault of this code) may hold anything."""
+
+    def settle(self, index: int, error: str | None) -> None:
+        if error is not None:
+            name = error.split(":", 1)[0]
+            error = name if name.isidentifier() else "error"
+        super().settle(index, error)
+
+
+class _OwnClaude(ClaudeClient):
+    """The Claude adapter on a visitor's key. A 200 whose body is not JSON makes the
+    SDK raise the decoder's own error (``JSONDecodeError``, ``UnicodeDecodeError``),
+    which is no ``anthropic`` error and would otherwise pass for a fault of this code.
+    Only the SDK call is covered: an error of those classes raised while the request
+    is built or the answer is read is still a bug, and is left alone."""
+
+    async def _send(self, arguments: dict[str, Any]) -> Any:
+        try:
+            return await super()._send(arguments)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            failure = _Unreadable("the answer is not JSON")
+        raise failure
 
 
 class _Budgeted(BudgetedLLM):
@@ -893,7 +966,7 @@ def _claude(
     sdk._custom_headers = {}  # noqa: SLF001 - ANTHROPIC_CUSTOM_HEADERS, see above
     _own_headers_only(sdk.default_headers, key)
     wire.expect(_sdk_wire_headers(sdk, http, timeout))
-    client = ClaudeClient(
+    client = _OwnClaude(
         model,
         api_key=key,
         max_tokens=EXTRACT_MAX_TOKENS if purpose == EXTRACT else SELECT_MAX_TOKENS,
@@ -976,7 +1049,7 @@ def own_llm(
         raise ValueError("not a provider a visitor's key can be used with")
     if purpose not in (EXTRACT, SELECT):
         raise ValueError("purpose must be 'extract' or 'select'")
-    budget = CallBudget(limit=call_cap if purpose == EXTRACT else max_entities * 2)
+    budget = _NamesOnly(limit=call_cap if purpose == EXTRACT else max_entities * 2)
     if credential.provider == "anthropic":
         from ner_site import service  # at call time: service imports this module
 

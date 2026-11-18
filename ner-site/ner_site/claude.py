@@ -482,10 +482,16 @@ class ClaudeClient:
             arguments["system"] = request.system
         return arguments
 
+    async def _send(self, arguments: dict[str, Any]) -> Any:
+        """The SDK call alone, apart from building its arguments and reading its
+        answer, so that a subclass can tell what the SDK raised from what this
+        adapter did (``providers._OwnClaude``)."""
+        return await self._client.beta.messages.create(**arguments)
+
     async def complete(self, request: LLMRequest) -> ClaudeResponse:
         """Send one Messages request. Never retries; errors carry ``reason``."""
         try:
-            message = await self._client.beta.messages.create(**self._arguments(request))
+            message = await self._send(self._arguments(request))
         except anthropic.APIError as exc:
             raise _translate(exc, self._api_key) from None
 

@@ -2956,3 +2956,79 @@ def test_a_bug_inside_a_real_adapter_is_not_reported_as_the_providers_failure(
         assert record["own_error"] == "KeyError"
     for text in (json.dumps(record), result[2].decode(), str(result[1])):
         assert OWN_KEY not in text and json.dumps(OWN_KEY)[1:-1] not in text
+
+
+# --- third review round ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("refused", ["haloperidol", "ketamine"])
+def test_a_refusal_among_other_failed_picks_is_what_the_log_names(
+    refused: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One pick is stopped by the site's own guard, the others fail at the provider,
+    in whatever order. The provider failing is ordinary; the guard refusing is what the
+    operator has to see, so it is not hidden behind whichever failure came first."""
+    import httpx2
+    from ner_site import providers
+
+    def respond(request: Any, pick: bool) -> Any:
+        if pick:
+            return httpx2.Response(
+                500, json={"type": "error", "error": {"type": "api_error", "message": "no"}}
+            )
+        return _claude_message(_three_drugs())
+
+    seen = _real_own_clients(monkeypatch, respond)
+    real = providers._Wire._allowed
+
+    def one_refused(self: Any, request: Any) -> bool:
+        body = json.loads(request.content)
+        is_pick = "chosen_key" in request.content.decode()
+        mention = f"Mention: {refused}" in json.dumps(body) or f"[{refused}]" in json.dumps(body)
+        return not (is_pick and mention) and real(self, request)
+
+    monkeypatch.setattr(providers._Wire, "_allowed", one_refused)
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "anthropic", "text": PICKS_TEXT, "selector": "claude-haiku-5-5"},
+        headers=OWN_HEADERS,
+    )
+    assert result[0] == 200, result[2]
+    picks = [e["pick"] for e in _json(result)["entities"] if e.get("pick")]
+    assert len(picks) == 2 and all(p["status"] == "failed" for p in picks)
+    assert sorted(p["explanation"] for p in picks) == ["error", "http_5xx"]
+    assert len(seen) == 2  # the extraction and the one pick that was sent
+    record = _last_log(capsys)
+    assert record["own_error"] == "WireRefused"
+    assert record["own_errors"] == ["LLMRetryableError", "WireRefused"]
+
+
+def test_a_malformed_200_during_extraction_is_the_providers_bad_answer_not_a_500(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import httpx2
+
+    _real_own_clients(
+        monkeypatch,
+        lambda request, pick: httpx2.Response(
+            200, headers={"Content-Type": "application/json"}, content=b'{"content": ['
+        ),
+    )
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "anthropic", "text": PICKS_TEXT},
+        headers=OWN_HEADERS,
+    )
+    assert _error(result) == (502, "provider_error")
+    assert _json(result)["error"]["message"] == (
+        "Anthropic could not complete the request (bad_answer)."
+    )
+    record = _last_log(capsys)
+    assert record["own_error"] == "LLMRetryableError" and "exception" not in record

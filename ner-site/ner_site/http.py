@@ -527,7 +527,14 @@ class _OwnJSONClient:
     what was raised), here because this is the one place both stages pass: a failed
     extraction becomes an error response, but a failed pick is part of a 200, and
     without this a request the site itself refused to send would leave no trace.
+    Picks fail side by side and for different reasons. ``own_error`` is the first
+    class seen, except that ``WireRefused`` (the site's own guard stopped a request)
+    takes its place whenever it occurs: a provider failing is ordinary, that is not.
+    When there was more than one class, ``own_errors`` lists them all, sorted, at
+    most ``MAX_OWN_ERRORS``.
     """
+
+    MAX_OWN_ERRORS = 8
 
     def __init__(
         self, client: LLMClient, credential: providers.Credential, log: dict[str, Any]
@@ -548,6 +555,15 @@ class _OwnJSONClient:
     def fingerprint(self) -> str:
         return self._client.fingerprint
 
+    def _failed(self, name: str) -> None:
+        log = self._log
+        first = log.get("own_error")
+        seen = sorted({*log.get("own_errors", [first] if first else []), name})
+        if len(seen) > 1:
+            log["own_errors"] = seen[: self.MAX_OWN_ERRORS]
+        if first is None or name == providers.WireRefused.__name__:
+            log["own_error"] = name
+
     @property
     def budget(self) -> Any:
         """The call budget of the client underneath, which counts every request it
@@ -558,7 +574,7 @@ class _OwnJSONClient:
         try:
             answer = await self._client.complete(request)
         except Exception as exc:
-            self._log.setdefault("own_error", type(exc).__name__)
+            self._failed(type(exc).__name__)
             raise
         key = self._token()
         if "\\" not in answer.text and key not in answer.text:
@@ -782,7 +798,8 @@ def handle(
     except Exception as exc:  # noqa: BLE001 - a 500 with no detail; type and place to the log
         frames = traceback.extract_tb(exc.__traceback__)
         log["code"] = "internal"
-        log.pop("own_error", None)  # not a provider's failure: `exception` says what
+        for name in ("own_error", "own_errors"):  # not a provider's: `exception` says what
+            log.pop(name, None)
         log["exception"] = type(exc).__name__
         log["where"] = [f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}:{f.name}" for f in frames]
         result = _error(
