@@ -43,6 +43,7 @@ the API key.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -80,6 +81,9 @@ SELECT_MAX_TOKENS = 8000
 EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# What the SDK raises for a 200 whose body it cannot decode: the decoders' own errors,
+# not an ``anthropic`` one. Caught around the SDK call only (``ClaudeClient._send``).
+UNREADABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
 MAX_MESSAGE_CHARS = 500
 
 
@@ -318,6 +322,8 @@ def _translate(exc: anthropic.APIError, api_key: str) -> LLMError:
     client's timeout)
     other 5xx, 408, 409, other connection      LLMRetryableError transient
     errors, an answer the SDK could not read
+    (a 200 that cannot be decoded at all is
+    raised as the same, in ``_send``)
     other 4xx                                  LLMFatalError     bad_request
     ========================================== ================= =================
 
@@ -484,9 +490,25 @@ class ClaudeClient:
 
     async def _send(self, arguments: dict[str, Any]) -> Any:
         """The SDK call alone, apart from building its arguments and reading its
-        answer, so that a subclass can tell what the SDK raised from what this
-        adapter did (``providers._OwnClaude``)."""
-        return await self._client.beta.messages.create(**arguments)
+        answer, so that what the SDK raised can be told from what this adapter did.
+
+        A 200 whose body cannot be decoded makes the SDK raise the decoder's own error
+        (``UNREADABLE``), which is no ``anthropic`` error. Here, and only here, such an
+        error is the provider's answer being unreadable (``_unreadable``); the same
+        class raised while the request is built or the answer is read is a bug of this
+        code and is left alone."""
+        try:
+            return await self._client.beta.messages.create(**arguments)
+        except UNREADABLE:
+            failure = self._unreadable()
+        # Raised out here: the decoder's error quotes the body it could not read.
+        raise failure
+
+    def _unreadable(self) -> Exception:
+        """What an undecodable 200 is raised as. On the site's key a ``transient``
+        failure, like a 5xx: the chain tries the model once more and then steps down.
+        Fixed words; nothing of the body. (``providers._OwnClaude`` says it its way.)"""
+        return _retryable("transient", "Anthropic answered 200 with a body that is not JSON")
 
     async def complete(self, request: LLMRequest) -> ClaudeResponse:
         """Send one Messages request. Never retries; errors carry ``reason``."""

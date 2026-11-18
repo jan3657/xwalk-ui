@@ -3032,3 +3032,116 @@ def test_a_malformed_200_during_extraction_is_the_providers_bad_answer_not_a_500
     )
     record = _last_log(capsys)
     assert record["own_error"] == "LLMRetryableError" and "exception" not in record
+
+
+# --- an unreadable 200 on the site's own Anthropic key (after the third review round) ---
+
+
+def _site_claude(script: dict[str, list[bytes | None]], seen: list[str]) -> Any:
+    """The real adapter and SDK on the operator's key over a mock Anthropic. `script`
+    gives each model its answers in order: bytes are sent as the 200 body as they are,
+    None is a good answer; the last one repeats."""
+    import anthropic
+    import httpx2
+    from ner_site.claude import ClaudeClient
+
+    def handler(request: Any) -> Any:
+        model = json.loads(request.content)["model"]
+        seen.append(model)
+        steps = script[model]
+        step = steps.pop(0) if len(steps) > 1 else steps[0]
+        if step is not None:
+            return httpx2.Response(200, headers={"Content-Type": "application/json"}, content=step)
+        body = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": HALO}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+        }
+        return httpx2.Response(200, json=body)
+
+    def factory(settings: Settings, model: str, purpose: str) -> Any:
+        sdk = anthropic.AsyncAnthropic(
+            api_key=ANTHROPIC_KEY,
+            max_retries=0,
+            http_client=anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)),
+        )
+        return ClaudeClient(model, api_key=ANTHROPIC_KEY, max_tokens=1000, client=sdk)
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    "body", [b'{"content": [', b"", b"\xff\xfe{", b'{"id":"msg_1","content":[{"type":"te']
+)
+def test_an_unreadable_200_from_opus_twice_ends_on_sonnet_with_a_notice(
+    body: bytes,
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 200 whose body cannot be decoded is the provider failing, as a 5xx is: the
+    chain tries the model once more and then moves on. It used to be a 500."""
+    seen: list[str] = []
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"text": HALO_TEXT},
+        claude=_site_claude({OPUS: [body], SONNET: [None]}, seen),
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert seen == [OPUS, OPUS, SONNET]
+    assert (out["model"], out["requested_model"]) == (SONNET, OPUS)
+    assert out["fallbacks"] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": "transient"}
+    ]
+    assert out["notices"] == ["Claude Opus 5.5 did not answer; this ran on Claude Sonnet 5.5."]
+    assert out["entities"][0]["text"] == "haloperidol"
+    assert out["usage"]["llm_calls"] == 3 and out["usage"]["prompt_tokens"] is None
+    record = _last_log(capsys)
+    assert record["status"] == 200 and "exception" not in record
+
+
+def test_an_unreadable_200_from_opus_once_is_retried_and_stays_on_opus(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    seen: list[str] = []
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"text": HALO_TEXT},
+        claude=_site_claude({OPUS: [b'{"content": [', None], SONNET: [None]}, seen),
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert seen == [OPUS, OPUS]
+    assert out["model"] == OPUS and out["fallbacks"] == [] and out["notices"] == []
+
+
+def test_a_fault_in_the_site_adapter_is_still_a_500(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only what the SDK raises while decoding the answer is translated. The same
+    class of error from the adapter's own code is a bug and stays one."""
+    from ner_site.claude import ClaudeClient
+
+    def broken(self: Any, request: Any) -> Any:
+        return json.loads("{not json")
+
+    monkeypatch.setattr(ClaudeClient, "_arguments", broken)
+    seen: list[str] = []
+    result = _ask(
+        _open_site(cache_dir, tmp_path),
+        {"text": HALO_TEXT},
+        claude=_site_claude({OPUS: [None], SONNET: [None]}, seen),
+    )
+    assert _error(result) == (500, "internal")
+    assert seen == [] and _last_log(capsys)["exception"] == "JSONDecodeError"

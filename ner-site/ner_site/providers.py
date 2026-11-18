@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -807,18 +806,13 @@ class _NamesOnly(CallBudget):
 
 
 class _OwnClaude(ClaudeClient):
-    """The Claude adapter on a visitor's key. A 200 whose body is not JSON makes the
-    SDK raise the decoder's own error (``JSONDecodeError``, ``UnicodeDecodeError``),
-    which is no ``anthropic`` error and would otherwise pass for a fault of this code.
-    Only the SDK call is covered: an error of those classes raised while the request
-    is built or the answer is read is still a bug, and is left alone."""
+    """The Claude adapter on a visitor's key. The adapter itself decides what is a 200
+    that cannot be decoded (``ClaudeClient._send``, around the SDK call only); here it
+    is said as on the other two providers, ``bad_answer``, where the site's key calls
+    it ``transient`` for its fallback chain. There is no chain on a visitor's key."""
 
-    async def _send(self, arguments: dict[str, Any]) -> Any:
-        try:
-            return await super()._send(arguments)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            failure = _Unreadable("the answer is not JSON")
-        raise failure
+    def _unreadable(self) -> Exception:
+        return _Unreadable("the answer is not JSON")
 
 
 class _Budgeted(BudgetedLLM):
