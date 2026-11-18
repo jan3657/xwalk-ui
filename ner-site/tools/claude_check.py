@@ -72,6 +72,7 @@ balance fell by less than the starts (``NOT COUNTED``), when any request got 503
 ``limits_unavailable`` or ran uncounted (the limiter is failing), when a request failed
 otherwise, and also when the run is ``INCONCLUSIVE``: health could not establish the
 count. That is the case when health reported no limiter that was on, before or after;
+when no request of the burst started at all (every one refused: nothing to count);
 when the hour or the day ended during the burst; when a balance fell by more than the
 starts (something else used the same visitor's allowance: run the burst alone); for
 requests that use no Claude model, which no balance shows; and for an own-key burst on
@@ -154,23 +155,43 @@ def _spellings(secret: str) -> list[str]:
     return sorted(found, key=len, reverse=True)
 
 
+def _unescaped(text: str) -> str:
+    """`text` with its percent escapes resolved, also ones written in lower case, for
+    only some characters, or more than once."""
+    for _ in range(4):
+        resolved = urllib.parse.unquote(text, errors="replace")
+        if resolved == text:
+            break
+        text = resolved
+    return text
+
+
+def _spelled_in(text: str, shortest: int) -> bool:
+    return any(
+        spelling in candidate
+        for secret in _REDACTED
+        if len(secret) >= shortest
+        for candidate in (text, _unescaped(text))
+        for spelling in _spellings(secret)
+    )
+
+
 def _redact(text: str, *, shortest: int = 1) -> str:
+    """`text` without the secrets of this run. A spelling this tool can name is cut
+    out where it stands. A secret that only shows once the percent escapes are
+    resolved has no fixed spelling to cut (any character may be escaped, in either
+    case, any number of times), so the whole value is withheld."""
     for secret in _REDACTED:
         if len(secret) >= shortest:
             for spelling in _spellings(secret):
                 text = text.replace(spelling, "[redacted]")
-    return text
+    return "[redacted]" if _spelled_in(text, shortest) else text
 
 
 def _holds(text: str) -> bool:
     """Whether `text` holds a secret of this run (one long enough to look for) in any
-    spelling."""
-    return any(
-        spelling in text
-        for secret in _REDACTED
-        if len(secret) >= MIN_ECHO_CHARS
-        for spelling in _spellings(secret)
-    )
+    spelling, percent escapes of any kind resolved."""
+    return _spelled_in(text, MIN_ECHO_CHARS)
 
 
 def _scrub(data: Any) -> tuple[Any, bool]:
@@ -681,12 +702,26 @@ def report_burst(
                     else ""
                 )
             )
+        elif was.keys() != now.keys():
+            inconclusive = True
+            say(
+                "  INCONCLUSIVE: health reported different fields before and after the "
+                "burst (one answer has `day_resets_in_s` and the other does not), so the "
+                "two cannot be compared; run it again"
+            )
         elif any(now[reset] > was[reset] for reset in was if reset.endswith("resets_in_s")):
             inconclusive = True
             say(
                 "  INCONCLUSIVE: the hour or the day ended during the burst (a reset is "
                 "further away after it than before), so the balances before and after "
                 "are of different windows; run it again"
+            )
+        elif not sum(tiers.values()):
+            inconclusive = True
+            say(
+                "  INCONCLUSIVE: no request of the burst started, so there was nothing "
+                "for the limiter to count and nothing this run can show about it; run it "
+                "again when requests can start (after the 429s it reported have passed)"
             )
         else:
             # Requests on no Claude model use the site's total, which can pull both
@@ -973,7 +1008,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             say(
                 f"credential echo check: none of the {len(responses)} responses contained "
                 "the API key or the passcode this run sent, in any spelling this tool knows "
-                "(as it is, JSON-escaped, percent-encoded), in a body or a header"
+                "(as it is, JSON-escaped, percent-escaped in any form), in a body or a header"
             )
     return code
 

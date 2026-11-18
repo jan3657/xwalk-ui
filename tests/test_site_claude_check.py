@@ -1530,3 +1530,79 @@ def test_a_balance_that_rose_during_a_burst_is_inconclusive(
     assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) != 0
     out = capsys.readouterr().out
     assert "INCONCLUSIVE: sonnet_left rose from 20 to 25" in out and "NOT COUNTED" not in out
+
+
+# --- second review round ------------------------------------------------------------------
+
+
+def lower_percent(text: str) -> str:
+    """Every character percent-escaped with lower-case hex digits: valid, and not what
+    ``urllib.parse.quote`` writes."""
+    return "".join(f"%{ord(char):02x}" for char in text)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        lower_percent,
+        lambda key: lower_percent(key[:8]) + key[8:],
+        lambda key: lower_percent(lower_percent(key)),
+        lambda key: key.replace("-", "%2d"),
+    ],
+    ids=["lowercase", "partly", "twice", "dashes-only"],
+)
+@pytest.mark.parametrize("where", ["error", "run", "health"])
+def test_a_percent_escaped_echo_in_any_case_is_caught_and_not_printed(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: Callable[[str], str],
+    where: str,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, QUOTED_KEY)
+    echo = spelling(QUOTED_KEY)
+    reply = error_response(401, "provider_key_refused", f"refused {echo} by upstream")
+    if where == "run":
+        reply = own_ok(
+            picks=({"selector": HAIKU, "status": "failed", "explanation": f"said {echo}"},)
+        )
+    elif where == "health":
+        stub.health["claude"] = {"status": "ok", "reason": f"saw {echo}"}
+        reply = own_ok()
+    stub.answer = lambda body: reply
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 1
+    captured = capsys.readouterr()
+    shown = captured.out + captured.err
+    assert echo not in shown and QUOTED_KEY not in shown
+    assert lower_percent(QUOTED_KEY[:8]) not in shown and "%2d" not in shown
+    assert ECHO_SAID in shown and "credential echo check: FAILED" in shown
+
+
+def test_a_burst_that_was_refused_entirely_certifies_nothing(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Five slots left, every request turned away at the lock, the balances unchanged:
+    zero starts match a fall of zero, which shows nothing about counting."""
+    stub.health["visitor"].update(opus_left=5, sonnet_left=20)
+    stub.answer = lambda body: error_response(429, "visitor_limit_reached", TOO_MANY)
+    assert check.main(["--url", stub.url, "--burst", "5", write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+    assert "started on Opus 0, on Sonnet 0" in out and "429 too many at once 5" in out
+    assert "INCONCLUSIVE: no request of the burst started" in out
+    assert "and counted" not in out and "within the allowance" not in out
+
+
+@pytest.mark.parametrize("missing", ["day_resets_in_s", "resets_in_s"])
+def test_health_snapshots_with_different_reset_fields_are_inconclusive_not_a_crash(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str], missing: str
+) -> None:
+    def answer(body: dict[str, Any]) -> Reply:
+        stub.health["visitor"].pop(missing, None)
+        stub.health["visitor"]["opus_left"] = 5
+        return ok_response()
+
+    stub.answer = answer
+    assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) == 1
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE" in out and "and counted" not in out
