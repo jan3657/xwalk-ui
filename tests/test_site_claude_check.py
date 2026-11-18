@@ -310,6 +310,99 @@ def test_a_site_that_does_not_answer_is_a_failure_not_a_crash(
     assert "a.txt  ---  " in out and "FAILED no response" in out
 
 
+@pytest.mark.parametrize(
+    ("reply", "named"),
+    [
+        (b"this is not HTTP\r\n\r\n", "BadStatusLine"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{", "IncompleteRead"),
+    ],
+)
+def test_a_broken_http_answer_is_a_failed_request_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], reply: bytes, named: str
+) -> None:
+    """``http.client`` raises these outside ``OSError``; they must not end the run."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    stop = threading.Event()
+
+    def serve() -> None:
+        listener.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                continue
+            with connection:
+                try:
+                    connection.settimeout(2)
+                    connection.recv(65536)
+                    connection.settimeout(0.1)  # a POST's body may come separately
+                    try:
+                        while connection.recv(65536):
+                            pass
+                    except TimeoutError:
+                        pass
+                    connection.sendall(reply)
+                    connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        files = [write(tmp_path, "a.txt", "a"), write(tmp_path, "b.txt", "b")]
+        code = check.main(["--url", url, "--timeout", "5", *files])
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        listener.close()
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert f"health: FAILED no response ({named}" in out
+    # Each file is still asked and gets its own line.
+    for name in ("a.txt", "b.txt"):
+        (line,) = [row for row in out.splitlines() if row.startswith(name)]
+        assert f"FAILED no response ({named}" in line
+    assert "totals: 2 requests, 0 ok, 2 failed" in out
+
+
+def test_a_passcode_the_site_echoes_is_not_printed(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "stub-passcode-value"
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", secret)
+    stub.health["claude"] = {"status": "unavailable", "reason": f"saw {secret}"}
+    echoing = ok_response(
+        picks=({"selector": OPUS, "status": "failed", "explanation": f"upstream said {secret}"},),
+        fallbacks=({"stage": "extract", "from": OPUS, "to": SONNET, "reason": secret},),
+    )
+    stub.answer = lambda body: (
+        error_response(401, "passcode_invalid", f"{secret} is not correct")
+        if "bad" in body["text"]
+        else echoing
+    )
+    argv = ["--url", stub.url, "--passcode-env", "CHECK_TEST_PASSCODE"]
+    files = [write(tmp_path, "good.txt", "good"), write(tmp_path, "bad.txt", "bad")]
+    assert check.main([*argv, *files]) == 1
+    assert check.main([*argv, "--burst", "2", files[1]]) == 1
+    captured = capsys.readouterr()
+
+    assert secret not in captured.out + captured.err
+    assert "passcode_invalid: [redacted] is not correct" in captured.out
+    assert "failed picks: upstream said [redacted] 1" in captured.out
+    assert '"reason": "saw [redacted]"' in captured.out
+    # The next run in this process, without a passcode, redacts nothing.
+    stub.answer = lambda body: error_response(502, "provider_error", f"{secret} again")
+    check.main(["--url", stub.url, files[0]])
+    assert f"{secret} again" in capsys.readouterr().out
+
+
 def test_the_passcode_comes_from_the_named_environment_variable(
     stub: Stub,
     tmp_path: Path,
@@ -393,12 +486,109 @@ def test_burst_counts_where_the_parallel_requests_started(
     assert code == 0
     assert (
         "burst: 7 parallel requests of first.txt: started on Opus 2, on Sonnet 2, "
-        "on another model 0, 429 visitor_limit_reached 2, uncounted (limits_unavailable) 1, "
-        "failed 0"
+        "on another model 0, 429 hour used 2, 429 too many at once 0, "
+        "uncounted (limits_unavailable) 1, failed 0"
     ) in out
     assert "within the allowance health reported before the burst" in out
-    assert "uncounted requests ran on Sonnet outside the allowance" in out
+    # One in seven is tolerated (a slow database for one request), and still said.
+    assert "1 of 7 requests ran on Sonnet uncounted" in out
     assert [body for _, body in posts(stub)] == [{"text": "first"}] * 7
+
+
+UNCOUNTED = {"stage": "admit", "from": OPUS, "to": SONNET, "reason": "limits_unavailable"}
+TOO_MANY = "too many requests at once; try again in a few seconds"  # ner_site.http._admit
+
+
+def test_burst_counts_a_contended_lock_apart_and_does_not_fail_on_it(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The tail of a large burst waits too long for the visitor's lock and is refused
+    with 429: the limiter doing its work, not the hour being used and not a failure."""
+    stub.health["visitor"].update(opus_left=10, sonnet_left=20)
+    stub.answer = _scripted(
+        [ok_response()] * 3
+        + [error_response(429, "visitor_limit_reached", TOO_MANY)] * 4
+        + [error_response(429, "visitor_limit_reached", "try again in 23 minutes")]
+    )
+    code = check.main(["--url", stub.url, "--burst", "8", write(tmp_path, "a.txt", "a")])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "started on Opus 3, on Sonnet 0" in out
+    assert "429 hour used 1, 429 too many at once 4, uncounted (limits_unavailable) 0" in out
+    assert "within the allowance health reported before the burst" in out
+    assert "refused because too many arrived at once" in out
+
+
+def test_burst_fails_when_most_of_it_ran_uncounted(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What a limiter that fails under concurrency looks like (Neon's batch endpoint not
+    at READ COMMITTED, SQLSTATE 40001): one start on Opus, the rest on Sonnet uncounted.
+    Nothing is over the allowance, and that is exactly why it must not pass."""
+    stub.health["visitor"].update(opus_left=10, sonnet_left=20)
+    stub.answer = _scripted(
+        [ok_response()] + [ok_response(model=SONNET, fallbacks=(UNCOUNTED,))] * 2
+    )
+    code = check.main(["--url", stub.url, "--burst", "3", write(tmp_path, "a.txt", "a")])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "started on Opus 1, on Sonnet 0" in out and "uncounted (limits_unavailable) 2" in out
+    assert "within the allowance" not in out
+    assert "THE LIMITER IS FAILING: 2 of 3 requests ran on Sonnet uncounted" in out
+    assert "40001" in out and "`limits`" in out
+
+
+@pytest.mark.parametrize(
+    "visitor",
+    [
+        None,
+        {"limits": "unavailable", "tier": "sonnet", "opus_left": 0, "sonnet_left": 20},
+        {"limits": "off", "tier": "opus", "opus_left": 10, "sonnet_left": 20},
+    ],
+    ids=["absent", "unavailable", "off"],
+)
+def test_burst_fails_when_there_is_no_allowance_to_compare_with(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    visitor: dict[str, Any] | None,
+) -> None:
+    if visitor is None:
+        del stub.health["visitor"]
+    else:
+        stub.health["visitor"] = visitor
+    code = check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "started on Opus 2" in out
+    assert "NOTHING TO COMPARE WITH" in out and "within the allowance" not in out
+
+
+def test_started_on_falls_back_to_the_selector_when_the_model_is_not_claude() -> None:
+    """A request for an OpenRouter extraction with a Claude selector is admitted on the
+    selector's tier (``ner_site.http._admit``)."""
+
+    def data(model: str, selector: str, *fallbacks: dict[str, str]) -> dict[str, Any]:
+        return {
+            "model": model,
+            "requested_model": model,
+            "requested_selector": selector,
+            "fallbacks": list(fallbacks),
+        }
+
+    assert check.started_on(data(GEMINI, OPUS)) == "opus"
+    assert check.started_on(data(GEMINI, SONNET)) == "sonnet"
+    assert check.started_on(data(GEMINI, OPUS, ADMIT_SONNET)) == "sonnet"
+    assert check.started_on(data(GEMINI, "jev")) == "other"
+    assert check.started_on(data(GEMINI, "retrieval")) == "other"
+    assert check.started_on(data(OPUS, SONNET)) == "opus"  # the model decides when it is Claude
+    assert check.started_on(data(SONNET, OPUS)) == "sonnet"
+    # A response from before `requested_*`: what it has.
+    assert check.started_on({"model": GEMINI, "selector": OPUS}) == "opus"
+    assert check.started_on({"model": OPUS}) == "opus"
 
 
 def test_burst_fails_when_more_started_on_opus_than_the_allowance_had_left(
@@ -430,7 +620,7 @@ def test_burst_fails_on_an_answer_that_is_neither_a_run_nor_the_visitor_limit(
 
     assert code == 1
     assert "FAILED provider_error: upstream" in out
-    assert "429 visitor_limit_reached 0, uncounted (limits_unavailable) 0, failed 1" in out
+    assert "429 too many at once 0, uncounted (limits_unavailable) 0, failed 1" in out
 
 
 def test_the_tool_follows_no_redirect(

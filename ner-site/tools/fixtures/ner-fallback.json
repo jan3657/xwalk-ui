@@ -433,10 +433,14 @@
     "entity 'Hydroxykynurenine' dropped: not found in text"
   ],
   "usage": {
-    "llm_calls": 14,
-    "prompt_tokens": 9240,
-    "completion_tokens": 2310,
-    "embedding_requests": 10
+    "llm_calls": 2,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "embedding_requests": 10,
+    "selector_calls": 14,
+    "selector_prompt_tokens": null,
+    "selector_completion_tokens": null,
+    "selector_cost_usd": null
   },
   "timing_ms": {
     "extract": 6400,

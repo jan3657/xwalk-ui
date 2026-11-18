@@ -206,3 +206,37 @@ def test_a_service_error_may_carry_response_headers() -> None:
         "ok": False,
         "error": {"code": "visitor_limit_reached", "message": "x"},
     }
+
+
+@pytest.mark.parametrize(
+    ("name", "llm_calls", "known"),
+    [("ner.json", 1, True), ("ner-sonnet.json", 1, True), ("ner-fallback.json", 2, False)],
+)
+def test_the_claude_fixtures_show_the_usage_the_server_sends(
+    name: str, llm_calls: int, known: bool
+) -> None:
+    """The page is developed against ``tools/fixtures``: ``llm_calls`` counts extraction
+    calls only (never more than the call cap), the picks are under ``selector_calls``
+    with their own tokens, a provider that reports no cost leaves ``selector_cost_usd``
+    null, and tokens are null once a call (a failed one) did not report them."""
+    from pathlib import Path
+
+    fixtures = Path(__file__).resolve().parents[1] / "ner-site" / "tools" / "fixtures"
+    data = json.loads((fixtures / name).read_text(encoding="utf-8"))
+    response = NerResponse.model_validate(data)
+    assert response.model_dump(mode="json") == data  # nothing missing, nothing extra
+    usage, raw = response.usage, data["usage"]
+    assert set(raw) == set(Usage.model_fields)
+    picks = sum(1 for entity in response.entities if entity.pick is not None)
+    assert usage.llm_calls == llm_calls <= Limits().llm_call_cap
+    assert picks > 0 and usage.selector_calls >= picks
+    assert usage.selector_cost_usd is None
+    tokens = (
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.selector_prompt_tokens,
+        usage.selector_completion_tokens,
+    )
+    assert all(isinstance(t, int) and t > 0 for t in tokens) if known else tokens == (None,) * 4
+    if known:
+        assert usage.selector_calls == picks
