@@ -1,7 +1,12 @@
 {
   "ok": true,
-  "model": "openai/gpt-4o-mini",
+  "model": "claude-opus-5-5",
+  "requested_model": "claude-opus-5-5",
   "mode": "live",
+  "selector": "claude-opus-5-5",
+  "requested_selector": "claude-opus-5-5",
+  "fallbacks": [],
+  "notices": [],
   "entities": [
     {
       "id": "e1",
@@ -40,7 +45,17 @@
           "url": "https://meshb.nlm.nih.gov/record/ui?ui=C562659"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "MESH:D000474",
+        "label": "Alkaptonuria",
+        "url": "https://meshb.nlm.nih.gov/record/ui?ui=D000474",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e2",
@@ -70,7 +85,17 @@
           "url": "https://meshb.nlm.nih.gov/record/ui?ui=C536836"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "MESH:C536081",
+        "label": "Hydroxykynureninuria",
+        "url": "https://meshb.nlm.nih.gov/record/ui?ui=C536081",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e3",
@@ -100,7 +125,17 @@
           "url": "https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:107736"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "CHEBI:5613",
+        "label": "haloperidol",
+        "url": "https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:5613",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e4",
@@ -130,7 +165,17 @@
           "url": "https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:38867"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "CHEBI:6121",
+        "label": "ketamine",
+        "url": "https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:6121",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e5",
@@ -159,7 +204,17 @@
           "url": "https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:38867"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "no_match",
+        "id": null,
+        "label": null,
+        "url": null,
+        "confidence": 0.9,
+        "explanation": "No candidate is aspirin; the closest are broader classes."
+      },
+      "more": []
     },
     {
       "id": "e6",
@@ -171,7 +226,9 @@
       "matches": [],
       "notes": [
         "no ontology for type 'other'"
-      ]
+      ],
+      "pick": null,
+      "more": []
     },
     {
       "id": "e7",
@@ -192,7 +249,17 @@
           "url": "https://www.ncbi.nlm.nih.gov/gene/10"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "NCBIGene:10",
+        "label": "NAT2",
+        "url": "https://www.ncbi.nlm.nih.gov/gene/10",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e8",
@@ -213,7 +280,17 @@
           "url": "https://www.ncbi.nlm.nih.gov/gene/100"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "NCBIGene:100",
+        "label": "ADA",
+        "url": "https://www.ncbi.nlm.nih.gov/gene/100",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e9",
@@ -243,7 +320,17 @@
           "url": "http://purl.obolibrary.org/obo/FOODON_00003855"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "FOODON:00003049",
+        "label": "hummus",
+        "url": "http://purl.obolibrary.org/obo/FOODON_00003049",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     },
     {
       "id": "e10",
@@ -264,7 +351,17 @@
           "url": "http://purl.obolibrary.org/obo/FOODON_00003582"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "review",
+        "id": "FOODON:00003582",
+        "label": "garlic bulb",
+        "url": "http://purl.obolibrary.org/obo/FOODON_00003582",
+        "confidence": 0.62,
+        "explanation": "The text says garlic; the candidate is the bulb specifically."
+      },
+      "more": []
     },
     {
       "id": "e11",
@@ -295,7 +392,17 @@
           "url": "http://purl.obolibrary.org/obo/FOODON_00003024"
         }
       ],
-      "notes": []
+      "notes": [],
+      "pick": {
+        "selector": "claude-opus-5-5",
+        "status": "match",
+        "id": "FOODON:00003396",
+        "label": "cumin seed",
+        "url": "http://purl.obolibrary.org/obo/FOODON_00003396",
+        "confidence": 0.97,
+        "explanation": "The label matches the mention exactly."
+      },
+      "more": []
     }
   ],
   "retrieval": {
@@ -310,14 +417,15 @@
     "entity 'Hydroxykynurenine' dropped: not found in text"
   ],
   "usage": {
-    "llm_calls": 1,
-    "prompt_tokens": 431,
-    "completion_tokens": 212,
+    "llm_calls": 11,
+    "prompt_tokens": 9240,
+    "completion_tokens": 2310,
     "embedding_requests": 10
   },
   "timing_ms": {
-    "extract": 1840,
+    "extract": 6400,
     "map": 620,
-    "total": 2470
+    "select": 9800,
+    "total": 16850
   }
 }

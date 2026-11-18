@@ -1,0 +1,74 @@
+{
+  "ok": true,
+  "mode": "live",
+  "default_model": "claude-opus-5-5",
+  "models": [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
+  ],
+  "selectors": [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "jev",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
+  ],
+  "default_selector": "claude-opus-5-5",
+  "limits": {
+    "max_chars": 5000,
+    "max_prompt_chars": 4000,
+    "max_entities": 25,
+    "top_k_max": 10
+  },
+  "passcode_required": false,
+  "default_prompt": "Extract every mention of a chemical compound or drug (chemical), a disease or disorder (disease), a gene or protein (gene), and a food or ingredient (food). Label anything else notable as other. Keep each mention exactly as written in the text. Do not nest or overlap mentions. Return at most 25.",
+  "ontologies": [
+    {
+      "slug": "chebi-sample",
+      "name": "ChEBI (sample)",
+      "type": "chemical",
+      "count": 200
+    },
+    {
+      "slug": "ctd-disease-sample",
+      "name": "CTD diseases / MeSH (sample)",
+      "type": "disease",
+      "count": 200
+    },
+    {
+      "slug": "ncbi-gene-sample",
+      "name": "NCBI Gene (sample)",
+      "type": "gene",
+      "count": 200
+    },
+    {
+      "slug": "foodon-sample",
+      "name": "FoodOn (sample)",
+      "type": "food",
+      "count": 200
+    }
+  ],
+  "retrieval": {
+    "bm25": {
+      "status": "ok"
+    },
+    "dense": {
+      "status": "ok"
+    }
+  },
+  "llm": {
+    "status": "ok"
+  },
+  "claude": {
+    "status": "ok"
+  },
+  "visitor": {
+    "limits": "on",
+    "tier": "sonnet",
+    "opus_left": 0,
+    "sonnet_left": 14,
+    "resets_in_s": 1380
+  }
+}

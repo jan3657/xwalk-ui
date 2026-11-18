@@ -15,6 +15,11 @@
 
   const TYPES = ["chemical", "disease", "gene", "food", "other"];
   const DEFAULT_LIMITS = { max_chars: 5000, max_prompt_chars: 4000, max_entities: 25, top_k_max: 10 };
+  // Names for the model ids the site knows; any other id is shown as it is.
+  const MODEL_NAMES = {
+    "claude-opus-5-5": "Claude Opus 5.5",
+    "claude-sonnet-5-5": "Claude Sonnet 5.5",
+  };
   const PASSCODE_KEY = "xwalk-ner-passcode";
   const REQUEST_TIMEOUT_MS = 130000;
 
@@ -32,6 +37,7 @@
     model: $("model"),
     selectorField: $("selector-field"),
     selector: $("selector"),
+    allowance: $("allowance"),
     topK: $("top-k"),
     passField: $("passcode-field"),
     passcode: $("passcode"),
@@ -42,6 +48,9 @@
     status: $("status"),
     results: $("results"),
     summary: $("results-summary"),
+    ranOn: $("results-models"),
+    notices: $("notices"),
+    noticesList: $("notices-list"),
     highlighted: $("highlighted"),
     legend: $("legend"),
     lede: $("lede"),
@@ -113,6 +122,15 @@
   function fmtSeconds(ms) {
     if (typeof ms !== "number") return "unknown";
     return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`;
+  }
+
+  function modelName(id) {
+    if (typeof id !== "string" || !id) return "unknown";
+    return Object.prototype.hasOwnProperty.call(MODEL_NAMES, id) ? MODEL_NAMES[id] : id;
+  }
+
+  function isClaude(id) {
+    return typeof id === "string" && id.startsWith("claude-");
   }
 
   function typeLabel(t) {
@@ -273,9 +291,8 @@
 
     const models = Array.isArray(health.models) ? health.models : [];
     clear(el.model);
-    for (const m of models) el.model.append(h("option", { value: m, text: m }));
+    for (const m of models) el.model.append(h("option", { value: m, text: modelName(m) }));
     if (health.default_model) el.model.value = health.default_model;
-    el.modelField.hidden = models.length <= 1;
 
     fillTopK(state.limits.top_k_max || 10);
 
@@ -289,7 +306,68 @@
     renderIntro(health);
     renderLegend();
     renderBanner(health.mode, health.retrieval);
+    renderAllowance();
     updateCounter();
+  }
+
+  // The selector a request would use: the chosen one, or the server's default when the
+  // field is not offered.
+  function effectiveSelector() {
+    if (!el.selectorField.hidden) return el.selector.value;
+    return state.health && typeof state.health.default_selector === "string" ? state.health.default_selector : "";
+  }
+
+  // What the next request will meet, from health.visitor. An older API sends no
+  // `visitor`, and then nothing is shown.
+  function allowanceMessage() {
+    const health = state.health;
+    const visitor = health && health.visitor && typeof health.visitor === "object" ? health.visitor : null;
+    if (!visitor) return null;
+    if (visitor.tier === "blocked") {
+      const s = visitor.resets_in_s;
+      if (typeof s !== "number" || !Number.isFinite(s)) {
+        return { blocked: true, text: "You have used this hour's requests; try again later." };
+      }
+      const minutes = Math.max(1, Math.ceil(s / 60));
+      return { blocked: true, text: `You have used this hour's requests; try again in ${minutes} minute${minutes === 1 ? "" : "s"}.` };
+    }
+    // The Sonnet sentence is only true when the allowance is counted, Claude can be
+    // reached and the request would use Claude at all.
+    const counted = visitor.limits === undefined || visitor.limits === "on";
+    const claudeDown = health.claude && health.claude.status === "unavailable";
+    const wantsClaude = isClaude(el.model.value) || isClaude(effectiveSelector());
+    if (visitor.tier === "sonnet" && counted && !claudeDown && wantsClaude) {
+      return { blocked: false, text: "Your Opus allowance for this hour is used; requests run on Claude Sonnet 5.5." };
+    }
+    return null;
+  }
+
+  function renderAllowance() {
+    const message = allowanceMessage();
+    el.allowance.textContent = message ? message.text : "";
+    el.allowance.classList.toggle("blocked", Boolean(message && message.blocked));
+    el.allowance.hidden = !message;
+    // A single model needs no dropdown, unless the line under it has something to say.
+    const count = el.model.options.length;
+    el.modelField.hidden = count === 0 || (count === 1 && !message);
+  }
+
+  // Health is read again after each request so the allowance line stays current. Only
+  // the parts that change between requests are taken: the form keeps the visitor's
+  // choices. A failed read keeps what was shown.
+  async function refreshHealth() {
+    let health;
+    try {
+      health = await api("GET", "/api/health");
+    } catch (_) {
+      return;
+    }
+    if (!state.health) {
+      applyHealth(health);
+      return;
+    }
+    state.health = { ...state.health, visitor: health.visitor, claude: health.claude };
+    renderAllowance();
   }
 
   // The page's text describes the samples; a full-catalog deployment says what it maps.
@@ -376,7 +454,7 @@
   function selectorName(s) {
     if (s === "retrieval") return "Retrieval ranking only";
     if (s === "jev") return "Jev (TypeSafe decision model)";
-    return s;
+    return modelName(s);
   }
 
   const PICK_TEXT = {
@@ -413,7 +491,7 @@
 
   function retrieverText(retrievers) {
     const parts = Object.entries(retrievers || {}).map(([name, rank]) => `${name} #${rank}`);
-    return parts.length ? parts.join(", ") : "—";
+    return parts.length ? parts.join(", ") : "-";
   }
 
   function renderCard(e) {
@@ -446,8 +524,8 @@
           { class: [i === 0 ? "top" : "", m.id === picked ? "picked" : ""].join(" ").trim() || null },
           h("td", { "data-label": "Rank", class: "c-rank num", text: String(i + 1) }),
           h("td", { "data-label": "ID", class: "c-id" }, idCell),
-          h("td", { "data-label": "Label", class: "c-label", text: m.label || "—" }),
-          h("td", { "data-label": "Score", class: "c-score num", text: typeof m.score === "number" ? m.score.toFixed(4) : "—" }),
+          h("td", { "data-label": "Label", class: "c-label", text: m.label || "-" }),
+          h("td", { "data-label": "Score", class: "c-score num", text: typeof m.score === "number" ? m.score.toFixed(4) : "-" }),
           h("td", { "data-label": "Ranks", class: "c-ranks", text: retrieverText(m.retrievers) }),
         );
         if (i >= matches.length) {
@@ -532,6 +610,72 @@
     return parts.length ? `Retrieval: ${parts.join(", ")}` : "Retrieval: unknown";
   }
 
+  function joinNames(names) {
+    return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  }
+
+  // The selectors that made the picks, in order of first appearance. After a step-down
+  // this differs from the selector the request asked for.
+  function pickersOf(entities) {
+    const pickers = [];
+    for (const e of entities) {
+      const who = e && e.pick && typeof e.pick.selector === "string" ? e.pick.selector : "";
+      if (who && !pickers.includes(who)) pickers.push(who);
+    }
+    return pickers;
+  }
+
+  // The results header names what actually ran: the extraction model, and the model
+  // (or models, after a step-down) that made the picks.
+  function renderRanOn(data, pickers) {
+    clear(el.ranOn);
+    let askedShown = null;
+    if (data.mode === "offline") {
+      el.ranOn.append("Extracted by the offline stand-in.");
+    } else if (typeof data.model === "string" && data.model) {
+      el.ranOn.append("Extracted by ", h("strong", { text: modelName(data.model) }));
+      if (typeof data.requested_model === "string" && data.requested_model && data.requested_model !== data.model) {
+        el.ranOn.append(h("span", { class: "asked", text: ` (you asked for ${modelName(data.requested_model)})` }));
+        askedShown = data.requested_model;
+      }
+      el.ranOn.append(".");
+    }
+    if (pickers.length) {
+      el.ranOn.append(" Matches picked by ");
+      pickers.forEach((who, i) => {
+        if (i) el.ranOn.append(i === pickers.length - 1 ? " and " : ", ");
+        el.ranOn.append(h("strong", { text: selectorName(who) }));
+      });
+      const asked = data.requested_selector;
+      // Not repeated when the extraction sentence already said the same thing.
+      if (typeof asked === "string" && asked && !pickers.includes(asked) && asked !== askedShown) {
+        el.ranOn.append(h("span", { class: "asked", text: ` (you asked for ${selectorName(asked)})` }));
+      }
+      el.ranOn.append(".");
+    }
+    el.ranOn.hidden = !el.ranOn.firstChild;
+  }
+
+  const FALLBACK_STAGE = { extract: "Extraction", select: "Selection" };
+
+  // One sentence per step-down, for a response that lists `fallbacks` without `notices`.
+  function fallbackSentence(f) {
+    if (!f || typeof f !== "object" || typeof f.from !== "string" || typeof f.to !== "string") return null;
+    const reason = typeof f.reason === "string" && f.reason ? ` (${f.reason.replace(/_/g, " ")})` : "";
+    const stage = FALLBACK_STAGE[f.stage];
+    return stage
+      ? `${stage} moved from ${modelName(f.from)} to ${modelName(f.to)}${reason}.`
+      : `This request started on ${modelName(f.to)} instead of ${modelName(f.from)}${reason}.`;
+  }
+
+  function renderNotices(data) {
+    clear(el.noticesList);
+    let lines = (Array.isArray(data.notices) ? data.notices : []).filter((n) => typeof n === "string" && n.trim());
+    if (!lines.length && Array.isArray(data.fallbacks)) lines = data.fallbacks.map(fallbackSentence).filter(Boolean);
+    for (const line of new Set(lines)) el.noticesList.append(h("li", { text: line }));
+    el.notices.hidden = !el.noticesList.firstChild;
+  }
+
   function renderResults(text, data) {
     const entities = Array.isArray(data.entities) ? data.entities : [];
     const skipped = renderHighlighted(text, entities);
@@ -549,11 +693,14 @@
     el.summary.textContent = entities.length
       ? `${entities.length} entit${entities.length === 1 ? "y" : "ies"} found, ${mapped} with candidate terms.`
       : "No entities found.";
+    const pickers = pickersOf(entities);
+    renderRanOn(data, pickers);
+    renderNotices(data);
 
     const timing = data.timing_ms || {};
     setStatus([
       retrievalText(data.retrieval),
-      `Model ${data.model || "unknown"} (${data.mode || "unknown"}), picked by ${selectorName(data.selector || "retrieval")}`,
+      `Model ${modelName(data.model)} (${data.mode || "unknown"}), picked by ${pickers.length ? joinNames(pickers.map(selectorName)) : selectorName(data.selector || "retrieval")}`,
       usageText(data.usage),
       `extract ${fmtSeconds(timing.extract)}, map ${fmtSeconds(timing.map)}` + (timing.select !== undefined ? `, select ${fmtSeconds(timing.select)}` : "") + `, total ${fmtSeconds(timing.total)}`,
     ]);
@@ -615,6 +762,7 @@
     } finally {
       setRunning(false);
     }
+    refreshHealth();
   }
 
   // ---------- wiring ----------
@@ -630,6 +778,8 @@
     }
   });
   el.text.addEventListener("input", updateCounter);
+  el.model.addEventListener("change", renderAllowance);
+  el.selector.addEventListener("change", renderAllowance);
   el.example.addEventListener("click", () => {
     el.text.value = EXAMPLE_TEXT;
     updateCounter();

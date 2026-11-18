@@ -10,7 +10,19 @@ Usage (from the repository root, with the venv active)::
 ``--canned DIR`` answers from JSON fixtures and never imports ``ner_site``:
 ``GET /api/health`` -> ``health[-SCENARIO].json``; ``POST /api/ner`` ->
 ``ner[-SCENARIO].json``, or ``error.json`` with HTTP 400 when the posted text contains
-``ERROR`` (to exercise the error UI). Without ``--canned``, requests go through
+``ERROR`` (to exercise the error UI). A scenario needs at least one file of its own; the
+others fall back to the plain ``health.json`` / ``ner.json``. When
+``error-SCENARIO.json`` exists, every POST is answered with it (HTTP 429 for
+``visitor_limit_reached``, otherwise 400). Scenarios in ``fixtures/``:
+
+- (none): Claude Opus 5.5 ran, the visitor is on the Opus allowance.
+- ``sonnet``: the hour's Opus allowance is used; requests start on Claude Sonnet 5.5.
+- ``blocked``: the hour's requests are used; every POST answers 429.
+- ``fallback``: Opus stepped down mid-request (``fallbacks`` and ``notices`` set).
+- ``degraded``: offline mode, dense retrieval unavailable, and the response shape of
+  an API from before the Claude change (no ``claude``, ``visitor``, ``notices``).
+
+Without ``--canned``, requests go through
 ``ner_site.http.handle`` exactly as the Vercel functions do; ``--offline`` sets
 ``NER_SITE_OFFLINE=1`` so the stand-in extractor replaces the LLM.
 
@@ -63,16 +75,40 @@ def load_header_rules(path: Path = VERCEL_JSON) -> HeaderRules:
     return rules
 
 
+# HTTP status for a canned error envelope, by error code; anything else answers 400.
+CANNED_ERROR_STATUS = {"visitor_limit_reached": 429}
+
+
+def _load_fixture(file: Path) -> object:
+    return json.loads(file.read_text(encoding="utf-8"))
+
+
+def _error_response(envelope: object) -> Response:
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    status = CANNED_ERROR_STATUS.get(code, 400) if isinstance(code, str) else 400
+    response = _json_response(status, envelope)
+    if status == 429:
+        response[1]["Retry-After"] = "1380"
+    return response
+
+
 def canned_backend(directory: Path, scenario: str) -> Backend:
     suffix = f"-{scenario}" if scenario else ""
-    names = (f"health{suffix}.json", f"ner{suffix}.json", "error.json")
-    fixtures: dict[str, object] = {}
-    for name in names:
-        file = directory / name
-        if not file.is_file():
-            raise SystemExit(f"serve_local: fixture {file} not found")
-        fixtures[name] = json.loads(file.read_text(encoding="utf-8"))
-    health, ner, error = (fixtures[n] for n in names)
+    scenario_files = [directory / f"{kind}{suffix}.json" for kind in ("health", "ner", "error")]
+    if scenario and not any(file.is_file() for file in scenario_files):
+        raise SystemExit(f"serve_local: no fixture for scenario {scenario!r} in {directory}")
+
+    def pick(kind: str) -> object:
+        """``KIND-SCENARIO.json`` when the scenario has one, else the plain ``KIND.json``."""
+        for file in (directory / f"{kind}{suffix}.json", directory / f"{kind}.json"):
+            if file.is_file():
+                return _load_fixture(file)
+        raise SystemExit(f"serve_local: fixture {directory / f'{kind}.json'} not found")
+
+    health, ner, error = pick("health"), pick("ner"), pick("error")
+    # A scenario with an error file of its own refuses every POST (e.g. the 429 state).
+    always_error = bool(scenario) and (directory / f"error{suffix}.json").is_file()
 
     def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
         if path == "/api/health":
@@ -87,6 +123,8 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _envelope(400, "bad_json", "the request body is not valid JSON")
+        if always_error:
+            return _error_response(error)
         text = request.get("text") if isinstance(request, dict) else None
         if isinstance(text, str) and "ERROR" in text:
             return _json_response(400, error)
@@ -237,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--scenario",
         default="",
-        help="with --canned: use health-NAME.json and ner-NAME.json (e.g. 'degraded')",
+        help="with --canned: use the NAME fixtures (sonnet, blocked, fallback, degraded)",
     )
     parser.add_argument(
         "--delay", type=float, default=0.0, help="seconds to wait before answering a POST"

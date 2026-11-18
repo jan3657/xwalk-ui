@@ -60,7 +60,8 @@
       <div class="options">
         <div class="field" id="model-field">
           <label for="model">Extraction model</label>
-          <select id="model" name="model"></select>
+          <select id="model" name="model" aria-describedby="allowance"></select>
+          <p id="allowance" class="hint allowance" hidden></p>
         </div>
         <div class="field" id="selector-field" hidden>
           <label for="selector">Pick the match with</label>
@@ -95,6 +96,11 @@
       <div class="results-head">
         <h2 id="results-heading">Results</h2>
         <p id="results-summary" class="summary" aria-live="polite"></p>
+        <p id="results-models" class="ran-on"></p>
+      </div>
+      <div id="notices" class="notices" role="note" aria-labelledby="notices-title" hidden>
+        <p id="notices-title" class="notices-title">About this run</p>
+        <ul id="notices-list"></ul>
       </div>
       <div class="panel">
         <p id="highlighted" class="highlighted"></p>
@@ -108,6 +114,10 @@
       <p>
         Built with <a href="https://github.com/jan3657/xwalk">xwalk</a>. Text you submit is
         sent to the model provider for extraction and is not stored by this site.
+      </p>
+      <p>
+        Requests are limited per visitor using a salted hash of your IP address, kept for
+        one day.
       </p>
     </footer>
   </main>

@@ -273,6 +273,15 @@ summary {
   font-size: 0.875rem;
 }
 
+.allowance {
+  margin: 0;
+}
+
+.allowance.blocked {
+  color: var(--text);
+  font-weight: 600;
+}
+
 .counter.over {
   color: var(--danger-text);
   font-weight: 600;
@@ -549,6 +558,46 @@ button[aria-busy="true"] .spinner {
   color: var(--muted);
 }
 
+.ran-on {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.ran-on .asked {
+  color: var(--muted);
+}
+
+/* Neutral information about the run (a different model answered). Not a warning (amber)
+   and not an error (red): the accent tint, with a label. */
+.notices {
+  margin: 0 0 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  border-radius: var(--radius);
+}
+
+.notices-title {
+  margin: 0 0 4px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.notices ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.notices li + li {
+  margin-top: 4px;
+}
+
 .highlighted {
   margin: 0;
   font-size: 1.05rem;
@@ -789,6 +838,10 @@ button[aria-busy="true"] .spinner {
 
 .footer p {
   margin: 0;
+}
+
+.footer p + p {
+  margin-top: 6px;
 }
 
 /* ---------- narrow screens ---------- */
