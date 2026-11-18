@@ -24,6 +24,7 @@ session's time zone is. Each test creates a schema of its own and drops it.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -33,6 +34,7 @@ import shutil
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, fields, replace
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -109,11 +111,15 @@ class FakeRuns:
         placeholders = {int(n) for n in re.findall(r"\$(\d+)", sql)}
         assert placeholders == set(range(1, len(p) + 1)), "placeholders and parameters differ"
         tag = tag_of(sql)
-        if tag != "site_runs_table" and not self.created:
+        if tag not in ("site_runs_schema", "site_runs_table") and not self.created:
             raise PostgresError('relation "site_runs" does not exist', code="42P01")
         return getattr(self, f"_{tag}")(sql, p)
 
     # --- the statements
+    def _site_runs_schema(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
+        assert "CREATE SCHEMA IF NOT EXISTS" in sql
+        return []
+
     def _site_runs_table(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
         assert "CREATE TABLE IF NOT EXISTS" in sql
         self.created = True
@@ -496,6 +502,28 @@ def test_a_failed_first_call_creates_the_table_on_the_next() -> None:
     fake.fail = None
     runs.record(a_run())
     assert fake.tags().count("site_runs_table") == 2 and len(fake.rows) == 1
+
+
+def test_create_makes_the_schema_table_and_index_in_one_round_trip_and_no_row() -> None:
+    runs, fake = make()
+    runs.create()
+    runs.create()
+    assert fake.round_trips == 2 and fake.rows == []
+    assert fake.tags() == ["site_runs_schema", "site_runs_table", "site_runs_index"] * 2
+    assert "CREATE SCHEMA IF NOT EXISTS xwalk" in fake.sent[0][0]
+    assert all(params == [] for _, params in fake.sent)
+    # An instance that provisioned has nothing left to create.
+    runs.record(a_run())
+    assert fake.tags()[6:] == ["site_run"]
+
+
+def test_a_failed_create_is_usage_unavailable_without_secrets() -> None:
+    runs, fake = make()
+    fake.fail = PostgresError(f"permission denied ({SENTINEL_URL})", code="42501")
+    with pytest.raises(UsageUnavailable) as caught:
+        runs.create()
+    assert str(caught.value) == "site runs could not be queried (PostgresError 42501)"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 @pytest.mark.parametrize("schema", ["Xwalk", "xwalk; DROP TABLE x", "x.y", "", "1abc", 'x"y'])
@@ -1151,6 +1179,30 @@ def test_postgres_the_table_has_the_specs_columns_and_an_index_on_at(database: D
 
 
 @pytest.mark.integration
+def test_postgres_create_provisions_an_empty_database_and_can_be_repeated(
+    database: Database,
+) -> None:
+    """What ``tools/setup_usage.py`` runs: the schema, the table and the index, twice
+    over, on a schema that exists and on one that does not."""
+    fresh = Database(database.executor, database.schema + "_new")
+    try:
+        for found in (database, fresh):
+            found.runs().create()
+            found.runs().create()
+            assert found.value("SELECT count(*) FROM {table}") == "0"
+            indexes = found.value(
+                f"SELECT string_agg(indexdef, ' ') FROM pg_indexes "
+                f"WHERE schemaname = '{found.schema}' AND tablename = '{TABLE}'"
+            )
+            assert indexes is not None and "(at)" in indexes
+            found.runs().record(FIXED[0])
+            found.runs().create()  # with a row in it: nothing is lost
+            assert found.value("SELECT count(*) FROM {table}") == "1"
+    finally:
+        database.executor.execute(f"DROP SCHEMA IF EXISTS {fresh.schema} CASCADE")
+
+
+@pytest.mark.integration
 def test_postgres_a_row_is_stored_as_it_was_given_nulls_included(database: Database) -> None:
     runs = database.runs()
     full, refused = FIXED[0], FIXED[2]
@@ -1206,6 +1258,115 @@ def test_postgres_a_failed_statement_is_usage_unavailable_with_its_sqlstate(
     assert caught.value.code == "22007" and caught.value.kind == "PostgresError"
     runs.record(FIXED[0])  # the failed first call rolled back; the table is created now
     assert database.value("SELECT count(*) FROM {table}") == "1"
+
+
+# --- tools/setup_usage.py: the table, once, before recording is turned on -------------
+
+SETUP_TOOL = Path(__file__).resolve().parents[1] / "ner-site" / "tools" / "setup_usage.py"
+
+
+def _setup_tool() -> Any:
+    spec = importlib.util.spec_from_file_location("setup_usage_under_test", SETUP_TOOL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _setup(
+    argv: list[str], env: dict[str, str], executor: Any = None
+) -> tuple[int, list[str], list[str]]:
+    said: list[str] = []
+    opened: list[str] = []
+
+    def factory(database_url: str) -> Any:
+        opened.append(database_url)
+        if isinstance(executor, Exception):
+            raise executor
+        return executor
+
+    code = _setup_tool().main(argv, env=env, executor_factory=factory, out=said.append)
+    return code, said, opened
+
+
+def test_the_setup_tool_creates_the_table_and_index_and_can_be_run_again() -> None:
+    fake = FakeRuns()
+    env = {"DATABASE_URL": SENTINEL_URL}
+    for _ in range(2):
+        code, said, opened = _setup([], env, fake)
+        assert code == 0 and opened == [SENTINEL_URL]
+        assert said == ["xwalk.site_runs and its index on at are in place"]
+    assert fake.tags() == ["site_runs_schema", "site_runs_table", "site_runs_index"] * 2
+    assert fake.created and fake.indexed and fake.rows == [] and fake.round_trips == 2
+
+
+def test_the_setup_tool_takes_the_schema_from_the_environment_or_the_flag() -> None:
+    fake = FakeRuns()
+    env = {"DATABASE_URL": SENTINEL_URL, "NER_SITE_NEON_SCHEMA": "demo"}
+    assert _setup([], env, fake)[1] == ["demo.site_runs and its index on at are in place"]
+    assert "demo.site_runs" in fake.sent[1][0]
+    assert _setup(["--schema", "other_one"], env, fake)[1] == [
+        "other_one.site_runs and its index on at are in place"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "executor", "code", "said"),
+    [
+        ([], {}, None, 2, "error: DATABASE_URL is not set"),
+        ([], {"DATABASE_URL": "  "}, None, 2, "error: DATABASE_URL is not set"),
+        (
+            ["--schema", "Bad; DROP"],
+            {"DATABASE_URL": SENTINEL_URL},
+            FakeRuns(),
+            2,
+            "error: the schema must be a lower-case identifier (letters, digits, _)",
+        ),
+        (
+            [],
+            {"DATABASE_URL": SENTINEL_URL},
+            ValueError(f"cannot use {SENTINEL_URL}"),
+            2,
+            "error: DATABASE_URL is not a postgres:// or postgresql:// URL with a host",
+        ),
+    ],
+)
+def test_the_setup_tool_refuses_what_it_cannot_use_without_showing_the_url(
+    argv: list[str], env: dict[str, str], executor: Any, code: int, said: str
+) -> None:
+    assert _setup(argv, env, executor)[:2] == (code, [said])
+
+
+def test_the_setup_tool_reports_a_database_failure_by_class_and_sqlstate_only(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake = FakeRuns()
+    fake.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({SENTINEL_URL})", code="08006")
+    code, said, _ = _setup([], {"DATABASE_URL": SENTINEL_URL}, fake)
+    assert code == 1
+    assert said == ["error: site runs could not be queried (PostgresError 08006)"]
+    captured = capsys.readouterr()
+    for secret in (SENTINEL_URL, "npg_SENTINELpw0123", "ep-x-pooler"):
+        assert secret not in "".join(said) + captured.out + captured.err
+
+
+def test_the_setup_tool_builds_a_neon_executor_and_prints_by_default(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tool = _setup_tool()
+    built: list[tuple[str, dict[str, Any]]] = []
+    fake = FakeRuns()
+
+    def neon(url: str, **options: Any) -> Any:
+        built.append((url, options))
+        return fake
+
+    monkeypatch.setattr(tool, "NeonHTTPExecutor", neon)
+    assert tool.main([], env={"DATABASE_URL": f"  {SENTINEL_URL} "}) == 0
+    assert built == [(SENTINEL_URL, {})] and fake.created
+    captured = capsys.readouterr()
+    assert captured.out == "xwalk.site_runs and its index on at are in place\n"
+    assert "SENTINEL" not in captured.out + captured.err
 
 
 def test_module_exports() -> None:

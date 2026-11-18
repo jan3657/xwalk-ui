@@ -27,7 +27,12 @@ round trip, so each call here is exactly one:
   requested selector, and the counts per error code, step-down reason and country
   (a null country is the runs that came without one).
 - The first call of an instance puts ``CREATE TABLE IF NOT EXISTS`` and the index on
-  ``at`` in front, in the same transaction: still one round trip.
+  ``at`` in front, in the same transaction: still one round trip. Two cold instances
+  that do this at the same moment on a database without the table can collide in
+  Postgres's catalog; the loser's transaction is rolled back and its one row is lost
+  (noted in its log line, like any failed write). ``create`` makes the table without
+  a row, and ``tools/setup_usage.py`` runs it once for the operator, before recording
+  is turned on, so that no instance ever has anything to create.
 
 Days are UTC days whatever the session's time zone: a row's day is
 ``(at AT TIME ZONE 'UTC')::date`` and the series is built from dates, not instants.
@@ -171,6 +176,11 @@ CREATE TABLE IF NOT EXISTS {table} (
     total_ms integer
 )"""
 
+# Only ``create`` sends this (the operator's provisioning). The site itself never
+# does: its schema is the one the indexes and the allowance already live in.
+_SCHEMA = """/* xwalk:site_runs_schema */
+CREATE SCHEMA IF NOT EXISTS {schema}"""
+
 _INDEX = """/* xwalk:site_runs_index */
 CREATE INDEX IF NOT EXISTS site_runs_at ON {table} (at)"""
 
@@ -262,6 +272,18 @@ class UsageUnavailable(Exception):
         super().__init__(message)
         self.kind = kind or type(self).__name__
         self.code = code
+
+
+def _unavailable(exc: Exception) -> UsageUnavailable:
+    """What an executor's failure is raised as: its class and SQLSTATE, not its text."""
+    code = getattr(exc, "code", None)
+    state = code if isinstance(code, str) and _SQLSTATE.fullmatch(code) else None
+    return UsageUnavailable(
+        "site runs could not be queried "
+        f"({type(exc).__name__}{'' if state is None else ' ' + state})",
+        kind=type(exc).__name__,
+        code=state,
+    )
 
 
 def visitor_day(visitor: str, salt: str, now: float) -> str:
@@ -500,11 +522,23 @@ class SiteRuns:
         self._executor = executor
         self._clock = clock
         table = f"{schema}.{TABLE}"
+        self._schema = _SCHEMA.format(schema=schema)
         self._create = _CREATE.format(table=table)
         self._index = _INDEX.format(table=table)
         self._insert = _INSERT.format(table=table)
         self._stats = _STATS.format(table=table)
         self._created = False
+
+    def create(self) -> None:
+        """Make the schema, the table and its index where they are missing: one round
+        trip, and the same result however often it runs. For provisioning before
+        recording is turned on (``tools/setup_usage.py``). Raises ``UsageUnavailable``
+        when the database cannot be asked."""
+        try:
+            self._executor.transaction([(self._schema, ()), (self._create, ()), (self._index, ())])
+        except Exception as exc:
+            raise _unavailable(exc) from None
+        self._created = True
 
     def record(self, run: Run) -> None:
         """Store one run: one round trip. Raises ``UsageUnavailable`` when the database
@@ -540,13 +574,6 @@ class SiteRuns:
                 lead: list[Statement] = [(self._create, ()), (self._index, ())]
                 rows = self._executor.transaction([*lead, statement])[-1]
         except Exception as exc:
-            code = getattr(exc, "code", None)
-            state = code if isinstance(code, str) and _SQLSTATE.fullmatch(code) else None
-            raise UsageUnavailable(
-                "site runs could not be queried "
-                f"({type(exc).__name__}{'' if state is None else ' ' + state})",
-                kind=type(exc).__name__,
-                code=state,
-            ) from None
+            raise _unavailable(exc) from None
         self._created = True
         return rows

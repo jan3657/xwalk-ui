@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import httpx
@@ -3926,3 +3926,215 @@ def test_the_stats_fixtures_have_the_shape_and_the_errors_the_server_sends(
         assert totals["runs"] == sum(day["runs"] for day in canned["by_day"]), name
         assert totals["errors"] == totals["runs"] - totals["ok"], name
         assert totals["visitors"] == sum(day["visitors"] for day in canned["by_day"]), name
+
+
+# --- analytics fix wave: recording must not harm the live site ------------------------
+
+
+def _wait_for(condition: Callable[[], bool], seconds: float = 5.0) -> bool:
+    import time
+
+    end = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _usage_threads() -> int:
+    return sum(1 for t in threading.enumerate() if t.name == "ner-site-usage" and t.is_alive())
+
+
+@pytest.fixture
+def blocked(runs: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """The ``runs`` table behind a database that takes every statement and does not
+    answer until ``release`` is set; ``peak`` is the most statements it held at once."""
+    release = threading.Event()
+    lock = threading.Lock()
+    state = SimpleNamespace(release=release, held=0, peak=0, entered=0)
+
+    def holding(real: Any) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                state.held += 1
+                state.entered += 1
+                state.peak = max(state.peak, state.held)
+            try:
+                release.wait(30)
+                with lock:
+                    return real(*args, **kwargs)
+            finally:
+                with lock:
+                    state.held -= 1
+
+        return call
+
+    monkeypatch.setattr(runs, "transaction", holding(runs.transaction))
+    monkeypatch.setattr(runs, "execute", holding(runs.execute))
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.15)
+    try:
+        yield state
+    finally:
+        release.set()
+        assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0)
+
+
+def _plain_stats_site(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """A deployment without a limiter (OpenRouter only) that records its runs."""
+    return _settings(
+        cache_dir,
+        tmp_path,
+        **{
+            "OPENROUTER_API_KEY": SENTINEL_KEY,
+            "NER_SITE_STATS_PASSCODE": STATS_PASSCODE,
+            "DATABASE_URL": DB_URL,
+            **env,
+        },
+    )
+
+
+def _plain_run(settings: Settings) -> tuple[int, dict[str, str], dict[str, Any]]:
+    status, headers, body = _post(settings, {"text": "x"}, llm_factory=_fake('{"entities": []}'))
+    data = json.loads(body)
+    data.pop("timing_ms", None)
+    return status, headers, data
+
+
+def _usage_notes(err: str) -> list[str | None]:
+    return [json.loads(line).get("usage") for line in err.strip().splitlines()]
+
+
+def test_a_hanging_database_holds_no_more_than_the_cap_and_later_runs_skip_at_once(
+    cache_dir: Path, tmp_path: Path, runs: Any, blocked: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sequential requests against a database that never answers. Each abandoned write
+    keeps a thread and a connection: before the cap there was one of each per request."""
+    import time
+
+    cap = http_mod.USAGE_MAX_IN_FLIGHT
+    assert cap == 4
+    off = _settings(cache_dir, tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
+    healthy = _plain_run(off)
+    assert healthy[0] == 200
+    s = _plain_stats_site(cache_dir, tmp_path)
+    capsys.readouterr()
+    for _ in range(cap):
+        assert _plain_run(s) == healthy
+    assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"] * cap
+    assert http_mod._USAGE_FLIGHTS.count == cap == _usage_threads()
+    started = time.monotonic()
+    for _ in range(3):
+        assert _plain_run(s) == healthy
+    waited = time.monotonic() - started
+    assert _usage_notes(capsys.readouterr().err) == ["saturated"] * 3
+    # Skipped without waiting, and without another thread, statement or executor.
+    assert waited < 3 * http_mod.USAGE_TIMEOUT_S
+    assert blocked.entered == cap == blocked.peak == _usage_threads()
+    assert http_mod._USAGE_FLIGHTS.count == cap and len(runs.opened) == 1
+    # The database answers again: the abandoned writes end, and recording resumes.
+    blocked.release.set()
+    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0)
+    assert _plain_run(s) == healthy
+    assert _usage_notes(capsys.readouterr().err) == [None]
+    assert len(runs.rows) == cap + 1
+
+
+def test_concurrent_requests_against_a_hanging_database_are_capped_too(
+    cache_dir: Path, tmp_path: Path, runs: Any, blocked: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cap = http_mod.USAGE_MAX_IN_FLIGHT
+    s = _plain_stats_site(cache_dir, tmp_path)
+    healthy = _plain_run(_settings(cache_dir, tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY))
+    capsys.readouterr()
+    answers: list[Any] = []
+    threads = [
+        threading.Thread(target=lambda: answers.append(_plain_run(s))) for _ in range(cap * 3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    assert len(answers) == cap * 3 and all(answer == healthy for answer in answers)
+    notes = _usage_notes(capsys.readouterr().err)
+    assert sorted(notes) == ["TimeoutError"] * cap + ["saturated"] * (cap * 2)
+    assert blocked.peak == cap == blocked.entered == http_mod._USAGE_FLIGHTS.count
+    blocked.release.set()
+    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0)
+    assert len(runs.rows) == cap
+
+
+def test_setting_up_the_store_is_under_the_same_deadline_as_the_write(
+    cache_dir: Path,
+    tmp_path: Path,
+    runs: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The store is built behind a lock every request of the instance shares. A request
+    that finds it held (another one is building the executor) waits no longer for it
+    than for the write itself."""
+    import time
+
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.15)
+    s = _plain_stats_site(cache_dir, tmp_path)
+    capsys.readouterr()
+    with http_mod._USAGE_LOCK:
+        started = time.monotonic()
+        result = _plain_run(s)
+        waited = time.monotonic() - started
+    assert result[0] == 200 and waited < 5
+    assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"]
+    # Once the lock is free the abandoned write goes through and the slot is given back.
+    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0)
+    assert len(runs.rows) == 1
+
+
+def test_the_executors_own_timeout_ends_an_abandoned_write(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real executor against a server that accepts the connection and never
+    answers: nothing releases the write but its own timeout, and the slot comes back."""
+    import socket
+
+    from xwalk.retrieval.postgres import NeonHTTPExecutor
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    port = server.getsockname()[1]
+    held: list[socket.socket] = []
+
+    def accept() -> None:
+        try:
+            while True:
+                held.append(server.accept()[0])
+        except OSError:
+            return
+
+    threading.Thread(target=accept, daemon=True).start()
+    built: list[float] = []
+
+    def executor(database_url: str, timeout: float) -> Any:
+        built.append(timeout)
+        return NeonHTTPExecutor(
+            database_url,
+            timeout=timeout,
+            max_retries=0,
+            endpoint=f"http://127.0.0.1:{port}/sql",
+            trust_env=False,
+        )
+
+    monkeypatch.setattr(http_mod, "make_usage_executor", executor)
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.3)
+    try:
+        s = _plain_stats_site(cache_dir, tmp_path)
+        for _ in range(2):
+            assert _plain_run(s)[0] == 200
+        assert built == [0.3]  # the write's timeout is the wait's
+        assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0)
+        assert len(held) == 2
+    finally:
+        server.close()
+        for connection in held:
+            connection.close()

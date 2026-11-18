@@ -112,6 +112,13 @@ LIMITS_TIMEOUT_S = 3.0
 # own request and may wait for a database that has to wake up.
 USAGE_TIMEOUT_S = 2.0
 STATS_TIMEOUT_S = 10.0
+# The recording writes one warm instance may have under way at once. A write whose wait
+# ran out is not stopped: it keeps its thread and its connection until the executor's
+# own timeout ends it, so a database that hangs would otherwise hold one of each for
+# every request. A healthy write takes tens of milliseconds and its request waits for
+# it, so four is never reached by a site that works, and bounds one that does not.
+USAGE_MAX_IN_FLIGHT = 4
+USAGE_SATURATED = "saturated"
 STATS_UNAVAILABLE = "stats_unavailable"
 CONTENDED_RETRY_AFTER_S = 5
 LIMITS_UNAVAILABLE = "limits_unavailable"
@@ -256,6 +263,30 @@ _USAGE_LOCK = threading.Lock()
 _USAGE: dict[tuple[str, str, float], usage.SiteRuns] = {}
 
 
+class _Flights:
+    """The recording writes of this instance that have not ended, at most ``limit``."""
+
+    def __init__(self, limit: int) -> None:
+        self._lock = threading.Lock()
+        self._limit = limit
+        self.count = 0
+
+    def enter(self) -> bool:
+        """Take a place for one write; False, at once, when every place is taken."""
+        with self._lock:
+            if self.count >= self._limit:
+                return False
+            self.count += 1
+            return True
+
+    def leave(self) -> None:
+        with self._lock:
+            self.count -= 1
+
+
+_USAGE_FLIGHTS = _Flights(USAGE_MAX_IN_FLIGHT)
+
+
 def _usage_store(settings: Settings, timeout: float) -> usage.SiteRuns | None:
     """Where runs are kept, or None when they are not: the stats passcode is unset, or
     there is no database to keep them in. Raises ``ValueError`` for a connection string
@@ -287,12 +318,18 @@ def _record(
 ) -> None:
     """Keep one row for a finished run. Called with the response already built, and
     nothing here can change it: every failure ends as ``log["usage"]``, the name of
-    what went wrong. The insert runs in a thread of its own so that the wait is bounded
-    by ``USAGE_TIMEOUT_S`` whatever the executor does; an insert that is abandoned
-    finishes, or fails, in the background of a warm instance."""
+    what went wrong.
+
+    Everything that can wait happens in a thread of its own, and this waits for that
+    thread no longer than ``USAGE_TIMEOUT_S``: finding or building the store (behind a
+    lock the instance's requests share) and the insert alike. A write that is abandoned
+    ends in the background of a warm instance when the executor's own timeout (the same
+    number of seconds) is up. Until then it holds one of ``USAGE_MAX_IN_FLIGHT``
+    places; with all of them taken a run is not recorded and does not wait
+    (``usage: "saturated"``), so a database that hangs costs an instance four threads
+    and connections, not one per request."""
     try:
-        store = _usage_store(settings, USAGE_TIMEOUT_S)
-        if store is None:
+        if settings.stats_passcode is None or settings.database_url is None:
             return
         now = _now()
         salt = settings.visitor_salt or limits.default_salt(settings.database_url or "")
@@ -303,21 +340,38 @@ def _record(
             country=country,
             selector_tokens=recorded.get("selector_tokens", (None, None)),
         )
-        failed: list[str] = []
+        if not _USAGE_FLIGHTS.enter():
+            log["usage"] = USAGE_SATURATED
+            return
+        # How the write ended: None, the name of an Exception, or what is no Exception
+        # (a test's own failure, an interpreter exit), which is handed on as it is.
+        ended: list[str | BaseException | None] = []
 
         def send() -> None:
             try:
-                store.record(row)
+                store = _usage_store(settings, USAGE_TIMEOUT_S)
+                if store is not None:
+                    store.record(row)
+                ended.append(None)
             except Exception as exc:  # noqa: BLE001 - named in the log, never raised
-                failed.append(getattr(exc, "kind", None) or type(exc).__name__)
+                ended.append(getattr(exc, "kind", None) or type(exc).__name__)
+            except BaseException as exc:  # noqa: BLE001 - raised again by the request
+                ended.append(exc)
+            finally:
+                _USAGE_FLIGHTS.leave()
 
         thread = threading.Thread(target=send, name="ner-site-usage", daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _USAGE_FLIGHTS.leave()
+            raise
         thread.join(USAGE_TIMEOUT_S)
-        if thread.is_alive():
-            log["usage"] = TimeoutError.__name__
-        elif failed:
-            log["usage"] = failed[0]
+        outcome = ended[0] if ended else TimeoutError.__name__
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome is not None:
+            log["usage"] = outcome
     except Exception as exc:  # noqa: BLE001 - recording never costs the visitor an answer
         log["usage"] = type(exc).__name__
 
