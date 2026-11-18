@@ -225,6 +225,7 @@ class Misbehaving:
 
     def __init__(self, mode: str, every: float = 0.02) -> None:
         self.mode, self.every = mode, every
+        self.behave = False  # set: connections accepted from now on are answered well
         self.accepted = 0
         self.gone = 0
         self._stop = threading.Event()
@@ -250,6 +251,13 @@ class Misbehaving:
             data = b""
             while b"\r\n\r\n" not in data:
                 data += connection.recv(65536)
+            while self.behave:  # one good answer for each request, as long as they come
+                body = b'{"fields": [{"name": "n"}], "rows": [[1]]}'
+                head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                connection.sendall(head + b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                connection.settimeout(5)
+                if connection.recv(65536) == b"":
+                    return
             if self.mode == "body":
                 head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 connection.sendall(head + b"Content-Length: 1000000\r\n\r\n")
@@ -321,7 +329,7 @@ def test_a_call_ends_at_its_deadline_whatever_the_server_does(misbehaving: Misbe
             call()
         waited = time.monotonic() - started
         assert TIMEOUT <= waited < TIMEOUT + BOUND
-        assert str(caught.value) == "Neon did not answer within 0.4 s"
+        assert str(caught.value) == "Neon did not answer in time"
         assert caught.value.__cause__ is None and caught.value.__context__ is None
     # Cancelled, not abandoned: the connections are closed, so the server sees the
     # client go, and nothing but the loop's one thread is left.
@@ -479,3 +487,436 @@ def test_every_place_is_free_again_after_the_deadline_with_a_stalled_resolver(
     assert notes[deadline.RESOLVER_THREADS :] == ["PostgresError"] * 3
     assert _places_free()
     assert _threads("ner-site-usage-dns") == deadline.RESOLVER_THREADS
+
+
+# --- round 3: errors that carry nothing, one deadline, the engine's parameters ----------
+
+SENTINEL_URL = "postgresql://owner:npg_URLSENTINELpw9@ep-sentinel-host.neon.tech/neondb"
+URL_SECRETS = (SENTINEL_URL, "npg_URLSENTINELpw9", "URLSENTINEL", "ep-sentinel-host")
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """`exc` and every exception reachable from it through causes and contexts."""
+    seen: list[BaseException] = []
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or any(item is other for other in seen):
+            continue
+        seen.append(item)
+        stack += [item.__cause__, item.__context__]
+    return seen
+
+
+def _assert_sealed(exc: BaseException, *extra: str) -> None:
+    """Nothing of the URL, the server's words or `extra` in the exception: its message,
+    arguments, attributes, repr, or anything chained to it."""
+    assert exc.__cause__ is None and exc.__context__ is None
+    for item in _chain(exc):
+        shown = " ".join([str(item), repr(item), repr(item.args), repr(vars(item))])
+        for secret in (*URL_SECRETS, *extra):
+            assert secret not in shown, (secret, type(item).__name__)
+
+
+ECHOES: dict[str, tuple[int, bytes, dict[str, str]]] = {
+    # The three cases of the second re-review.
+    "a code that echoes the URL": (
+        400,
+        json.dumps({"message": "bad", "code": f"failed for {SENTINEL_URL}"}).encode(),
+        {"Content-Type": "application/json"},
+    ),
+    "a 200 that is not JSON and echoes the URL": (
+        200,
+        f'{{"rows": [ oops {SENTINEL_URL}'.encode(),
+        {"Content-Type": "application/json"},
+    ),
+    "an error that is not JSON and echoes the URL": (
+        500,
+        f"<html>upstream {SENTINEL_URL}</html>".encode(),
+        {"Content-Type": "text/html"},
+    ),
+    # And what else a server could try.
+    "a message that echoes the URL": (
+        400,
+        json.dumps({"message": f"no relation at {SENTINEL_URL}", "code": "42P01"}).encode(),
+        {"Content-Type": "application/json"},
+    ),
+    "a code that is no string": (
+        400,
+        json.dumps({"message": "bad", "code": [SENTINEL_URL]}).encode(),
+        {"Content-Type": "application/json"},
+    ),
+    "a code of five characters that are not a SQLSTATE": (
+        400,
+        json.dumps({"message": "bad", "code": "ab cd", "detail": SENTINEL_URL}).encode(),
+        {"Content-Type": "application/json"},
+    ),
+    "a redirect to a URL with the secret": (
+        302,
+        b"",
+        {"Location": f"https://elsewhere.example/?u={SENTINEL_URL}"},
+    ),
+    "a body that is not UTF-8": (200, b"\xff\xfe" + SENTINEL_URL.encode(), {}),
+    "rows that are no rows": (
+        200,
+        json.dumps({"fields": SENTINEL_URL, "rows": 7}).encode(),
+        {"Content-Type": "application/json"},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(ECHOES), ids=list(ECHOES))
+@pytest.mark.parametrize("call", ["execute", "transaction"])
+def test_no_failure_carries_what_the_server_sent_or_the_connection_string(
+    case: str, call: str
+) -> None:
+    status, content, headers = ECHOES[case]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=content, headers=headers)
+
+    ours = DeadlineExecutor(SENTINEL_URL, timeout=5, transport=httpx.MockTransport(handler))
+    with pytest.raises(PostgresError) as caught:
+        if call == "execute":
+            ours.execute("SELECT 1")
+        else:
+            ours.transaction([("SELECT 1", ()), ("SELECT 2", ())])
+    exc = caught.value
+    _assert_sealed(exc, "oops", "upstream", "elsewhere", "no relation")
+    assert type(exc) is PostgresError
+    assert exc.code in (None, "42P01") and (exc.code is None or len(exc.code) == 5)
+    assert str(exc) in {
+        f"Neon answered HTTP {status}",
+        "Neon answered HTTP 400 with SQLSTATE 42P01",
+        "Neon answered HTTP 200 with a body that is not JSON",
+        "Neon answered with a result that is not an object",
+        "Neon answered a transaction without one result per statement",
+        "Neon answered with rows that cannot be read",
+    }
+    ours.close()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://owner:päss-URLSENTINEL@ep-sentinel-host.neon.tech/db",
+        "postgresql://owner:URLSENTINEL☃@ep-sentinel-host.neon.tech/db",
+        "postgresql://owner:URLSENTINEL pw@ep-sentinel-host.neon.tech/db",
+        "postgresql://owner:URLSENTINEL\npw@ep-sentinel-host.neon.tech/db",
+        "postgresql://owner:URLSENTINEL\x7f@ep-sentinel-host.neon.tech/db",
+        "postgresql://owner:URLSENTINEL@ep-sentinel-host.neon.tech:port/db",
+    ],
+)
+def test_a_connection_string_that_cannot_be_sent_is_refused_before_any_request(url: str) -> None:
+    """A header takes plain ASCII. The HTTP library's own refusal quotes the value."""
+    hits = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal hits
+        hits += 1
+        return httpx.Response(200, json={"fields": [], "rows": []})
+
+    with pytest.raises(ValueError) as caught:
+        DeadlineExecutor(url, timeout=5, transport=httpx.MockTransport(handler))
+    assert str(caught.value) == "a postgres:// or postgresql:// connection string with a host"
+    assert type(caught.value) is ValueError
+    _assert_sealed(caught.value, "päss")
+    assert hits == 0
+
+
+def test_whatever_fails_while_sending_is_one_fixed_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Should the library refuse a request for a reason of its own, quoting what it was
+    given (a header it cannot encode, a URL it cannot build), that text stays inside."""
+    for error in (
+        UnicodeEncodeError("ascii", SENTINEL_URL, 0, 1, "ordinal not in range"),
+        httpx.InvalidURL(f"cannot use {SENTINEL_URL}"),
+        httpx.ConnectError(f"cannot connect for {SENTINEL_URL}"),
+        RuntimeError(f"something else with {SENTINEL_URL}"),
+        OSError(f"socket for {SENTINEL_URL}"),
+    ):
+
+        async def handler(request: httpx.Request, error: Exception = error) -> httpx.Response:
+            raise error
+
+        ours = DeadlineExecutor(SENTINEL_URL, timeout=5, transport=httpx.MockTransport(handler))
+        with pytest.raises(PostgresError) as caught:
+            ours.execute("SELECT 1")
+        _assert_sealed(caught.value)
+        assert str(caught.value) == f"could not reach Neon ({type(error).__name__})"
+        assert caught.value.code is None
+        ours.close()
+    # A parameter that cannot be written as JSON fails before anything is sent.
+    ours = DeadlineExecutor(SENTINEL_URL, timeout=5, transport=httpx.MockTransport(handler))
+    with pytest.raises(PostgresError) as caught:
+        ours.execute("SELECT $1", [object()])
+    assert str(caught.value) == "a statement could not be written as JSON (TypeError)"
+    with pytest.raises(PostgresError):
+        ours.execute("SELECT $1", [float("nan")])
+    _assert_sealed(caught.value)
+
+
+def test_the_log_line_of_a_run_holds_nothing_of_a_failed_write(
+    cache_dir: Path,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The three cases through the handler: the run is answered, the log line names a
+    class, and neither holds the URL, its password, its host or the server's words."""
+    for case in list(ECHOES)[:3]:
+        status, content, headers = ECHOES[case]
+
+        async def handler(
+            request: httpx.Request,
+            status: int = status,
+            content: bytes = content,
+            headers: dict[str, str] = headers,
+        ) -> httpx.Response:
+            return httpx.Response(status, content=content, headers=headers)
+
+        monkeypatch.setattr(
+            http_mod,
+            "make_usage_executor",
+            lambda url, timeout, handler=handler: DeadlineExecutor(
+                url, timeout=timeout, transport=httpx.MockTransport(handler)
+            ),
+        )
+        http_mod.reset()
+        s = _settings(
+            cache_dir,
+            tmp_path,
+            OPENROUTER_API_KEY=SENTINEL_KEY,
+            NER_SITE_STATS_PASSCODE=STATS_PASSCODE,
+            DATABASE_URL=SENTINEL_URL,
+            NER_SITE_VISITOR_SALT="a-salt-of-its-own",
+        )
+        capsys.readouterr()
+        result = _post(s, {"text": "x"}, llm_factory=_fake('{"entities": []}'))
+        stats = http_mod.handle(
+            "GET", "/api/stats", {"x-stats-passcode": STATS_PASSCODE}, b"", settings=s
+        )
+        err = capsys.readouterr().err
+        run_line, stats_line = (json.loads(line) for line in err.strip().splitlines())
+        assert result[0] == 200 and run_line["usage"] == "PostgresError"
+        assert stats[0] == 503 and stats_line["stats"] == (
+            "site runs could not be queried (PostgresError)"
+        )
+        for secret in (*URL_SECRETS, "oops", "upstream"):
+            assert secret not in err, (case, secret)
+            assert secret.encode() not in result[2] + stats[2]
+
+
+def test_a_sqlstate_is_five_characters_of_its_alphabet_or_none() -> None:
+    codes = ["42P01", "08006", "42p01", "42P011", "42P0", " 42P01", "42P01\n", "", None, 42601]
+    kept = []
+    for code in codes:
+
+        async def handler(request: httpx.Request, code: Any = code) -> httpx.Response:
+            return httpx.Response(400, json={"message": "m", "code": code})
+
+        ours = DeadlineExecutor(URL, timeout=5, transport=httpx.MockTransport(handler))
+        with pytest.raises(PostgresError) as caught:
+            ours.execute("SELECT 1")
+        kept.append(caught.value.code)
+        ours.close()
+    assert kept == ["42P01", "08006", *[None] * 8]
+
+
+def test_binary_parameters_and_the_retryable_mark_are_the_engines() -> None:
+    """Parity with ``NeonHTTPExecutor`` beyond what analytics sends: bytes travel as
+    bytea hex and tuples as arrays, and an error the server marks retryable says so
+    (nothing here acts on it: there are no retries)."""
+    seen: dict[str, list[Any]] = {"engine": [], "ours": []}
+    answers = [
+        (200, {"fields": [{"name": "n"}], "rows": [[1]]}),
+        (400, {"message": "serialization failure", "code": "40001", "neon:retryable": True}),
+        (400, {"message": "syntax", "code": "42601"}),
+        (400, {"code": "40001", "neon:retryable": True}),  # no message: not Neon's shape
+        (429, {"message": "slow down"}),
+        (503, {"message": "starting", "neon:retryable": False}),
+    ]
+
+    def record(kind: str, request: httpx.Request) -> httpx.Response:
+        seen[kind].append(json.loads(request.content))
+        status, body = answers[len(seen[kind]) - 1]
+        return httpx.Response(status, json=body)
+
+    async def ours_handler(request: httpx.Request) -> httpx.Response:
+        return record("ours", request)
+
+    engine = NeonHTTPExecutor(
+        URL, max_retries=0, transport=httpx.MockTransport(lambda r: record("engine", r))
+    )
+    ours = DeadlineExecutor(URL, timeout=5, transport=httpx.MockTransport(ours_handler))
+    params = [b"\x00\xffbytes", bytearray(b"ab"), memoryview(b"cd"), (1, (b"\x01", "x")), None]
+
+    def outcome(executor: Any) -> Any:
+        try:
+            return executor.execute("SELECT $1, $2, $3, $4, $5", params)
+        except PostgresError as exc:
+            return (exc.code, exc.status, exc.retryable)
+
+    results = [(outcome(ours), outcome(engine)) for _ in answers]
+    assert all(mine == theirs for mine, theirs in results), results
+    assert [r[0] for r in results[1:]] == [
+        ("40001", 400, True),
+        ("42601", 400, False),
+        (None, 400, False),
+        (None, 429, True),
+        (None, 503, True),
+    ]
+    assert seen["ours"] == seen["engine"]
+    assert seen["ours"][0]["params"] == [
+        "\\x00ff6279746573",
+        "\\x6162",
+        "\\x6364",
+        [1, ["\\x01", "x"]],
+        None,
+    ]
+    statements = [("SELECT $1", (b"\x01",)), ("SELECT $1", ((b"\x02",),))]
+    seen["ours"].clear()
+    seen["engine"].clear()
+    answers[:] = [(200, {"results": [{"fields": [], "rows": []}] * 2})] * 2
+    assert ours.transaction(statements) == engine.transaction(statements)
+    assert seen["ours"] == seen["engine"]
+    ours.close()
+
+
+def test_a_bracketed_address_keeps_its_brackets_in_the_endpoint() -> None:
+    urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        return httpx.Response(200, json={"fields": [], "rows": []})
+
+    for url in ("postgresql://u:p@[2001:db8::7]:5432/db", "postgresql://u:p@db.example.:5432/db"):
+        ours = DeadlineExecutor(url, timeout=5, transport=httpx.MockTransport(handler))
+        ours.execute("SELECT 1")
+        ours.close()
+    assert urls == ["https://[2001:db8::7]/sql", "https://db.example./sql"]
+
+
+def test_a_view_with_less_time_ends_sooner_and_shares_the_connection_pool() -> None:
+    server = Misbehaving("body")
+    ours = DeadlineExecutor(URL, timeout=30, endpoint=server.endpoint)
+    try:
+        short = ours.within(TIMEOUT)
+        assert isinstance(short, SQLExecutor) and repr(short) == "DeadlineExecutor(timeout=0.4)"
+        started = time.monotonic()
+        with pytest.raises(TimeoutError) as caught:
+            short.execute("SELECT 1")
+        assert TIMEOUT <= time.monotonic() - started < TIMEOUT + BOUND
+        assert str(caught.value) == "Neon did not answer in time"
+        _assert_sealed(caught.value)
+        # No more than the executor's own time, and never a wait that is not positive.
+        assert repr(ours.within(99)) == "DeadlineExecutor(timeout=30)"
+        for none in (0, -1, 1e-9):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                ours.within(none).execute("SELECT 1")
+            assert time.monotonic() - started < 0.2
+        assert _wait_for(lambda: server.gone == server.accepted == 1, BOUND)
+    finally:
+        server.close()
+        ours.close()
+
+
+def test_a_write_whose_deadline_passed_while_the_loop_was_held_up_is_never_sent() -> None:
+    """The loop itself delayed (it is one thread): the caller still gets its answer
+    soon after the deadline, and the write does not go out when the loop is back."""
+    hits = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal hits
+        hits += 1
+        return httpx.Response(200, json={"fields": [], "rows": []})
+
+    ours = DeadlineExecutor(URL, timeout=TIMEOUT, transport=httpx.MockTransport(handler))
+    ours.execute("SELECT 1")
+    assert hits == 1
+    deadline._loop().call_soon_threadsafe(time.sleep, TIMEOUT * 4)
+    time.sleep(0.05)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        ours.execute("SELECT 1")
+    assert time.monotonic() - started < TIMEOUT + BOUND
+    time.sleep(TIMEOUT * 4)
+    assert hits == 1
+    ours.execute("SELECT 1")
+    assert hits == 2
+    ours.close()
+
+
+def test_a_lookup_thread_that_cannot_start_gives_its_place_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four threads that failed to start used to use up the lookups for good."""
+    real_thread = threading.Thread
+    refuse = True
+
+    class Thread(real_thread):
+        def start(self) -> None:
+            if refuse and self.name == "ner-site-usage-dns":
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    resolved = socket.getaddrinfo("127.0.0.1", 80)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **k: resolved,
+    )
+    monkeypatch.setattr(deadline.threading, "Thread", Thread)
+    ours = DeadlineExecutor(URL, timeout=TIMEOUT, endpoint="http://name.lookup.test:9/sql")
+    for _ in range(deadline.RESOLVER_THREADS + 2):
+        with pytest.raises(PostgresError) as caught:
+            ours.execute("SELECT 1")
+        assert str(caught.value) == "could not reach Neon (RuntimeError)"
+    assert deadline._loop()._lookups == 0
+    refuse = False
+    server = Misbehaving("silent")
+    try:
+        reached = DeadlineExecutor(
+            URL, timeout=TIMEOUT, endpoint=f"http://name.lookup.test:{server.port}/sql"
+        )
+        with pytest.raises(TimeoutError):  # the lookup ran: the silent server was reached
+            reached.execute("SELECT 1")
+        assert server.accepted == 1
+        reached.close()
+    finally:
+        server.close()
+        ours.close()
+
+
+def test_calls_cancelled_while_they_waited_their_turn_do_not_use_the_executor_up() -> None:
+    """Found by probing: with more calls at once than the HTTP library's pool had
+    connections, the ones cancelled while they waited in that pool were never got
+    over, and every later call timed out for good. Calls wait at a semaphore of this
+    module instead."""
+    server = Misbehaving("body")
+    ours = DeadlineExecutor(URL, timeout=TIMEOUT, endpoint=server.endpoint)
+    outcomes: list[str] = []
+
+    def call() -> None:
+        try:
+            ours.execute("SELECT 1")
+            outcomes.append("rows")
+        except Exception as exc:  # noqa: BLE001 - collected by name
+            outcomes.append(type(exc).__name__)
+
+    try:
+        threads = [threading.Thread(target=call) for _ in range(deadline.MAX_CONNECTIONS * 6)]
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert time.monotonic() - started < TIMEOUT + BOUND
+        assert outcomes == ["TimeoutError"] * len(threads)
+        # No more than the executor's share of connections was ever opened.
+        assert server.accepted == deadline.MAX_CONNECTIONS
+        server.behave = True
+        assert [ours.execute("SELECT 1") for _ in range(6)] == [[{"n": 1}]] * 6
+    finally:
+        server.close()
+        ours.close()
