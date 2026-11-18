@@ -36,9 +36,12 @@ wants more (or who arrives during an outage) run the demo on their own provider 
   `own_per_day = 60`. Environment: `NER_SITE_OPUS_PER_DAY`, `NER_SITE_SONNET_PER_DAY`,
   `NER_SITE_OWN_PER_HOUR`, `NER_SITE_OWN_PER_DAY` (whole numbers 0..10000, refused out
   of range like the others).
-- The table is unchanged (hour buckets). The visit statement sums the visitor's rows from
-  UTC midnight through the current hour, giving hourly and daily counts per tier in the
-  same statement, still under the advisory lock, the lock timeout and one round trip.
+- The table is unchanged (hour buckets). The visit statement sums the visitor's rows of
+  the request's whole UTC day (from its midnight to the next), giving hourly and daily
+  counts per tier in the same statement, still under the advisory lock, the lock timeout
+  and one round trip. The day, not the request's own hour, bounds the scan: a request
+  stamped 14:59 that takes the lock after a 15:00 visit committed must see that visit,
+  or the daily cap could be exceeded at every hour boundary (found by the implementer).
 - Site tiers (`opus`, `sonnet`, `other`):
   - The hour's site total must be below `opus_per_hour + sonnet_per_hour` and the day's
     below `opus_per_day + sonnet_per_day`; `own` visits are in neither total.

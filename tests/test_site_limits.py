@@ -1,4 +1,4 @@
-"""The visitor allowance (spec 2026-11-18, section 3.3).
+"""The visitor allowance (own-key daily-cap design, section 3).
 
 Two layers, because the grant rule lives in SQL.
 
@@ -37,7 +37,8 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -61,6 +62,7 @@ from xwalk.retrieval.postgres import PostgresError, SQLExecutor, tag_of
 # 18 November 2026, 14:20:00 UTC: 40 minutes before the next clock hour.
 HOUR = datetime(2026, 11, 18, 14, tzinfo=timezone.utc)
 NOW = HOUR.timestamp() + 20 * 60
+TO_MIDNIGHT = 9 * 3600 + 40 * 60
 SENTINEL_URL = "postgresql://owner:npg_SENTINELpw0123@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
 RAW_IP = "203.0.113.77"
 SALT = "test-salt"
@@ -122,13 +124,21 @@ class FakeVisits:
         self.created = True
         return []
 
-    def _counts(self, visitor: str, hour: datetime) -> dict[str, int]:
-        found = {"opus": 0, "sonnet": 0, "total": 0}
+    def _counts(self, visitor: str, hour: datetime, midnight: datetime) -> dict[str, int]:
+        found = {
+            key + suffix: 0
+            for suffix in ("", "_today")
+            for key in ("opus", "sonnet", "own", "total")
+        }
+        next_midnight = midnight + timedelta(days=1)
         for (who, when, tier), count in self.rows.items():
-            if who == visitor and when == hour:
-                found["total"] += count
-                if tier in found:
-                    found[tier] += count
+            if who != visitor or not midnight <= when < next_midnight:
+                continue
+            for suffix in ("", "_today") if when == hour else ("_today",):
+                if tier != "own":
+                    found["total" + suffix] += count
+                if tier != "other":
+                    found[tier + suffix] += count
         return found
 
     def _site_visit_lock_timeout(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
@@ -143,17 +153,19 @@ class FakeVisits:
         return [{"pg_advisory_xact_lock": ""}]
 
     def _site_visit(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
-        visitor, hour_text, wanted, opus_cap, sonnet_cap = p
+        visitor, hour_text, midnight, wanted, opus, sonnet, opus_day, sonnet_day, own, own_day = p
         assert visitor in self.locked, "a visit must follow its visitor's lock in a transaction"
         hour = _when(hour_text)
-        seen = self._counts(visitor, hour)
-        if seen["total"] >= opus_cap + sonnet_cap:
+        seen = self._counts(visitor, hour, _when(midnight))
+        if wanted == "own":
+            tier = "own" if seen["own"] < own and seen["own_today"] < own_day else None
+        elif seen["total"] >= opus + sonnet or seen["total_today"] >= opus_day + sonnet_day:
             tier = None
         elif wanted == "other":
             tier = "other"
-        elif wanted == "opus" and seen["opus"] < opus_cap:
+        elif wanted == "opus" and seen["opus"] < opus and seen["opus_today"] < opus_day:
             tier = "opus"
-        elif seen["sonnet"] < sonnet_cap:
+        elif seen["sonnet"] < sonnet and seen["sonnet_today"] < sonnet_day:
             tier = "sonnet"
         else:
             tier = None
@@ -163,8 +175,8 @@ class FakeVisits:
         return [{**seen, "tier": tier}]  # the counts as they were before this visit
 
     def _site_visits_read(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
-        visitor, hour_text = p
-        return [self._counts(visitor, _when(hour_text))]
+        visitor, hour_text, midnight = p
+        return [self._counts(visitor, _when(hour_text), _when(midnight))]
 
     def _site_visits_prune(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
         (cutoff_text,) = p
@@ -225,13 +237,16 @@ def test_first_ten_opus_visits_are_opus() -> None:
 def test_eleventh_is_sonnet_thirtieth_is_last_thirty_first_is_refused() -> None:
     lim, fake, _ = make()
     got = [lim.admit(VISITOR, "opus") for _ in range(30)]
-    assert got[10] == Admission("sonnet", 0, 19, 40 * 60, "opus_allowance_used")
+    assert got[10] == Admission(
+        "sonnet", 0, 19, 40 * 60, "opus_allowance_used", 10, 39, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert [a.tier for a in got[10:]] == ["sonnet"] * 20
     assert all(a.reason == "opus_allowance_used" for a in got[10:])
     assert got[29].sonnet_left == 0
     before = dict(fake.rows)
     with pytest.raises(VisitorLimitReached) as caught:
         lim.admit(VISITOR, "opus")
+    assert caught.value.window == "hour"
     assert 1 <= caught.value.resets_in_s <= 3600
     assert caught.value.resets_in_s == 40 * 60
     assert fake.rows == before == {(VISITOR, HOUR, "opus"): 10, (VISITOR, HOUR, "sonnet"): 20}
@@ -253,8 +268,13 @@ def test_wanting_sonnet_uses_only_the_sonnet_allowance() -> None:
 def test_other_counts_toward_the_total_only() -> None:
     lim, fake, _ = make()
     got = [lim.admit(VISITOR, "other") for _ in range(10)]
-    assert all(a == Admission("other", 10, 20, 40 * 60, None) for a in got)
-    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 19, 40 * 60, None)
+    assert all(
+        a == Admission("other", 10, 20, 40 * 60, None, 20, 40, 30, 60, TO_MIDNIGHT, "hour")
+        for a in got
+    )
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "opus", 9, 19, 40 * 60, None, 19, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     for _ in range(14):
         lim.admit(VISITOR, "other")
     assert [lim.admit(VISITOR, "opus").tier for _ in range(5)] == ["opus"] * 5
@@ -273,19 +293,25 @@ def test_what_is_left_is_capped_by_the_rest_of_the_hours_total() -> None:
     assert [(a.opus_left, a.sonnet_left) for a in got[:10]] == [(10, 20)] * 10
     assert [(a.opus_left, a.sonnet_left) for a in got[10:20]] == [(10, n) for n in range(19, 9, -1)]
     assert [(a.opus_left, a.sonnet_left) for a in got[20:]] == [(n, n) for n in range(9, 4, -1)]
-    assert lim.peek(VISITOR) == Admission("opus", 5, 5, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "opus", 5, 5, 40 * 60, None, 20, 35, 30, 60, TO_MIDNIGHT, "hour"
+    )
     opus = [lim.admit(VISITOR, "opus") for _ in range(5)]
     assert [(a.tier, a.opus_left, a.sonnet_left) for a in opus] == [
         ("opus", n, n) for n in range(4, -1, -1)
     ]
-    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "blocked", 0, 0, 40 * 60, None, 15, 30, 30, 60, TO_MIDNIGHT, "hour"
+    )
 
 
 def test_a_second_visitor_is_unaffected() -> None:
     lim, fake, _ = make()
     for _ in range(30):
         lim.admit(VISITOR, "opus")
-    assert lim.admit(OTHER_VISITOR, "opus") == Admission("opus", 9, 20, 40 * 60, None)
+    assert lim.admit(OTHER_VISITOR, "opus") == Admission(
+        "opus", 9, 20, 40 * 60, None, 19, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert fake.total(OTHER_VISITOR) == 1
 
 
@@ -294,7 +320,9 @@ def test_the_next_clock_hour_starts_fresh() -> None:
     for _ in range(30):
         lim.admit(VISITOR, "opus")
     clock.now = HOUR.timestamp() + 3600
-    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 20, 3600, None)
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "opus", 9, 20, 3600, None, 9, 20, 30, 60, 9 * 3600, "hour"
+    )
     assert fake.rows[(VISITOR, HOUR + timedelta(hours=1), "opus")] == 1
 
 
@@ -318,23 +346,23 @@ def test_an_unknown_tier_is_refused_before_any_query() -> None:
 
 def test_peek_reports_the_same_numbers_and_records_nothing() -> None:
     lim, fake, _ = make()
-    assert lim.peek(VISITOR) == Admission("opus", 10, 20, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "opus", 10, 20, 40 * 60, None, 20, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert fake.rows == {}
     for count in range(1, 31):
         admitted = lim.admit(VISITOR, "opus")
         before = dict(fake.rows)
         peeked = lim.peek(VISITOR)
         assert fake.rows == before
-        assert (peeked.opus_left, peeked.sonnet_left, peeked.resets_in_s) == (
-            admitted.opus_left,
-            admitted.sonnet_left,
-            admitted.resets_in_s,
-        )
+        assert replace(peeked, tier=admitted.tier, reason=admitted.reason) == admitted
         if count < 10:
             assert (peeked.tier, peeked.reason) == ("opus", None)
         elif count < 30:
             assert (peeked.tier, peeked.reason) == ("sonnet", "opus_allowance_used")
-    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "blocked", 0, 0, 40 * 60, None, 10, 20, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert fake.total() == 30
 
 
@@ -342,7 +370,9 @@ def test_peek_is_blocked_at_the_total_even_with_opus_unused() -> None:
     lim, _, _ = make()
     for _ in range(30):
         lim.admit(VISITOR, "other")
-    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "blocked", 0, 0, 40 * 60, None, 20, 30, 30, 60, TO_MIDNIGHT, "hour"
+    )
 
 
 # --- allowances of zero ------------------------------------------------------------
@@ -350,8 +380,12 @@ def test_peek_is_blocked_at_the_total_even_with_opus_unused() -> None:
 
 def test_opus_allowance_of_zero_starts_on_sonnet() -> None:
     lim, fake, _ = make(Allowance(opus_per_hour=0, sonnet_per_hour=2))
-    assert lim.peek(VISITOR) == Admission("sonnet", 0, 2, 40 * 60, "opus_allowance_used")
-    assert lim.admit(VISITOR, "opus") == Admission("sonnet", 0, 1, 40 * 60, "opus_allowance_used")
+    assert lim.peek(VISITOR) == Admission(
+        "sonnet", 0, 2, 40 * 60, "opus_allowance_used", 20, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "sonnet", 0, 1, 40 * 60, "opus_allowance_used", 20, 39, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert lim.admit(VISITOR, "opus").sonnet_left == 0
     with pytest.raises(VisitorLimitReached):
         lim.admit(VISITOR, "opus")
@@ -365,6 +399,183 @@ def test_both_allowances_of_zero_refuse_the_first_visit() -> None:
             lim.admit(VISITOR, wanted)
     assert lim.peek(VISITOR).tier == "blocked"
     assert fake.rows == {}
+
+
+# Exercise the same boundary cases against the in-memory table and the actual SQL.
+Metered = tuple[Callable[..., VisitorLimits], Clock]
+
+
+@pytest.fixture(params=["fake", pytest.param("postgres", marks=pytest.mark.integration)])
+def metered(request: pytest.FixtureRequest) -> Metered:
+    if request.param == "postgres":
+        db = request.getfixturevalue("database")
+        return db.limits, db.clock
+    clock = Clock()
+    return lambda allowance=None: make(allowance, clock=clock)[0], clock
+
+
+def test_twentieth_opus_of_the_day_is_last(metered: Metered) -> None:
+    build, clock = metered
+    lim = build()
+    for hour, visits in enumerate((7, 7, 5)):
+        clock.now = NOW + hour * 3600
+        for _ in range(visits):
+            assert lim.admit(VISITOR, "opus").tier == "opus"
+    last = lim.admit(VISITOR, "opus")
+    assert (last.tier, last.opus_left, last.opus_left_today, last.window) == ("opus", 0, 0, "day")
+    next_visit = lim.admit(VISITOR, "opus")
+    assert (next_visit.tier, next_visit.reason, next_visit.window) == (
+        "sonnet",
+        "opus_allowance_used",
+        "day",
+    )
+
+
+@pytest.mark.parametrize(
+    "later_hour",
+    [HOUR.replace(hour=15), datetime(2026, 3, 29, 23, tzinfo=timezone.utc)],
+    ids=["15h", "last-utc-hour-on-dst-change"],
+)
+def test_delayed_visit_sees_a_later_hours_daily_opus_spend(
+    metered: Metered, later_hour: datetime
+) -> None:
+    build, clock = metered
+    lim = build(Allowance(opus_per_day=1))
+    clock.now = later_hour.timestamp()
+    assert lim.admit(VISITOR, "opus").tier == "opus"
+    clock.now = (later_hour - timedelta(minutes=1)).timestamp()
+    delayed = lim.admit(VISITOR, "opus")
+    assert (delayed.tier, delayed.reason, delayed.window) == (
+        "sonnet",
+        "opus_allowance_used",
+        "day",
+    )
+
+
+def test_sixtieth_site_visit_is_last_until_utc_midnight(metered: Metered) -> None:
+    build, clock = metered
+    lim = build()
+    for _ in range(30):
+        lim.admit(VISITOR, "opus")
+    clock.now += 3600
+    for _ in range(30):
+        last = lim.admit(VISITOR, "opus")
+    assert (last.tier, last.sonnet_left_today) == ("sonnet", 0)
+    before = lim.peek(VISITOR)
+    for wanted in ("opus", "sonnet", "other"):
+        with pytest.raises(VisitorLimitReached) as caught:
+            lim.admit(VISITOR, wanted)
+        assert (caught.value.window, caught.value.resets_in_s) == ("day", 8 * 3600 + 40 * 60)
+    assert before == lim.peek(VISITOR)
+    assert (before.tier, before.window) == ("blocked", "day")
+    assert lim.admit(VISITOR, "own").tier == "own"
+
+
+def test_midnight_restores_both_windows(metered: Metered) -> None:
+    build, clock = metered
+    lim = build()
+    midnight = (HOUR + timedelta(hours=10)).timestamp()
+    clock.now = midnight - 0.2
+    for wanted in ("opus", "sonnet", "own", "other"):
+        last = lim.admit(VISITOR, wanted)
+    assert (last.resets_in_s, last.day_resets_in_s) == (1, 1)
+    clock.now = midnight
+    assert lim.peek(VISITOR) == Admission("opus", 10, 20, 3600, None, 20, 40, 30, 60, 86400, "hour")
+
+
+def test_other_spends_both_site_totals(metered: Metered) -> None:
+    build, clock = metered
+    lim = build(Allowance(2, 2, 3, 2))
+    for _ in range(3):
+        last = lim.admit(VISITOR, "other")
+    assert (last.opus_left, last.sonnet_left) == (1, 1)
+    assert (last.opus_left_today, last.sonnet_left_today) == (2, 2)
+    clock.now += 3600
+    assert lim.admit(VISITOR, "sonnet").opus_left == 1
+    assert lim.admit(VISITOR, "other").window == "day"
+    with pytest.raises(VisitorLimitReached) as caught:
+        lim.admit(VISITOR, "other")
+    assert caught.value.window == "day"
+
+
+def test_own_visits_have_independent_hourly_and_daily_limits(metered: Metered) -> None:
+    build, clock = metered
+    lim = build()
+    for hour in range(2):
+        for wanted in ("opus", "sonnet", "other"):
+            site = lim.admit(VISITOR, wanted)
+            assert (site.own_left, site.own_left_today) == (30, 60 - hour * 30)
+        for n in range(1, 31):
+            own = lim.admit(VISITOR, "own")
+            assert own.tier == "own" and own.reason is None
+            assert (own.own_left, own.own_left_today) == (30 - n, 60 - hour * 30 - n)
+            assert (own.opus_left, own.sonnet_left) == (site.opus_left, site.sonnet_left)
+            assert (own.opus_left_today, own.sonnet_left_today) == (
+                site.opus_left_today,
+                site.sonnet_left_today,
+            )
+        before = lim.peek(VISITOR)
+        with pytest.raises(VisitorLimitReached) as caught:
+            lim.admit(VISITOR, "own")
+        expected = ("hour", 2400) if hour == 0 else ("day", 8 * 3600 + 2400)
+        assert (caught.value.window, caught.value.resets_in_s) == expected
+        assert lim.peek(VISITOR) == before
+        clock.now += 3600
+    assert lim.peek(VISITOR).own_left == 0
+    with pytest.raises(VisitorLimitReached) as caught:
+        lim.admit(VISITOR, "own")
+    assert caught.value.window == "day"
+    assert lim.admit(VISITOR, "opus").tier == "opus"
+
+
+def test_hourly_opus_room_is_capped_by_daily_opus_room(metered: Metered) -> None:
+    build, clock = metered
+    lim = build(Allowance(opus_per_day=3))
+    lim.admit(VISITOR, "opus")
+    clock.now += 3600
+    got = lim.admit(VISITOR, "opus")
+    assert got.opus_left == got.opus_left_today == 1
+    assert got == lim.peek(VISITOR) == lim.peek(VISITOR)
+
+
+def test_retry_after_an_hour_can_admit_opus_on_sonnet(metered: Metered) -> None:
+    build, clock = metered
+    lim = build(Allowance(1, 1, 1, 3))
+    lim.admit(VISITOR, "opus")
+    lim.admit(VISITOR, "sonnet")
+    with pytest.raises(VisitorLimitReached) as caught:
+        lim.admit(VISITOR, "opus")
+    assert (caught.value.window, caught.value.resets_in_s) == ("hour", 2400)
+    clock.now += caught.value.resets_in_s
+    assert lim.admit(VISITOR, "opus").tier == "sonnet"
+
+
+@pytest.mark.parametrize(
+    ("cap", "wanted", "window"),
+    [
+        ("sonnet_per_day", "sonnet", "day"),
+        ("own_per_hour", "own", "hour"),
+        ("own_per_day", "own", "day"),
+    ],
+)
+def test_zero_cap_refuses_without_recording(
+    metered: Metered, cap: str, wanted: limits.Tier, window: str
+) -> None:
+    build, _ = metered
+    lim = build(Allowance(**{cap: 0}))
+    before = lim.peek(VISITOR)
+    with pytest.raises(VisitorLimitReached) as caught:
+        lim.admit(VISITOR, wanted)
+    assert caught.value.window == window
+    assert lim.peek(VISITOR) == before
+
+
+def test_zero_daily_opus_starts_on_sonnet(metered: Metered) -> None:
+    build, _ = metered
+    lim = build(Allowance(opus_per_day=0))
+    last = lim.admit(VISITOR, "opus")
+    assert (last.tier, last.reason, last.window) == ("sonnet", "opus_allowance_used", "day")
+    assert last.opus_left == last.opus_left_today == 0
 
 
 # --- round trips, the table, pruning -----------------------------------------------
@@ -391,7 +602,7 @@ def test_every_visit_locks_its_visitor_first_in_a_statement_of_its_own() -> None
     # The fake refuses a visit that does not follow its visitor's lock in one transaction.
     lim, fake, _ = make(rng=0.0)
     lim.admit(VISITOR, "opus")
-    lim.admit(OTHER_VISITOR, "sonnet")
+    lim.admit(OTHER_VISITOR, "own")
     assert fake.round_trips == 2
     assert fake.tags() == [
         "site_visits_table",
@@ -448,12 +659,13 @@ def test_a_second_instance_creates_the_table_again_harmlessly() -> None:
 
 
 def test_every_value_is_a_parameter() -> None:
-    lim, fake, _ = make(Allowance(opus_per_hour=7, sonnet_per_hour=13), rng=0.0)
+    lim, fake, _ = make(Allowance(7, 13, 11, 31, 17, 47), rng=0.0)
     lim.admit(VISITOR, "opus")
     lim.peek(VISITOR)
     by_tag = {tag_of(sql): (sql, params) for sql, params in fake.sent}
-    assert by_tag["site_visit"][1] == [VISITOR, "2026-11-18T14:00:00+00:00", "opus", 7, 13]
-    assert by_tag["site_visits_read"][1] == [VISITOR, "2026-11-18T14:00:00+00:00"]
+    bounds = [VISITOR, "2026-11-18T14:00:00+00:00", "2026-11-18T00:00:00+00:00"]
+    assert by_tag["site_visit"][1] == [*bounds, "opus", 7, 13, 11, 31, 17, 47]
+    assert by_tag["site_visits_read"][1] == bounds
     assert by_tag["site_visits_prune"][1] == ["2026-11-17T14:20:00+00:00"]
     for sql, _ in fake.sent:
         assert VISITOR not in sql and "2026" not in sql
@@ -651,7 +863,7 @@ def test_default_salt_is_the_digest_of_the_database_url() -> None:
 def test_no_sql_parameter_ever_holds_the_raw_address() -> None:
     lim, fake, _ = make(rng=0.0)
     who = visitor_id({"x-forwarded-for": f"{RAW_IP}, 10.0.0.1"}, SALT)
-    for wanted in ("opus", "sonnet", "other"):
+    for wanted in ("opus", "sonnet", "other", "own"):
         lim.admit(who, wanted)
     lim.peek(who)
     assert fake.sent
@@ -784,23 +996,33 @@ def database() -> Iterator[Database]:
 @pytest.mark.integration
 def test_postgres_ten_opus_then_twenty_sonnet_then_refused(database: Database) -> None:
     lim = database.limits()
-    assert lim.peek(VISITOR) == Admission("opus", 10, 20, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "opus", 10, 20, 40 * 60, None, 20, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     got = [lim.admit(VISITOR, "opus") for _ in range(30)]
     assert [a.tier for a in got] == ["opus"] * 10 + ["sonnet"] * 20
     assert [a.opus_left for a in got[:10]] == list(range(9, -1, -1))
     assert all(a.reason is None and a.sonnet_left == 20 for a in got[:10])
-    assert got[10] == Admission("sonnet", 0, 19, 40 * 60, "opus_allowance_used")
+    assert got[10] == Admission(
+        "sonnet", 0, 19, 40 * 60, "opus_allowance_used", 10, 39, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert [a.sonnet_left for a in got[10:]] == list(range(19, -1, -1))
-    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "blocked", 0, 0, 40 * 60, None, 10, 20, 30, 60, TO_MIDNIGHT, "hour"
+    )
     for wanted in ("opus", "sonnet", "other"):
         with pytest.raises(VisitorLimitReached) as caught:
             lim.admit(VISITOR, wanted)
         assert caught.value.resets_in_s == 40 * 60
     assert database.counts(VISITOR) == {"opus": 10, "sonnet": 20}
     # A second visitor is unaffected, and the next clock hour starts fresh.
-    assert lim.admit(OTHER_VISITOR, "opus") == Admission("opus", 9, 20, 40 * 60, None)
+    assert lim.admit(OTHER_VISITOR, "opus") == Admission(
+        "opus", 9, 20, 40 * 60, None, 19, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     database.clock.now = HOUR.timestamp() + 3600
-    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 20, 3600, None)
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "opus", 9, 20, 3600, None, 9, 20, 30, 60, 9 * 3600, "hour"
+    )
     assert database.counts(VISITOR) == {"opus": 11, "sonnet": 20}
     stored = database.executor.execute(
         f"SELECT to_char(min(hour) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS first, "
@@ -821,8 +1043,12 @@ def test_postgres_sonnet_uses_only_the_sonnet_allowance(database: Database) -> N
     with pytest.raises(VisitorLimitReached):
         lim.admit(VISITOR, "sonnet")
     assert database.counts(VISITOR) == {"sonnet": 20}
-    assert lim.peek(VISITOR) == Admission("opus", 10, 0, 40 * 60, None)
-    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 0, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "opus", 10, 0, 40 * 60, None, 20, 20, 30, 60, TO_MIDNIGHT, "hour"
+    )
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "opus", 9, 0, 40 * 60, None, 19, 20, 30, 60, TO_MIDNIGHT, "hour"
+    )
 
 
 @pytest.mark.integration
@@ -832,7 +1058,9 @@ def test_postgres_other_counts_toward_the_total_only(database: Database) -> None
     assert all(a.tier == "other" and a.reason is None for a in got)
     assert (got[9].opus_left, got[9].sonnet_left) == (10, 20)
     assert (got[24].opus_left, got[24].sonnet_left) == (5, 5)
-    assert lim.peek(VISITOR) == Admission("opus", 5, 5, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission(
+        "opus", 5, 5, 40 * 60, None, 20, 35, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert [lim.admit(VISITOR, "opus").tier for _ in range(5)] == ["opus"] * 5
     for wanted in ("opus", "sonnet", "other"):
         with pytest.raises(VisitorLimitReached):
@@ -843,7 +1071,9 @@ def test_postgres_other_counts_toward_the_total_only(database: Database) -> None
 @pytest.mark.integration
 def test_postgres_allowances_of_zero(database: Database) -> None:
     no_opus = database.limits(Allowance(opus_per_hour=0, sonnet_per_hour=2))
-    assert no_opus.peek(VISITOR) == Admission("sonnet", 0, 2, 40 * 60, "opus_allowance_used")
+    assert no_opus.peek(VISITOR) == Admission(
+        "sonnet", 0, 2, 40 * 60, "opus_allowance_used", 20, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )
     assert [no_opus.admit(VISITOR, "opus").tier for _ in range(2)] == ["sonnet"] * 2
     with pytest.raises(VisitorLimitReached):
         no_opus.admit(VISITOR, "opus")
@@ -872,13 +1102,15 @@ def test_postgres_pruning_deletes_only_rows_older_than_a_day(database: Database)
     assert database.counts(VISITOR) == {"opus": 3}
 
 
-def _burst(database: Database, lim: VisitorLimits, size: int, hold_s: float) -> dict[str, Any]:
+def _burst(
+    database: Database, lim: VisitorLimits, size: int, hold_s: float, wanted: limits.Tier = "opus"
+) -> dict[str, Any]:
     """`size` requests of one visitor that reach the visit statement at the same instant.
 
     A gate session holds the table locked for `hold_s` seconds while every request
     starts, so that all of them are released together: without the per-visitor lock they
     would all take the same snapshot and all be granted Opus. Returns the tiers granted,
-    how many were refused for the hour, and the SQLSTATE of every other failure."""
+    how many were refused for an allowance, and the SQLSTATE of every other failure."""
     lim.peek(VISITOR)  # the table exists and this instance knows it
     gate = database.executor.spawn()
     assert gate.stdin is not None and gate.stdout is not None
@@ -896,7 +1128,7 @@ def _burst(database: Database, lim: VisitorLimits, size: int, hold_s: float) -> 
 
     def visit() -> None:
         try:
-            granted.append(lim.admit(VISITOR, "opus").tier)
+            granted.append(lim.admit(VISITOR, wanted).tier)
         except VisitorLimitReached as reached:
             refused.append(reached.resets_in_s)
         except LimitsUnavailable as unavailable:
@@ -937,6 +1169,21 @@ def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Da
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("wanted", ["opus", "own"])
+def test_postgres_only_one_visit_can_spend_the_last_daily_slot(
+    database: Database, wanted: limits.Tier
+) -> None:
+    lim = database.limits(Allowance(opus_per_day=2, sonnet_per_day=0, own_per_day=2))
+    lim.admit(VISITOR, wanted)
+    database.clock.now += 3600
+    seen = _burst(database, lim, 8, 0.3, wanted)
+    assert seen["granted"] == [wanted]
+    assert seen["refused"] + len(seen["contended"]) == 7
+    assert set(seen["contended"]) <= {limits.LOCK_NOT_AVAILABLE}
+    assert database.counts(VISITOR) == {wanted: 2}
+
+
+@pytest.mark.integration
 def test_postgres_a_held_visitor_lock_makes_admit_raise_55p03(database: Database) -> None:
     """Another session holds this visitor's advisory lock: ``admit`` gives up after the
     lock timeout with ``code == "55P03"``, another visitor is not held up, and the
@@ -967,4 +1214,6 @@ def test_postgres_a_held_visitor_lock_makes_admit_raise_55p03(database: Database
     holder.stdout.close()
     assert holder.stderr is not None
     holder.stderr.close()
-    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 20, 40 * 60, None)
+    assert lim.admit(VISITOR, "opus") == Admission(
+        "opus", 9, 20, 40 * 60, None, 19, 40, 30, 60, TO_MIDNIGHT, "hour"
+    )

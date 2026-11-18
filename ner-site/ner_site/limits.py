@@ -1,11 +1,8 @@
-"""The visitor allowance: how many requests an hour one visitor may start on Claude.
+"""Per-visitor hourly and daily allowances for the public demo.
 
-Binding: docs/superpowers/specs/2026-11-18-claude-provider-open-access-design.md section
-3.3. The site is open and Claude runs on the operator's prepaid Anthropic balance, so the
-only thing between one visitor and that balance is this module. Each visitor gets
-``opus_per_hour`` requests starting on Opus in a clock hour, then ``sonnet_per_hour``
-starting on Sonnet, then is refused until the hour rolls over. A request for another
-model (``other``) spends none of the Claude allowances but counts toward the hour's total.
+The site tiers share a total in each UTC window. Opus can step down to Sonnet,
+and other site models spend only the shared total. Own-key visits have independent
+hourly and daily flood limits. See the own-key daily-cap design, section 3.
 
 Who a visitor is. ``visitor_id`` is a keyed hash of the client address, so the table, the
 SQL parameters and the logs never hold a raw IP, and the ids cannot be reversed without
@@ -19,9 +16,8 @@ and every ``execute`` is an HTTPS round trip, so each call here is exactly one r
 
 - ``admit`` sends one transaction of three statements: a bound on how long it may wait
   for a lock, a lock on the visitor, then one statement that reads the visitor's counts
-  for the hour, decides the tier and records the visit (an upsert that increments
-  ``count``). Deciding in SQL is what keeps that to one round trip; ``_grant`` is the
-  same rule in Python, used by ``peek``.
+  for both windows, decides the tier and records the visit (an upsert that increments
+  ``count``). Deciding in SQL is what keeps that to one round trip.
 - ``peek`` sends one read and decides in Python. It records nothing and takes no lock.
 - The first call of an instance puts ``CREATE TABLE IF NOT EXISTS`` in front, and about
   one ``admit`` in fifty puts a ``DELETE`` of rows older than a day behind, in the same
@@ -35,10 +31,10 @@ transaction, so the visits of one visitor run one after another however they arr
 lock has to be a statement of its own. The transaction runs at READ COMMITTED (the
 default of Postgres and of Neon's endpoint; the executor asks for no other level), where
 each statement takes a fresh snapshot, so the visit statement, which starts only once the
-lock is held, sees every earlier visit committed. The allowances and the hour's total are
-therefore exact under any interleaving: no visit is lost, none is counted twice, and none
-is granted beyond an allowance. Different visitors take different locks and do not wait
-for each other (two ids whose 64-bit hashes collide would merely take turns).
+lock is held, sees every earlier visit committed. Each granted transaction increments
+one bucket. Counting the request's whole UTC day includes visits that committed first
+even when their sampled hour is later. Different visitors lock independently unless
+their 64-bit hashes collide.
 
 The wait for that lock is bounded. One visitor's parallel requests queue on it, and a
 request whose turn does not come within ``LOCK_TIMEOUT_MS`` gives up: Postgres cancels
@@ -91,7 +87,9 @@ __all__ = [
     "visitor_id",
 ]
 
-Tier = Literal["opus", "sonnet", "other"]
+Tier = Literal["opus", "sonnet", "other", "own"]
+_Window = Literal["hour", "day"]
+DAY_S = 86400
 TABLE = "site_visits"
 PRUNE_AFTER_S = 86400
 PRUNE_CHANCE = 0.02
@@ -131,39 +129,44 @@ SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"""
 _LOCK = """/* xwalk:site_visit_lock */
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))"""
 
-# $1 visitor, $2 hour, $3 wanted tier, $4 Opus allowance, $5 Sonnet allowance. One row
-# comes back: the counts as they were before this visit and the tier granted, NULL when
-# the visit is refused (then `put` inserts nothing). The CASE is `_grant` in SQL.
-_VISIT = """/* xwalk:site_visit */
+# $1 visitor, $2 UTC hour, $3 UTC midnight. Both paths read exactly the same buckets.
+# A UTC day is 24 hours even when the database session's local day has a DST change.
+_COUNTS = """SELECT
+    coalesce(sum(count) FILTER (WHERE hour = $2 AND tier = 'opus'), 0) AS opus,
+    coalesce(sum(count) FILTER (WHERE hour = $2 AND tier = 'sonnet'), 0) AS sonnet,
+    coalesce(sum(count) FILTER (WHERE hour = $2 AND tier <> 'own'), 0) AS total,
+    coalesce(sum(count) FILTER (WHERE hour = $2 AND tier = 'own'), 0) AS own,
+    coalesce(sum(count) FILTER (WHERE tier = 'opus'), 0) AS opus_today,
+    coalesce(sum(count) FILTER (WHERE tier = 'sonnet'), 0) AS sonnet_today,
+    coalesce(sum(count) FILTER (WHERE tier <> 'own'), 0) AS total_today,
+    coalesce(sum(count) FILTER (WHERE tier = 'own'), 0) AS own_today
+FROM {table}
+WHERE visitor = $1::text AND hour >= $3::timestamptz
+  AND hour < $3::timestamptz + interval '24 hours'"""
+
+_READ = "/* xwalk:site_visits_read */\n" + _COUNTS
+
+# $4 wanted tier, $5/$6 hourly site caps, $7/$8 daily site caps, $9/$10 own caps.
+# Return pre-increment counts even on refusal, so a retry can use the right reset.
+_VISIT = f"""/* xwalk:site_visit */
 WITH seen AS (
-    SELECT coalesce(sum(s.count) FILTER (WHERE s.tier = 'opus'), 0)::int AS opus,
-           coalesce(sum(s.count) FILTER (WHERE s.tier = 'sonnet'), 0)::int AS sonnet,
-           coalesce(sum(s.count), 0)::int AS total
-    FROM {table} AS s
-    WHERE s.visitor = $1::text AND s.hour = $2::timestamptz
+    {_COUNTS}
 ), pick AS (
-    SELECT seen.opus, seen.sonnet, seen.total,
-           CASE WHEN seen.total >= $4::int + $5::int THEN NULL
-                WHEN $3::text = 'other' THEN 'other'
-                WHEN $3::text = 'opus' AND seen.opus < $4::int THEN 'opus'
-                WHEN seen.sonnet < $5::int THEN 'sonnet'
-                ELSE NULL
+    SELECT seen.*,
+           CASE WHEN $4::text = 'own' THEN
+                    CASE WHEN own < $9::int AND own_today < $10::int THEN 'own' END
+                WHEN total >= $5::int + $6::int OR total_today >= $7::int + $8::int THEN NULL
+                WHEN $4 = 'other' THEN 'other'
+                WHEN $4 = 'opus' AND opus < $5 AND opus_today < $7 THEN 'opus'
+                WHEN sonnet < $6 AND sonnet_today < $8 THEN 'sonnet'
            END AS tier
     FROM seen
 ), put AS (
-    INSERT INTO {table} AS v (visitor, hour, tier, count)
-    SELECT $1::text, $2::timestamptz, pick.tier, 1 FROM pick WHERE pick.tier IS NOT NULL
+    INSERT INTO {{table}} AS v (visitor, hour, tier, count)
+    SELECT $1, $2, tier, 1 FROM pick WHERE tier IS NOT NULL
     ON CONFLICT (visitor, hour, tier) DO UPDATE SET count = v.count + 1
 )
-SELECT pick.opus, pick.sonnet, pick.total, pick.tier FROM pick"""
-
-# $1 visitor, $2 hour.
-_READ = """/* xwalk:site_visits_read */
-SELECT coalesce(sum(s.count) FILTER (WHERE s.tier = 'opus'), 0)::int AS opus,
-       coalesce(sum(s.count) FILTER (WHERE s.tier = 'sonnet'), 0)::int AS sonnet,
-       coalesce(sum(s.count), 0)::int AS total
-FROM {table} AS s
-WHERE s.visitor = $1::text AND s.hour = $2::timestamptz"""
+SELECT * FROM pick"""
 
 # $1 the cutoff: now minus PRUNE_AFTER_S.
 _PRUNE = """/* xwalk:site_visits_prune */
@@ -172,29 +175,37 @@ DELETE FROM {table} WHERE hour < $1::timestamptz"""
 
 @dataclass(frozen=True)
 class Allowance:
-    """Requests one visitor may start on each Claude tier in a clock hour. Their sum is
-    the hour's total for every kind of request."""
+    """Per-visitor caps. Each window's two Claude caps also set its shared site total."""
 
     opus_per_hour: int = 10
     sonnet_per_hour: int = 20
+    opus_per_day: int = 20
+    sonnet_per_day: int = 40
+    own_per_hour: int = 30
+    own_per_day: int = 60
 
 
 @dataclass(frozen=True)
 class Admission:
-    """Where a request starts and what is left of the hour.
-
-    ``opus_left`` and ``sonnet_left`` are what a visitor can still start on each tier this
-    hour: the tier's own allowance, capped by what remains of the hour's total (requests
-    for other models use up the total too). From ``admit`` they are after this visit.
-    ``tier`` is ``"blocked"`` only from ``peek``. ``reason`` is ``"opus_allowance_used"``
-    when Opus was wanted and Sonnet granted, else None.
+    """Where the visit starts (or the next Opus request in a peek), and remaining starts.
+    Only ``peek`` can return ``"blocked"``. Balances from ``admit`` are after the visit.
+    Hourly balances include the daily constraint. Even when ``window == "day"``,
+    ``resets_in_s`` gives the hourly reset and ``day_resets_in_s`` the reset at UTC midnight.
+    A step-down reports the window that limited Opus. Other grants report the window
+    that would next limit starts on the requested tier.
     """
 
-    tier: Literal["opus", "sonnet", "other", "blocked"]
+    tier: Tier | Literal["blocked"]
     opus_left: int
     sonnet_left: int
     resets_in_s: int
     reason: str | None
+    opus_left_today: int
+    sonnet_left_today: int
+    own_left: int
+    own_left_today: int
+    day_resets_in_s: int
+    window: _Window
 
 
 class LimitsUnavailable(Exception):
@@ -208,12 +219,12 @@ class LimitsUnavailable(Exception):
 
 
 class VisitorLimitReached(Exception):
-    """The visitor has used the hour; nothing was recorded. ``resets_in_s`` is the time
-    to the next clock hour."""
+    """The request was refused and nothing was recorded. The binding window sets the retry time."""
 
-    def __init__(self, resets_in_s: int) -> None:
+    def __init__(self, resets_in_s: int, window: _Window = "hour") -> None:
         super().__init__(f"visitor limit reached; resets in {resets_in_s} s")
         self.resets_in_s = resets_in_s
+        self.window = window
 
 
 def visitor_id(headers: Mapping[str, str], salt: str) -> str:
@@ -238,28 +249,39 @@ def default_salt(database_url: str) -> str:
     return hashlib.sha256(database_url.encode("utf-8")).hexdigest()
 
 
-def _grant(wanted: Tier, opus: int, sonnet: int, total: int, allowance: Allowance) -> Tier | None:
-    """The tier a request for ``wanted`` starts on given the hour's counts, or None when
-    it is refused. The CASE in ``_VISIT`` is this rule in SQL; keep the two alike."""
-    if total >= allowance.opus_per_hour + allowance.sonnet_per_hour:
-        return None
-    if wanted == "other":
-        return "other"
-    if wanted == "opus" and opus < allowance.opus_per_hour:
-        return "opus"
-    if sonnet < allowance.sonnet_per_hour:
-        return "sonnet"
-    return None
+def _room(
+    row: Mapping[str, Any], suffix: str, opus: int, sonnet: int, own: int, spent: Tier | None
+) -> dict[Tier, int]:
+    """Starts still possible in one window, including a grant just recorded by the SQL."""
+    try:
+        site_visit = spent is not None and spent != "own"
+        total = opus + sonnet - int(row["total" + suffix]) - site_visit
+        return {
+            "opus": max(0, min(total, opus - int(row["opus" + suffix]) - (spent == "opus"))),
+            "sonnet": max(
+                0, min(total, sonnet - int(row["sonnet" + suffix]) - (spent == "sonnet"))
+            ),
+            "other": max(0, total),
+            "own": max(0, own - int(row["own" + suffix]) - (spent == "own")),
+        }
+    except (KeyError, TypeError, ValueError):
+        raise LimitsUnavailable("visitor limits answered with an unreadable row") from None
 
 
-def _left(opus: int, sonnet: int, total: int, allowance: Allowance) -> tuple[int, int]:
-    """(opus_left, sonnet_left) for the hour's counts: each tier's own allowance, capped
-    by what remains of the hour's total, never negative."""
-    room = allowance.opus_per_hour + allowance.sonnet_per_hour - total
-    return (
-        max(0, min(allowance.opus_per_hour - opus, room)),
-        max(0, min(allowance.sonnet_per_hour - sonnet, room)),
-    )
+def _refusal_window(wanted: Tier, day: dict[Tier, int], caps: Allowance) -> _Window:
+    """An Opus retry only needs one eligible starting tier after the hour rolls over."""
+    hourly = {
+        "opus": caps.opus_per_hour,
+        "sonnet": caps.sonnet_per_hour,
+        "other": caps.opus_per_hour + caps.sonnet_per_hour,
+        "own": caps.own_per_hour,
+    }
+    candidates: tuple[Tier, ...] = ("opus", "sonnet") if wanted == "opus" else (wanted,)
+    enabled = [tier for tier in candidates if hourly[tier] > 0]
+    # A disabling zero cap gives its window's next boundary because no finite retry can admit.
+    if not enabled or any(day[tier] for tier in enabled):
+        return "hour"
+    return "day"
 
 
 def _stamp(epoch: int) -> str:
@@ -298,72 +320,94 @@ class VisitorLimits:
 
     def admit(self, visitor: str, wanted: Tier) -> Admission:
         """Count one visit and say where it starts. Raises ``VisitorLimitReached`` (and
-        records nothing) when the hour is used, ``LimitsUnavailable`` when the database
+        records nothing) when an allowance is used, ``LimitsUnavailable`` when the database
         cannot be asked; with ``code == LOCK_NOT_AVAILABLE`` when the visitor's other
         requests held the lock for longer than ``LOCK_TIMEOUT_MS`` (nothing recorded)."""
         if wanted not in _TIERS:
             raise ValueError(f"wanted must be one of {_TIERS}, got {wanted!r}")
-        allowance = self._allowance
+        caps = self._allowance
         now = self._clock()
-        hour, resets_in_s = self._hour(now)
+        hour, midnight, hour_reset, day_reset = self._windows(now)
         statements: list[Statement] = [
             (_LOCK_TIMEOUT, ()),
             (_LOCK, (visitor,)),
             (
                 self._visit,
-                (visitor, hour, wanted, allowance.opus_per_hour, allowance.sonnet_per_hour),
+                (
+                    visitor,
+                    hour,
+                    midnight,
+                    wanted,
+                    caps.opus_per_hour,
+                    caps.sonnet_per_hour,
+                    caps.opus_per_day,
+                    caps.sonnet_per_day,
+                    caps.own_per_hour,
+                    caps.own_per_day,
+                ),
             ),
         ]
         if self._rng() < PRUNE_CHANCE:
             statements.append((self._prune, (_stamp(int(now) - PRUNE_AFTER_S),)))
         row = self._send(statements, answer=2)
-        try:
-            opus, sonnet, total = int(row["opus"]), int(row["sonnet"]), int(row["total"])
-            tier = row["tier"]
-            if tier is not None and tier not in _TIERS:
-                raise ValueError("unknown tier")
-        except (KeyError, TypeError, ValueError):
-            raise LimitsUnavailable("visitor limits answered with an unreadable row") from None
-        if tier is None:
-            raise VisitorLimitReached(resets_in_s)
-        opus_left, sonnet_left = _left(
-            opus + (tier == "opus"), sonnet + (tier == "sonnet"), total + 1, allowance
-        )
-        return Admission(
-            tier=tier,
-            opus_left=opus_left,
-            sonnet_left=sonnet_left,
-            resets_in_s=resets_in_s,
-            reason=OPUS_USED if wanted == "opus" and tier == "sonnet" else None,
-        )
+        if "tier" not in row or (row["tier"] is not None and row["tier"] not in _TIERS):
+            raise LimitsUnavailable("visitor limits answered with an unreadable row")
+        return self._admission(row, wanted, hour_reset, day_reset, peek=False)
 
     def peek(self, visitor: str) -> Admission:
-        """What a request for Opus would get now, and what is left of the hour before it.
-        Records nothing; ``tier`` is ``"blocked"`` where ``admit`` would raise
-        ``VisitorLimitReached``."""
-        allowance = self._allowance
-        hour, resets_in_s = self._hour(self._clock())
-        row = self._send([(self._read, (visitor, hour))], answer=0)
-        try:
-            opus, sonnet, total = int(row["opus"]), int(row["sonnet"]), int(row["total"])
-        except (KeyError, TypeError, ValueError):
-            raise LimitsUnavailable("visitor limits answered with an unreadable row") from None
-        tier = _grant("opus", opus, sonnet, total, allowance)
-        opus_left, sonnet_left = _left(opus, sonnet, total, allowance)
+        """Predict the next Opus start and report both balances without taking a lock."""
+        hour, midnight, hour_reset, day_reset = self._windows(self._clock())
+        row = self._send([(self._read, (visitor, hour, midnight))], answer=0)
+        return self._admission(row, "opus", hour_reset, day_reset, peek=True)
+
+    def _admission(
+        self, row: Mapping[str, Any], wanted: Tier, hour_reset: int, day_reset: int, *, peek: bool
+    ) -> Admission:
+        caps = self._allowance
+        tier = None if peek else row["tier"]
+        hour = _room(row, "", caps.opus_per_hour, caps.sonnet_per_hour, caps.own_per_hour, tier)
+        day = _room(row, "_today", caps.opus_per_day, caps.sonnet_per_day, caps.own_per_day, tier)
+        if peek:
+            if hour["opus"] and day["opus"]:
+                tier = "opus"
+            elif hour["sonnet"] and day["sonnet"]:
+                tier = "sonnet"
+        reason = OPUS_USED if wanted == "opus" and tier == "sonnet" else None
+        if tier is None:
+            window = _refusal_window(wanted, day, caps)
+            if not peek:
+                raise VisitorLimitReached(day_reset if window == "day" else hour_reset, window)
+        elif reason:
+            # A step-down spends a site slot in both windows. Attribute it to the
+            # Opus cap before that spend, when the SQL actually made its decision.
+            window = "day" if int(row["opus_today"]) >= caps.opus_per_day else "hour"
+        else:
+            window = "day" if day[wanted] == 0 or day[wanted] < hour[wanted] else "hour"
         return Admission(
             tier=tier or "blocked",
-            opus_left=opus_left,
-            sonnet_left=sonnet_left,
-            resets_in_s=resets_in_s,
-            reason=OPUS_USED if tier == "sonnet" else None,
+            opus_left=min(hour["opus"], day["opus"]),
+            sonnet_left=min(hour["sonnet"], day["sonnet"]),
+            resets_in_s=hour_reset,
+            reason=reason,
+            opus_left_today=day["opus"],
+            sonnet_left_today=day["sonnet"],
+            own_left=min(hour["own"], day["own"]),
+            own_left_today=day["own"],
+            day_resets_in_s=day_reset,
+            window=window,
         )
 
     @staticmethod
-    def _hour(now: float) -> tuple[str, int]:
-        """The UTC clock hour of ``now`` as a timestamptz literal, and the whole seconds
-        to the next one (at least 1)."""
-        start = int(now // HOUR_S) * HOUR_S
-        return _stamp(start), max(1, math.ceil(start + HOUR_S - now))
+    def _windows(now: float) -> tuple[str, str, int, int]:
+        """Take both UTC boundaries and ceiling-rounded retry intervals from one clock sample."""
+        hour = int(now // HOUR_S) * HOUR_S
+        day = int(now // DAY_S) * DAY_S
+        return (
+            _stamp(hour),
+            _stamp(day),
+            math.ceil(hour + HOUR_S - now),
+            math.ceil(day + DAY_S - now),
+        )
 
     def _send(self, statements: list[Statement], *, answer: int) -> Mapping[str, Any]:
         """One round trip: the statements, behind the table's creation when this instance
