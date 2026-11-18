@@ -187,27 +187,29 @@ The sections above are the design. Where the code differs, this section holds.
   (`openssl rand -hex 24`). The comparison is constant-time and comes before any
   database call. A Vercel Firewall rate-limit rule on `/api/stats` is the optional
   second layer.
-- **Recording is capped (amends 3.4).** Finding or building the store and the insert
-  run in one worker thread, and the request waits for it at most 2 s in all. At most
-  four writes are under way per warm instance; a run that finds them all taken is not
-  recorded and does not wait, and its log line says `usage: "saturated"`. The write
-  goes through an executor of the site's own (`ner_site/deadline.py`) whose timeout
-  is a wall-clock deadline for the whole exchange, name lookup and complete answer
-  included: at the deadline the write is cancelled and its connection closed. The
-  deadline is one, for the whole attempt, taken on the monotonic clock before any
-  setup: the lock the store is found behind is waited for no longer than to it, a
-  write that gets the lock after it does not start, the SQL call is given only the
-  time that is left, and a write the loop had not got to by then is never sent. So a
-  place is free again when the deadline passes (tested to within one second: with
-  the store's lock held past the deadline and four writes waiting, none of which
-  starts when the lock is released; against an answer that trickles in the body or
-  the headers; a silent server; and a resolver that never answers). No failure of
-  that executor carries the connection string or anything the server sent: each is
-  one of a few fixed-message errors with no cause and no context, and a SQLSTATE is
-  kept only when it has the form of one. The engine's executor limits each read, and a database that
-  sent a byte now and then held a place without end. A name lookup cannot be
-  cancelled: it keeps one of at most four daemon threads until the system's resolver
-  gives up, and while all four are stuck a write fails at once.
+- **Recording is capped (amends 3.4).** The write goes through the engine's Neon
+  executor, built as the limiter's is (no retries, a 2 s timeout), in a daemon worker
+  thread. What the request waits for has one deadline, 2 s on the monotonic clock
+  from the start of the attempt: the lock the store is found behind is waited for no
+  longer than to it, a write whose turn comes after it does not start, and the
+  request stops waiting at it and answers. At most four writes are under way per
+  warm instance; a run that finds them all taken is not recorded and does not wait,
+  and its log line says `usage: "saturated"`.
+- **What that leaves (accepted).** A write that has started cannot be stopped. It
+  ends when the client's own timeouts end it: promptly for a database that is down
+  or silent, not for one that keeps sending an answer very slowly, since the
+  timeouts are per read. In that case up to four worker threads of the warm instance
+  stay busy and its recording pauses (later runs log `saturated`; visitors' answers
+  are unaffected) until the connections end or the instance is recycled. A client of
+  the site's own with a wall-clock deadline was written to close this and removed
+  after three review rounds each found faults in it: a hand-written database client
+  on the request path was the greater risk.
+- **Errors and logs.** Of a database failure the site keeps the error's class and a
+  SQLSTATE that has the form of one, as the limiter does; the replacement is raised
+  outside the handler, so the executor's error (it quotes the server) is neither its
+  cause nor its context. The HTTP libraries' loggers are silent during the limiter's
+  and the record's database exchanges (they log the reason phrase, which can echo
+  the connection string).
 - **The table can be provisioned (amends 3.2).** The lazy `CREATE TABLE IF NOT EXISTS`
   stays; two cold instances racing on a database without the table may lose one row.
   `tools/setup_usage.py` creates the schema, the table and the index once from
@@ -246,12 +248,14 @@ The sections above are the design. Where the code differs, this section holds.
   statement an instance sends fails (SQLSTATE 42P01, that row is lost, as are any
   that were under way at that moment) and the next one it sends creates the table
   again; `tools/setup_usage.py` after the drop avoids the loss.
-- **A port in an analytics-only `DATABASE_URL`.** "Unusable" includes what the URL
-  parser only checks when asked: a port that is not a number in range, a host that
-  is not a DNS name (labels of 1 to 63 letters, digits and hyphens with no hyphen at
-  an end, one dot allowed at the very end; an address, bracketed or not, is refused:
-  a Neon host is a name), anything that is not printable ASCII. Nothing of an
-  unusable URL is kept, so nothing of it is scrubbed from answers.
+- **The host and port of an analytics-only `DATABASE_URL`.** "Unusable" includes
+  what the URL parser only checks when asked: a port that is not a number in range;
+  a host that is not a DNS name (labels of 1 to 63 letters, digits and hyphens with
+  no hyphen at an end, one dot allowed at the very end); an address in any form
+  (bracketed, with a trailing dot, in a resolver's short or hexadecimal forms: a
+  name whose last label is a number); anything in brackets; anything that is not
+  printable ASCII. Nothing of an unusable URL is kept, so nothing of it is scrubbed
+  from answers.
 - **Null rows (amends 4).** `by_model` has a row with `"model": null` per credential
   for runs no model answered, and `by_country` a row with `"country": null` for runs
   without a country, so that each list's runs add up to every run.

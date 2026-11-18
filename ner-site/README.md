@@ -1121,34 +1121,35 @@ The per-model and per-day dollars both add up to the total. Not in the estimate:
 The Anthropic Console is the bill.
 
 **What recording costs a request.** One HTTPS round trip to Neon (a single `INSERT`),
-made after the response is built and before it is sent. One deadline covers the whole
-attempt: 2 s on the clock from the moment recording begins. Against it, in this
-order: the wait for a lock the instance's requests share (behind it the database
-client is found or built; a write that gets the lock after the deadline does not
-start), and then the exchange with what time is left (the name lookup, the
-connection, the request and the complete answer). When the deadline is up the write
-is cancelled and its connection closed, whatever the database is doing, also one that
-keeps sending a byte at a time (`ner_site/deadline.py`; the engine's own client
-limits each read, not the exchange), and a write that had not gone out yet is never
-sent. So the request waits at most 2 s, and the place a write holds is free again
-when its deadline passes; the tests hold it to one second after that, with the lock
-held, with an answer that trickles in the body or in the headers, with a silent
-server and with a resolver that never answers. At most four writes are under way on
-a warm instance at once; a run that finds all four taken is not recorded and does not
-wait. A name lookup is the one thing that cannot be cancelled: the write
-stops waiting for it at the deadline, and the lookup keeps a small thread until the
-system's resolver gives up; there are at most four such threads, and while all four
-are stuck a write fails at once. A database that hangs therefore costs a request at
-most 2 s and never an answer. `timing_ms.handle` in the log does not include
-recording. The log line of a request gains one field, and only when its run was not
-recorded:
+made after the response is built and before it is sent, through the same client the
+visitor allowance uses (the engine's Neon client, with no retries). The write runs in
+a worker thread. What the request waits for has one deadline: 2 s on the clock from
+the moment recording begins. The worker waits no longer than that for a lock the
+instance's requests share (behind it the database client is found or built), a write
+whose turn comes after the deadline does not start, and the request stops waiting at
+the deadline and answers, whatever the write is doing. At most four writes are under
+way on a warm instance at once; a run that finds all four taken is not recorded and
+does not wait. So recording costs a request at most 2 s and never an answer.
+
+What is left, accepted as it is: a write that has started cannot be stopped. When its
+request stops waiting, the write ends when the client's own timeouts end it. They
+are 2 s for each step of the exchange (connecting, sending, each read of the answer),
+so a database that is down or silent ends it promptly. A database that keeps sending
+an answer very slowly, a little at a time, never lets a read time out, and the write
+stays. With four such writes, four worker threads of that warm instance stay busy
+and its recording pauses: later runs log `usage: "saturated"`. Visitors' answers are
+not affected. Recording resumes when the connections end or the instance is
+recycled. The workers are daemon threads and never keep the process alive.
+
+`timing_ms.handle` in the log does not include recording. The log line of a request
+gains one field, and only when its run was not recorded:
 
 | `usage` in the log line | Meaning |
 |---|---|
 | absent | The row was written, or recording is off. |
-| `"TimeoutError"` | No answer within 2 s; the write was cancelled. If the request had already reached the database, the row may still have been written. |
+| `"TimeoutError"` | The write was not done within 2 s and the request stopped waiting. The write itself goes on until it ends, so the row may still be written. |
 | `"saturated"` | Four writes were already under way; this run was skipped at once. |
-| `"PostgresError"` | The database refused the statement or could not be reached (also: four name lookups are still waiting for the resolver). |
+| `"PostgresError"` | The database refused the statement or could not be reached. Only the class and, when the server gave one, its five-character SQLSTATE are kept of such an error (the statistics request logs both, as `stats`). |
 | another class name | What else failed (`ValueError`: a connection string the client cannot use). |
 
 **Deleting the data.** In the Neon SQL editor or with `psql`, on the schema of the
@@ -1787,7 +1788,7 @@ after the fixes.
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1726 passed, 34
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1715 passed, 34
   deselected (1431 before the fixes). The fixes were written test first. Reproduced
   before the code changed: four requests in a row against a database that never
   answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
@@ -1800,32 +1801,27 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
   held at most four writes, skipped the rest at once, and recorded again once it
   answered; the store's shared lock held by another thread cost a request no more
   than the same wait.
-- The write's deadline, after a second review found that the engine's client has
-  none (`tests/test_site_deadline.py`; shown there first against that client, which
-  was still waiting six timeouts later). Against a socket on 127.0.0.1 that answers
-  one byte at a time in the body, one byte at a time in the headers, or not at all,
-  and against a resolver that never returns: every call ended at its deadline with
-  `TimeoutError`, the server saw the connection closed, and through the site every
-  place was free again within one second after the deadline, for requests in a row
-  and for twelve at once, with nothing releasing the server. With the resolver
-  stalled, four lookups each kept a daemon thread and the following writes failed at
-  once. The protocol of the new client was compared with the engine's, request for
-  request and answer for answer, over mock transports.
-- After a third review: with the store's lock held for longer than the deadline and
-  writes waiting for it (four in the test, nine in a probe with the real client),
-  every place was free within one second after the deadline and no write went out
-  when the lock was released. A Neon answer that echoes the database URL in its
-  error code, in a body that is not JSON, or in an error page, and a connection
-  string that cannot be sent as a header, each end as a fixed-message error with no
-  cause or context and nothing of the URL in its message, attributes or `repr`, or
-  in the log line. Beyond the tests, 416 generated answers (statuses, bodies and
-  headers that echo the URL, deeply nested and oversized JSON, broken encodings) and
-  seven answers over raw sockets that are not HTTP or are cut short were run through
-  the client, looking also at the local variables of every frame of the errors:
-  that found one leak (a transaction's answer in a frame, since removed) and that
-  the HTTP library's pool did not recover from calls cancelled while they waited in
-  it, after which every write timed out; calls now wait at a semaphore of the
-  module, and a test covers it.
+- After further reviews, the write's client. A client of the site's own with a
+  wall-clock deadline was written and, three review rounds later, removed again:
+  each round found new faults in it, and a hand-written database client on the
+  request path was judged a greater risk than what it solved. Recording and the
+  statistics read use the engine's Neon client, as the visitor allowance does. What
+  that leaves is tested as it is documented above: against a socket on 127.0.0.1 that
+  accepts and never answers, each write ended by the client's timeout and every
+  place came back; against one that answers a byte at a time, four writes kept their
+  places six timeouts later, every answer was the same as without analytics, the
+  following runs logged `saturated` at once, and the places came back when the
+  connections ended.
+- With the store's lock held for longer than the deadline and four requests waiting,
+  every place was free within one second of the last attempt's own deadline (watched
+  while the requests ran) and no write went out when the lock was released; a write
+  whose turn came after its deadline did not start.
+- A Neon answer that echoes the database URL in its error code, in a body that is
+  not JSON, in an error page or in the reason phrase, and a connection string the
+  client cannot send: the log lines hold the error's class and a SQLSTATE of the
+  right form, and nothing of the URL, also with the HTTP library's own logging at
+  DEBUG (it logs the reason phrase; its loggers are now silent during the limiter's
+  and the record's database exchanges, as they were during own-key exchanges).
 - A failed run that had stepped down (a paid Opus refusal, then a Sonnet failure) is
   priced as Opus; a row with strings of its own in it adds none to `/api/stats`;
   a dropped table is created again after one lost row; a `DATABASE_URL` with a port
@@ -1854,8 +1850,7 @@ Not run or not verified:
   `/_vercel/insights/view`, the dashboard. The `/stats` rewrite on Vercel.
 - Neon's HTTPS endpoint with these statements: that it takes the one text parameter
   of the insert for `$1::jsonb` and returns the statistics column as text. The
-  client that now sends them (`ner_site/deadline.py`) has never spoken to Neon: it
-  follows the engine's client, which has, and was checked against it offline only.
+  client is the one the visitor allowance already uses against Neon in production.
   `tools/setup_usage.py` was run against a fake executor and, through
   `SiteRuns.create`, on the local Postgres; never against Neon.
 - What Anthropic's responses put in `model` for `claude-opus-5-5` and
