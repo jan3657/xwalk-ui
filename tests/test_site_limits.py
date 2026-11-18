@@ -1,23 +1,44 @@
-"""The visitor allowance (spec 2026-11-18, section 3.3): offline, no database.
+"""The visitor allowance (spec 2026-11-18, section 3.3).
 
-``FakeVisits`` is an in-memory stand-in for the ``site_visits`` table. It was chosen over
-``sqlite3`` because the limiter's one statement is Postgres only (a data-modifying CTE,
-``FILTER``, ``$n`` placeholders, ``timestamptz``). It tells the limiter's four statements
-apart by their ``/* xwalk:<tag> */`` and answers each with the meaning of its SQL: it
-keeps the counts, makes the same grant decision the ``site_visit`` statement makes from
-the parameters it was sent, and refuses a statement that arrives before the table exists.
-It also records every statement and counts round trips, so the tests can check what was
-sent as well as what came back.
+Two layers, because the grant rule lives in SQL.
+
+Offline (the default run): ``FakeVisits`` is an in-memory stand-in for the ``site_visits``
+table. It was chosen over ``sqlite3`` because the limiter's statements are Postgres only
+(a data-modifying CTE, ``FILTER``, ``$n`` placeholders, ``timestamptz``, advisory locks).
+It tells the limiter's five statements apart by their ``/* xwalk:<tag> */`` and answers
+each with the meaning of its SQL: it keeps the counts, makes the same grant decision the
+``site_visit`` statement makes from the parameters it was sent, and refuses a statement
+that arrives before the table exists or a visit that does not follow its lock. It also
+records every statement and counts round trips. These tests prove the Python around the
+SQL and what is sent; they cannot prove the SQL.
+
+Against Postgres (``integration`` marker, at the end of the file): the same cases run
+through the real statements, plus a burst of overlapping requests. They need a Postgres
+URL in ``NER_SITE_TEST_DATABASE_URL`` and the ``psql`` client (16 or later, for
+``\\bind``), and skip without either:
+
+    NER_SITE_TEST_DATABASE_URL=postgresql://user@localhost:5432/postgres \\
+        .venv/bin/python -m pytest -q -m integration tests/test_site_limits.py
+
+No Postgres driver is installed in the project's environment and none may be added, so
+``PsqlExecutor`` drives ``psql``. Each test creates a schema of its own and drops it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import os
 import re
-from collections.abc import Sequence
+import secrets
+import shutil
+import subprocess
+import threading
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 from ner_site import limits
@@ -58,6 +79,7 @@ class FakeVisits:
         self.sent: list[tuple[str, list[Any]]] = []
         self.round_trips = 0
         self.fail: Exception | None = None
+        self.locked: set[str] = set()  # visitors locked by the transaction now running
 
     # --- the executor protocol
     def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -74,6 +96,8 @@ class FakeVisits:
         except Exception:
             self.rows, self.created = before, created  # all or nothing
             raise
+        finally:
+            self.locked.clear()  # a transaction lock ends with its transaction
 
     def _run(self, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
         p = list(params)
@@ -83,7 +107,7 @@ class FakeVisits:
         placeholders = {int(n) for n in re.findall(r"\$(\d+)", sql)}
         assert placeholders == set(range(1, len(p) + 1)), "placeholders and parameters differ"
         tag = tag_of(sql)
-        if tag != "site_visits_table" and not self.created:
+        if tag not in ("site_visits_table", "site_visit_lock") and not self.created:
             raise PostgresError('relation "site_visits" does not exist', code="42P01")
         return getattr(self, f"_{tag}")(sql, p)
 
@@ -102,8 +126,14 @@ class FakeVisits:
                     found[tier] += count
         return found
 
+    def _site_visit_lock(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
+        assert "pg_advisory_xact_lock" in sql
+        self.locked.add(p[0])
+        return [{"pg_advisory_xact_lock": ""}]
+
     def _site_visit(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
         visitor, hour_text, wanted, opus_cap, sonnet_cap = p
+        assert visitor in self.locked, "a visit must follow its visitor's lock in a transaction"
         hour = _when(hour_text)
         seen = self._counts(visitor, hour)
         if seen["total"] >= opus_cap + sonnet_cap:
@@ -211,14 +241,33 @@ def test_wanting_sonnet_uses_only_the_sonnet_allowance() -> None:
 
 def test_other_counts_toward_the_total_only() -> None:
     lim, fake, _ = make()
-    got = [lim.admit(VISITOR, "other") for _ in range(25)]
+    got = [lim.admit(VISITOR, "other") for _ in range(10)]
     assert all(a == Admission("other", 10, 20, 40 * 60, None) for a in got)
-    assert [lim.admit(VISITOR, "opus").opus_left for _ in range(5)] == [9, 8, 7, 6, 5]
+    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 19, 40 * 60, None)
+    for _ in range(14):
+        lim.admit(VISITOR, "other")
+    assert [lim.admit(VISITOR, "opus").tier for _ in range(5)] == ["opus"] * 5
     assert fake.total() == 30
     for wanted in ("opus", "sonnet", "other"):
         with pytest.raises(VisitorLimitReached):
             lim.admit(VISITOR, wanted)
-    assert fake.rows == {(VISITOR, HOUR, "other"): 25, (VISITOR, HOUR, "opus"): 5}
+    assert fake.rows == {(VISITOR, HOUR, "other"): 24, (VISITOR, HOUR, "opus"): 6}
+
+
+def test_what_is_left_is_capped_by_the_rest_of_the_hours_total() -> None:
+    lim, _, _ = make()
+    # 30 in the hour. Other models use up the total, so less than a full Claude allowance
+    # can be left although no Claude request has been made.
+    got = [lim.admit(VISITOR, "other") for _ in range(25)]
+    assert [(a.opus_left, a.sonnet_left) for a in got[:10]] == [(10, 20)] * 10
+    assert [(a.opus_left, a.sonnet_left) for a in got[10:20]] == [(10, n) for n in range(19, 9, -1)]
+    assert [(a.opus_left, a.sonnet_left) for a in got[20:]] == [(n, n) for n in range(9, 4, -1)]
+    assert lim.peek(VISITOR) == Admission("opus", 5, 5, 40 * 60, None)
+    opus = [lim.admit(VISITOR, "opus") for _ in range(5)]
+    assert [(a.tier, a.opus_left, a.sonnet_left) for a in opus] == [
+        ("opus", n, n) for n in range(4, -1, -1)
+    ]
+    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
 
 
 def test_a_second_visitor_is_unaffected() -> None:
@@ -282,7 +331,7 @@ def test_peek_is_blocked_at_the_total_even_with_opus_unused() -> None:
     lim, _, _ = make()
     for _ in range(30):
         lim.admit(VISITOR, "other")
-    assert lim.peek(VISITOR) == Admission("blocked", 10, 20, 40 * 60, None)
+    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
 
 
 # --- allowances of zero ------------------------------------------------------------
@@ -314,13 +363,36 @@ def test_one_round_trip_per_call_and_the_table_is_created_once() -> None:
     lim, fake, _ = make()
     lim.admit(VISITOR, "opus")
     assert fake.round_trips == 1
-    assert fake.tags() == ["site_visits_table", "site_visit"]
+    assert fake.tags() == ["site_visits_table", "site_visit_lock", "site_visit"]
     lim.admit(VISITOR, "opus")
     lim.peek(VISITOR)
     assert fake.round_trips == 3
-    assert fake.tags()[2:] == ["site_visit", "site_visits_read"]
-    assert f"xwalk.{TABLE}" in fake.sent[0][0]
-    assert all(f"xwalk.{TABLE}" in sql for sql, _ in fake.sent)
+    assert fake.tags()[3:] == ["site_visit_lock", "site_visit", "site_visits_read"]
+    assert all(f"xwalk.{TABLE}" in sql for sql, _ in fake.sent if tag_of(sql) != "site_visit_lock")
+
+
+def test_every_visit_locks_its_visitor_first_in_a_statement_of_its_own() -> None:
+    # The fake refuses a visit that does not follow its visitor's lock in one transaction.
+    lim, fake, _ = make(rng=0.0)
+    lim.admit(VISITOR, "opus")
+    lim.admit(OTHER_VISITOR, "sonnet")
+    assert fake.round_trips == 2
+    assert fake.tags() == [
+        "site_visits_table", "site_visit_lock", "site_visit", "site_visits_prune",
+        "site_visit_lock", "site_visit", "site_visits_prune",
+    ]  # fmt: skip
+    locks = [(sql, params) for sql, params in fake.sent if tag_of(sql) == "site_visit_lock"]
+    assert [params for _, params in locks] == [[VISITOR], [OTHER_VISITOR]]
+    assert all("pg_advisory_xact_lock(hashtextextended($1::text, 0))" in sql for sql, _ in locks)
+    visit = next(sql for sql, _ in fake.sent if tag_of(sql) == "site_visit")
+    assert "pg_advisory" not in visit
+
+
+def test_peek_takes_no_lock() -> None:
+    lim, fake, _ = make()
+    lim.peek(VISITOR)
+    lim.peek(VISITOR)
+    assert "site_visit_lock" not in fake.tags()
 
 
 def test_peek_on_a_new_instance_creates_the_table_in_the_same_round_trip() -> None:
@@ -451,8 +523,11 @@ def test_a_schema_that_is_not_a_lower_case_identifier_is_refused(schema: str) ->
 
 def test_a_plain_schema_is_accepted() -> None:
     fake = FakeVisits()
-    VisitorLimits(fake, "ner_site_2", Allowance(), clock=Clock(), rng=lambda: 0.5).peek(VISITOR)
-    assert all(f"ner_site_2.{TABLE}" in sql for sql, _ in fake.sent)
+    lim = VisitorLimits(fake, "ner_site_2", Allowance(), clock=Clock(), rng=lambda: 0.5)
+    lim.admit(VISITOR, "opus")
+    lim.peek(VISITOR)
+    tables = [sql for sql, _ in fake.sent if tag_of(sql) != "site_visit_lock"]
+    assert len(tables) == 3 and all(f"ner_site_2.{TABLE}" in sql for sql in tables)
 
 
 # --- the visitor id ----------------------------------------------------------------
@@ -532,3 +607,254 @@ def test_module_exports() -> None:
     assert {"VisitorLimits", "visitor_id", "default_salt", "Allowance", "Admission"} <= set(
         limits.__all__
     )
+
+
+# --- against Postgres --------------------------------------------------------------
+
+DATABASE_URL_ENV = "NER_SITE_TEST_DATABASE_URL"
+_SEPARATOR = "-----statement-----"
+
+
+class PsqlExecutor:
+    """The smallest ``SQLExecutor`` over the ``psql`` client that the limiter needs.
+
+    Parameters are bound as text (``\bind``), as Neon's HTTPS endpoint sends them. A
+    transaction is one ``psql`` session at READ COMMITTED, the level Neon's endpoint uses
+    when none is asked for. At most one row per statement is read back, and every value
+    comes back as a string (NULL as None), which is also the least a real executor may
+    give. The URL goes to ``psql`` through ``PG*`` environment variables, never on the
+    command line, and appears in no message.
+    """
+
+    def __init__(self, url: str) -> None:
+        parts = urlsplit(url)
+        query = parse_qs(parts.query)
+        settings = {
+            "PGHOST": (query.get("host") or [parts.hostname or ""])[0],
+            "PGPORT": str(parts.port or ""),
+            "PGUSER": unquote(parts.username or ""),
+            "PGPASSWORD": unquote(parts.password or ""),
+            "PGDATABASE": unquote(parts.path.lstrip("/")),
+            "PGSSLMODE": (query.get("sslmode") or [""])[0],
+            "PGCONNECT_TIMEOUT": "10",
+        }
+        self._env = {**os.environ, **{k: v for k, v in settings.items() if v}}
+
+    @staticmethod
+    def _statement(sql: str, params: Sequence[Any]) -> str:
+        bound = " ".join("'" + str(p).replace("'", "''") + "'" for p in params)
+        return f"{sql}\n\\bind {bound} \\gx\n"
+
+    def spawn(self) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            ["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env,
+        )
+
+    def _run(self, script: str) -> str:
+        process = self.spawn()
+        out, err = process.communicate(script, timeout=60)
+        if process.returncode:
+            raise RuntimeError(f"psql failed: {(err.strip().splitlines() or ['?'])[-1]}")
+        return out
+
+    @staticmethod
+    def _rows(out: str) -> list[dict[str, Any]]:
+        lines = [line for line in out.splitlines() if "|" in line]
+        row = dict(line.split("|", 1) for line in lines)
+        return [{name: value or None for name, value in row.items()}] if row else []
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        return self._rows(self._run(self._statement(sql, params)))
+
+    def transaction(
+        self, statements: Sequence[tuple[str, Sequence[Any]]], *, read_only: bool = False
+    ) -> list[list[dict[str, Any]]]:
+        body = f"\\echo {_SEPARATOR}\n".join(self._statement(s, p) for s, p in statements)
+        out = self._run(f"BEGIN ISOLATION LEVEL READ COMMITTED;\n{body}COMMIT;\n")
+        return [self._rows(part) for part in out.split(_SEPARATOR + "\n")]
+
+
+class Database:
+    """A throwaway schema on the Postgres of ``NER_SITE_TEST_DATABASE_URL``."""
+
+    def __init__(self, executor: PsqlExecutor, schema: str) -> None:
+        self.executor = executor
+        self.schema = schema
+        self.clock = Clock()
+
+    def limits(self, allowance: Allowance | None = None, *, rng: float = 0.5) -> VisitorLimits:
+        return VisitorLimits(
+            self.executor, self.schema, allowance or Allowance(), clock=self.clock, rng=lambda: rng
+        )
+
+    def counts(self, visitor: str) -> dict[str, int]:
+        """What the table holds for a visitor, per tier, over every hour."""
+        rows = self.executor.execute(
+            "SELECT coalesce(json_object_agg(t.tier, t.n), '{}') AS counts FROM ("
+            f"SELECT tier, sum(count) AS n FROM {self.schema}.{TABLE} "
+            "WHERE visitor = $1::text GROUP BY tier) AS t",
+            (visitor,),
+        )
+        return json.loads(rows[0]["counts"])
+
+
+@pytest.fixture
+def database() -> Iterator[Database]:
+    url = os.environ.get(DATABASE_URL_ENV, "").strip()
+    if not url:
+        pytest.skip(f"{DATABASE_URL_ENV} is not set")
+    if shutil.which("psql") is None:
+        pytest.skip("the psql client is not installed")
+    executor = PsqlExecutor(url)
+    schema = f"limits_test_{secrets.token_hex(4)}"
+    executor.execute(f"CREATE SCHEMA {schema}")
+    try:
+        yield Database(executor, schema)
+    finally:
+        executor.execute(f"DROP SCHEMA {schema} CASCADE")
+
+
+@pytest.mark.integration
+def test_postgres_ten_opus_then_twenty_sonnet_then_refused(database: Database) -> None:
+    lim = database.limits()
+    assert lim.peek(VISITOR) == Admission("opus", 10, 20, 40 * 60, None)
+    got = [lim.admit(VISITOR, "opus") for _ in range(30)]
+    assert [a.tier for a in got] == ["opus"] * 10 + ["sonnet"] * 20
+    assert [a.opus_left for a in got[:10]] == list(range(9, -1, -1))
+    assert all(a.reason is None and a.sonnet_left == 20 for a in got[:10])
+    assert got[10] == Admission("sonnet", 0, 19, 40 * 60, "opus_allowance_used")
+    assert [a.sonnet_left for a in got[10:]] == list(range(19, -1, -1))
+    assert lim.peek(VISITOR) == Admission("blocked", 0, 0, 40 * 60, None)
+    for wanted in ("opus", "sonnet", "other"):
+        with pytest.raises(VisitorLimitReached) as caught:
+            lim.admit(VISITOR, wanted)
+        assert caught.value.resets_in_s == 40 * 60
+    assert database.counts(VISITOR) == {"opus": 10, "sonnet": 20}
+    # A second visitor is unaffected, and the next clock hour starts fresh.
+    assert lim.admit(OTHER_VISITOR, "opus") == Admission("opus", 9, 20, 40 * 60, None)
+    database.clock.now = HOUR.timestamp() + 3600
+    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 20, 3600, None)
+    assert database.counts(VISITOR) == {"opus": 11, "sonnet": 20}
+    stored = database.executor.execute(
+        f"SELECT to_char(min(hour) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS first, "
+        f"count(DISTINCT hour) AS hours FROM {database.schema}.{TABLE} WHERE visitor = $1::text",
+        (VISITOR,),
+    )
+    assert stored == [{"first": "2026-11-18 14:00:00", "hours": "2"}]
+
+
+@pytest.mark.integration
+def test_postgres_sonnet_uses_only_the_sonnet_allowance(database: Database) -> None:
+    lim = database.limits()
+    got = [lim.admit(VISITOR, "sonnet") for _ in range(20)]
+    assert [(a.tier, a.sonnet_left, a.reason) for a in got] == [
+        ("sonnet", n, None) for n in range(19, -1, -1)
+    ]
+    assert all(a.opus_left == 10 for a in got)
+    with pytest.raises(VisitorLimitReached):
+        lim.admit(VISITOR, "sonnet")
+    assert database.counts(VISITOR) == {"sonnet": 20}
+    assert lim.peek(VISITOR) == Admission("opus", 10, 0, 40 * 60, None)
+    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 0, 40 * 60, None)
+
+
+@pytest.mark.integration
+def test_postgres_other_counts_toward_the_total_only(database: Database) -> None:
+    lim = database.limits()
+    got = [lim.admit(VISITOR, "other") for _ in range(25)]
+    assert all(a.tier == "other" and a.reason is None for a in got)
+    assert (got[9].opus_left, got[9].sonnet_left) == (10, 20)
+    assert (got[24].opus_left, got[24].sonnet_left) == (5, 5)
+    assert lim.peek(VISITOR) == Admission("opus", 5, 5, 40 * 60, None)
+    assert [lim.admit(VISITOR, "opus").tier for _ in range(5)] == ["opus"] * 5
+    for wanted in ("opus", "sonnet", "other"):
+        with pytest.raises(VisitorLimitReached):
+            lim.admit(VISITOR, wanted)
+    assert database.counts(VISITOR) == {"other": 25, "opus": 5}
+
+
+@pytest.mark.integration
+def test_postgres_allowances_of_zero(database: Database) -> None:
+    no_opus = database.limits(Allowance(opus_per_hour=0, sonnet_per_hour=2))
+    assert no_opus.peek(VISITOR) == Admission("sonnet", 0, 2, 40 * 60, "opus_allowance_used")
+    assert [no_opus.admit(VISITOR, "opus").tier for _ in range(2)] == ["sonnet"] * 2
+    with pytest.raises(VisitorLimitReached):
+        no_opus.admit(VISITOR, "opus")
+    assert database.counts(VISITOR) == {"sonnet": 2}
+    nothing = database.limits(Allowance(opus_per_hour=0, sonnet_per_hour=0))
+    for wanted in ("opus", "sonnet", "other"):
+        with pytest.raises(VisitorLimitReached):
+            nothing.admit(OTHER_VISITOR, wanted)
+    assert nothing.peek(OTHER_VISITOR).tier == "blocked"
+    assert database.counts(OTHER_VISITOR) == {}
+
+
+@pytest.mark.integration
+def test_postgres_pruning_deletes_only_rows_older_than_a_day(database: Database) -> None:
+    database.limits(rng=0.99).admit(VISITOR, "opus")  # creates the table, prunes nothing
+    for visitor, hours in (("old", 25), ("recent", 23)):
+        database.executor.execute(
+            f"INSERT INTO {database.schema}.{TABLE} VALUES ($1::text, $2::timestamptz, 'opus', 3)",
+            (visitor, (HOUR - timedelta(hours=hours)).isoformat()),
+        )
+    database.limits(rng=0.99).admit(VISITOR, "opus")
+    assert database.counts("old") == {"opus": 3}
+    database.limits(rng=0.0).admit(VISITOR, "opus")
+    assert database.counts("old") == {}
+    assert database.counts("recent") == {"opus": 3}
+    assert database.counts(VISITOR) == {"opus": 3}
+
+
+@pytest.mark.integration
+def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Database) -> None:
+    """Forty requests of one visitor that reach the visit statement at the same instant.
+
+    A gate session holds the table locked while every request starts, so that all of them
+    are released together: without the per-visitor lock they would all take the same
+    snapshot and all be granted Opus.
+    """
+    lim = database.limits()
+    lim.peek(VISITOR)  # the table exists and this instance knows it
+    gate = database.executor.spawn()
+    assert gate.stdin is not None and gate.stdout is not None
+    gate.stdin.write(
+        f"BEGIN;\nLOCK TABLE {database.schema}.{TABLE} IN ACCESS EXCLUSIVE MODE;\n"
+        "\\echo held\nSELECT pg_sleep(3);\nCOMMIT;\n"
+    )
+    gate.stdin.close()
+    assert gate.stdout.readline().strip() == "held"
+
+    burst = 40
+    granted: list[str] = []
+    refused: list[int] = []
+    errors: list[BaseException] = []
+
+    def visit() -> None:
+        try:
+            granted.append(lim.admit(VISITOR, "opus").tier)
+        except VisitorLimitReached as reached:
+            refused.append(reached.resets_in_s)
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=visit) for _ in range(burst)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert gate.wait(timeout=30) == 0
+    gate.stdout.close()
+    assert gate.stderr is not None
+    gate.stderr.close()
+
+    assert errors == []
+    assert granted.count("opus") == 10
+    assert granted.count("sonnet") == 20
+    assert len(granted) == 30 and len(refused) == burst - 30
+    # Every granted visit is in the table once, and nothing else is.
+    assert database.counts(VISITOR) == {"opus": 10, "sonnet": 20}

@@ -17,20 +17,32 @@ through the same ``SQLExecutor``: ``site_visits(visitor, hour, tier, count)`` wi
 per visitor, UTC clock hour and tier. A serverless instance has no memory worth trusting,
 and every ``execute`` is an HTTPS round trip, so each call here is exactly one round trip:
 
-- ``admit`` sends one statement that reads the visitor's counts for the hour, decides the
-  tier and records the visit (an upsert that increments ``count``). Deciding in SQL is what
-  makes that a single statement; ``_grant`` is the same rule in Python, used by ``peek``.
-- ``peek`` sends one read and decides in Python.
+- ``admit`` sends one transaction of two statements: a lock on the visitor, then one
+  statement that reads the visitor's counts for the hour, decides the tier and records
+  the visit (an upsert that increments ``count``). Deciding in SQL is what keeps that to
+  one round trip; ``_grant`` is the same rule in Python, used by ``peek``.
+- ``peek`` sends one read and decides in Python. It records nothing and takes no lock.
 - The first call of an instance puts ``CREATE TABLE IF NOT EXISTS`` in front, and about
-  one ``admit`` in fifty puts a ``DELETE`` of rows older than a day behind, as one
+  one ``admit`` in fifty puts a ``DELETE`` of rows older than a day behind, in the same
   transaction: still one round trip.
 
-Under concurrent requests. The statement decides from the counts it read and then
-increments the row in place, so two requests of one visitor that overlap both see the
-same counts, both are granted, and both are counted: the counter never loses a visit, and
-an allowance can be overshot by at most the number of requests in flight together. The
-next request reads the true total and is held to it. A count above its allowance is
-reported as nothing left, never as a negative number.
+Under concurrent requests. A statement decides from the snapshot it starts with, so
+without more, a burst of parallel requests from one visitor would all read the same
+counts and all be granted the same tier. The lock closes that: every ``admit`` first
+takes ``pg_advisory_xact_lock`` on a hash of the visitor id, held to the end of the
+transaction, so the visits of one visitor run one after another however they arrive. The
+lock has to be a statement of its own. The transaction runs at READ COMMITTED (the
+default of Postgres and of Neon's endpoint; the executor asks for no other level), where
+each statement takes a fresh snapshot, so the visit statement, which starts only once the
+lock is held, sees every earlier visit committed. The allowances and the hour's total are
+therefore exact under any interleaving: no visit is lost, none is counted twice, and none
+is granted beyond an allowance. Different visitors take different locks and do not wait
+for each other (two ids whose 64-bit hashes collide would merely take turns).
+
+One thing the statements cannot make safe is a retry. ``NeonHTTPExecutor`` sends a
+request again after a transport error or a 5xx, and the increment is not idempotent, so a
+visit whose first attempt was applied but whose answer was lost would be counted twice:
+the caller should give the limiter an executor that does not retry.
 
 When the database cannot be asked, every failure becomes ``LimitsUnavailable`` with a
 message made here from the error's class and SQLSTATE only. The executor's own text is
@@ -92,6 +104,12 @@ CREATE TABLE IF NOT EXISTS {table} (
     PRIMARY KEY (visitor, hour, tier)
 )"""
 
+# $1 visitor. Serialises the visits of one visitor to the end of the transaction. It must
+# stay a statement of its own, ahead of `_VISIT`: a lock taken inside the visit statement
+# would come after that statement's snapshot, and the counts read would be stale.
+_LOCK = """/* xwalk:site_visit_lock */
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))"""
+
 # $1 visitor, $2 hour, $3 wanted tier, $4 Opus allowance, $5 Sonnet allowance. One row
 # comes back: the counts as they were before this visit and the tier granted, NULL when
 # the visit is refused (then `put` inserts nothing). The CASE is `_grant` in SQL.
@@ -144,9 +162,11 @@ class Allowance:
 class Admission:
     """Where a request starts and what is left of the hour.
 
-    From ``admit``, ``opus_left`` and ``sonnet_left`` are after this visit. ``tier`` is
-    ``"blocked"`` only from ``peek``. ``reason`` is ``"opus_allowance_used"`` when Opus was
-    wanted and Sonnet granted, else None.
+    ``opus_left`` and ``sonnet_left`` are what a visitor can still start on each tier this
+    hour: the tier's own allowance, capped by what remains of the hour's total (requests
+    for other models use up the total too). From ``admit`` they are after this visit.
+    ``tier`` is ``"blocked"`` only from ``peek``. ``reason`` is ``"opus_allowance_used"``
+    when Opus was wanted and Sonnet granted, else None.
     """
 
     tier: Literal["opus", "sonnet", "other", "blocked"]
@@ -206,6 +226,16 @@ def _grant(wanted: Tier, opus: int, sonnet: int, total: int, allowance: Allowanc
     return None
 
 
+def _left(opus: int, sonnet: int, total: int, allowance: Allowance) -> tuple[int, int]:
+    """(opus_left, sonnet_left) for the hour's counts: each tier's own allowance, capped
+    by what remains of the hour's total, never negative."""
+    room = allowance.opus_per_hour + allowance.sonnet_per_hour - total
+    return (
+        max(0, min(allowance.opus_per_hour - opus, room)),
+        max(0, min(allowance.sonnet_per_hour - sonnet, room)),
+    )
+
+
 def _stamp(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
@@ -250,16 +280,17 @@ class VisitorLimits:
         now = self._clock()
         hour, resets_in_s = self._hour(now)
         statements: list[Statement] = [
+            (_LOCK, (visitor,)),
             (
                 self._visit,
                 (visitor, hour, wanted, allowance.opus_per_hour, allowance.sonnet_per_hour),
-            )
+            ),
         ]
         if self._rng() < PRUNE_CHANCE:
             statements.append((self._prune, (_stamp(int(now) - PRUNE_AFTER_S),)))
-        row = self._send(statements)
+        row = self._send(statements, answer=1)
         try:
-            opus, sonnet = int(row["opus"]), int(row["sonnet"])
+            opus, sonnet, total = int(row["opus"]), int(row["sonnet"]), int(row["total"])
             tier = row["tier"]
             if tier is not None and tier not in _TIERS:
                 raise ValueError("unknown tier")
@@ -267,10 +298,13 @@ class VisitorLimits:
             raise LimitsUnavailable("visitor limits answered with an unreadable row") from None
         if tier is None:
             raise VisitorLimitReached(resets_in_s)
+        opus_left, sonnet_left = _left(
+            opus + (tier == "opus"), sonnet + (tier == "sonnet"), total + 1, allowance
+        )
         return Admission(
             tier=tier,
-            opus_left=max(0, allowance.opus_per_hour - opus - (tier == "opus")),
-            sonnet_left=max(0, allowance.sonnet_per_hour - sonnet - (tier == "sonnet")),
+            opus_left=opus_left,
+            sonnet_left=sonnet_left,
             resets_in_s=resets_in_s,
             reason=OPUS_USED if wanted == "opus" and tier == "sonnet" else None,
         )
@@ -281,16 +315,17 @@ class VisitorLimits:
         ``VisitorLimitReached``."""
         allowance = self._allowance
         hour, resets_in_s = self._hour(self._clock())
-        row = self._send([(self._read, (visitor, hour))])
+        row = self._send([(self._read, (visitor, hour))], answer=0)
         try:
             opus, sonnet, total = int(row["opus"]), int(row["sonnet"]), int(row["total"])
         except (KeyError, TypeError, ValueError):
             raise LimitsUnavailable("visitor limits answered with an unreadable row") from None
         tier = _grant("opus", opus, sonnet, total, allowance)
+        opus_left, sonnet_left = _left(opus, sonnet, total, allowance)
         return Admission(
             tier=tier or "blocked",
-            opus_left=max(0, allowance.opus_per_hour - opus),
-            sonnet_left=max(0, allowance.sonnet_per_hour - sonnet),
+            opus_left=opus_left,
+            sonnet_left=sonnet_left,
             resets_in_s=resets_in_s,
             reason=OPUS_USED if tier == "sonnet" else None,
         )
@@ -302,9 +337,9 @@ class VisitorLimits:
         start = int(now // HOUR_S) * HOUR_S
         return _stamp(start), max(1, math.ceil(start + HOUR_S - now))
 
-    def _send(self, statements: list[Statement]) -> Mapping[str, Any]:
-        """One round trip: the statements (the first is the one whose single row is
-        returned), behind the table's creation when this instance has not sent it yet."""
+    def _send(self, statements: list[Statement], *, answer: int) -> Mapping[str, Any]:
+        """One round trip: the statements, behind the table's creation when this instance
+        has not sent it yet. Returns the single row of ``statements[answer]``."""
         lead = 0 if self._created else 1
         if lead:
             statements = [(self._create, ()), *statements]
@@ -312,7 +347,7 @@ class VisitorLimits:
             if len(statements) == 1:
                 rows = self._executor.execute(*statements[0])
             else:
-                rows = self._executor.transaction(statements)[lead]
+                rows = self._executor.transaction(statements)[lead + answer]
             row = rows[0]
         except Exception as exc:
             code = getattr(exc, "code", None)
