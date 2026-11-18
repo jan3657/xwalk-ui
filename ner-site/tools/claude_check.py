@@ -155,32 +155,53 @@ def _spellings(secret: str) -> list[str]:
     return sorted(found, key=len, reverse=True)
 
 
-def _unescaped(text: str) -> str:
-    """`text` with its percent escapes resolved, also ones written in lower case, for
-    only some characters, or more than once."""
-    for _ in range(4):
-        resolved = urllib.parse.unquote(text, errors="replace")
-        if resolved == text:
-            break
-        text = resolved
-    return text
+# How many times a value is percent-decoded while looking for a secret in it.
+MAX_DECODINGS = 8
+
+
+def _decodings(text: str) -> tuple[list[str], bool]:
+    """`text` and every result of resolving its percent escapes once more (escapes in
+    either case, for only some characters, any number of times), and whether that came
+    to an end: False when the value still changed after ``MAX_DECODINGS`` rounds."""
+    found = [text]
+    for _ in range(MAX_DECODINGS):
+        resolved = urllib.parse.unquote(found[-1], errors="replace")
+        if resolved == found[-1]:
+            return found, True
+        found.append(resolved)
+    return found, False
 
 
 def _spelled_in(text: str, shortest: int) -> bool:
+    """Whether a secret of at least `shortest` characters is in `text` at any layer of
+    percent decoding. Every layer is looked at, not only the last: a secret that
+    itself holds ``%20`` shows after one decoding and is gone after the next. A value
+    that is still changing when the decoding stops gives no verdict, and no verdict
+    counts as a secret: it is withheld and reported, never passed."""
+    secrets = [secret for secret in _REDACTED if len(secret) >= shortest]
+    if not secrets:
+        return False
+    layers, settled = _decodings(text)
+    if not settled:
+        return True
+    # A secret that holds escapes of its own may come back with only some characters
+    # escaped, and then no layer of the value equals it: decoding the value resolves
+    # the secret's own escapes together with the added ones. So the secret is looked
+    # for in each of its own decoded forms as well.
     return any(
-        spelling in candidate
-        for secret in _REDACTED
-        if len(secret) >= shortest
-        for candidate in (text, _unescaped(text))
-        for spelling in _spellings(secret)
+        spelling in layer
+        for secret in secrets
+        for layer in layers
+        for spelling in (*_spellings(secret), *_decodings(secret)[0][1:])
     )
 
 
 def _redact(text: str, *, shortest: int = 1) -> str:
     """`text` without the secrets of this run. A spelling this tool can name is cut
-    out where it stands. A secret that only shows once the percent escapes are
-    resolved has no fixed spelling to cut (any character may be escaped, in either
-    case, any number of times), so the whole value is withheld."""
+    out where it stands. A secret that only shows once percent escapes are resolved
+    has no fixed spelling to cut (any character may be escaped, in either case, any
+    number of times), so the whole value is withheld; so is a value escaped more
+    deeply than this tool decodes (``_spelled_in``)."""
     for secret in _REDACTED:
         if len(secret) >= shortest:
             for spelling in _spellings(secret):
@@ -190,7 +211,7 @@ def _redact(text: str, *, shortest: int = 1) -> str:
 
 def _holds(text: str) -> bool:
     """Whether `text` holds a secret of this run (one long enough to look for) in any
-    spelling, percent escapes of any kind resolved."""
+    spelling, at any layer of percent decoding, or cannot be decoded to the end."""
     return _spelled_in(text, MIN_ECHO_CHARS)
 
 
@@ -1008,7 +1029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             say(
                 f"credential echo check: none of the {len(responses)} responses contained "
                 "the API key or the passcode this run sent, in any spelling this tool knows "
-                "(as it is, JSON-escaped, percent-escaped in any form), in a body or a header"
+                "(as it is, JSON-escaped, percent-escaped in any form and depth), in a body "
+                "or a header"
             )
     return code
 

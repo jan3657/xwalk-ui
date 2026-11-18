@@ -1606,3 +1606,74 @@ def test_health_snapshots_with_different_reset_fields_are_inconclusive_not_a_cra
     assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) == 1
     out = capsys.readouterr().out
     assert "INCONCLUSIVE" in out and "and counted" not in out
+
+
+# --- third review round: every layer of percent decoding ---------------------------------
+
+# A key may hold a percent sign and what looks like an escape: all printable ASCII.
+PERCENT_KEY = "sk-own%20key%2Dwith-escapes-0123456789"
+
+
+def layers(text: str, times: int) -> str:
+    for _ in range(times):
+        text = lower_percent(text)
+    return text
+
+
+@pytest.mark.parametrize(
+    ("key", "spelling"),
+    [
+        # Escaped once: the key shows after one decoding and is gone again after two,
+        # because its own "%20" is then decoded as well.
+        (PERCENT_KEY, lower_percent),
+        (PERCENT_KEY, lambda key: key.replace("-", "%2d")),
+        (PERCENT_KEY, lambda key: layers(key, 2)),
+        # Deeper than the tool is willing to decode: no verdict is not a pass.
+        (QUOTED_KEY, lambda key: layers(key, 5)),
+        (QUOTED_KEY, lambda key: layers(key, 12)),
+        (PERCENT_KEY, lambda key: layers(key, 9)),
+    ],
+    ids=["once", "dashes", "twice", "five-layers", "twelve-layers", "nine-layers"],
+)
+@pytest.mark.parametrize("where", ["error", "run", "health"])
+def test_an_echo_is_found_at_every_layer_of_percent_decoding(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    spelling: Callable[[str], str],
+    where: str,
+) -> None:
+    assert check._KEY.fullmatch(key)
+    monkeypatch.setenv(KEY_ENV, key)
+    echo = spelling(key)
+    reply = error_response(401, "provider_key_refused", f"refused {echo} by upstream")
+    if where == "run":
+        reply = own_ok(
+            picks=({"selector": HAIKU, "status": "failed", "explanation": f"said {echo}"},)
+        )
+    elif where == "health":
+        stub.health["claude"] = {"status": "ok", "reason": f"saw {echo}"}
+        reply = own_ok()
+    stub.answer = lambda body: reply
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 1
+    captured = capsys.readouterr()
+    shown = captured.out + captured.err
+    assert echo not in shown and key not in shown
+    assert echo[:24] not in shown and echo[-24:] not in shown
+    assert ECHO_SAID in shown and "credential echo check: FAILED" in shown
+
+
+def test_ordinary_percent_signs_are_not_an_echo(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, PERCENT_KEY)
+    stub.health["claude"] = {"status": "ok", "reason": "100% sure, 5%20 of the time, %zz"}
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 0
+    out = capsys.readouterr().out
+    assert ECHO_SAID not in out and "100% sure, 5%20 of the time, %zz" in out
