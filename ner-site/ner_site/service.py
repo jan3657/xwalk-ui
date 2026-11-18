@@ -20,7 +20,7 @@ import hashlib
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,13 +32,26 @@ from xwalk.decide.budget import BudgetedDecider
 from xwalk.decide.fake import FakeDecider
 from xwalk.decide.jev import JevClient
 from xwalk.fingerprint import redact_url
-from xwalk.llm.base import LLMClient, LLMError, LLMRequest
+from xwalk.llm.base import LLMCapabilities, LLMClient, LLMError, LLMRequest, LLMResponse
 from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
-from ner_site.claude import CLAUDE_MODELS, EFFORTS, OPUS, SONNET, is_claude
+from ner_site import fallback
+from ner_site.claude import (
+    CLAUDE_MODELS,
+    DISPLAY_NAMES,
+    EFFORTS,
+    EXTRACT_MAX_TOKENS,
+    OPUS,
+    SELECT_MAX_TOKENS,
+    SONNET,
+    ClaudeClient,
+    is_claude,
+    key_status,
+)
 from ner_site.extract import MAX_TOKENS, TEMPERATURE, extract, render_default_prompt
+from ner_site.fallback import FallbackLLM, Step
 from ner_site.indexes import (
     NEON_DIMENSIONS,
     NEON_SCHEMA,
@@ -51,6 +64,7 @@ from ner_site.limits import Allowance
 from ner_site.mapping import MapStats, map_entities
 from ner_site.ontologies import FULL_ROUTES, ROUTES
 from ner_site.schema import (
+    FallbackNote,
     Limits,
     Mode,
     NerRequest,
@@ -83,6 +97,11 @@ DEFAULT_MODELS = (OPUS, SONNET, DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna")
 # V4.1 Flash returned non-JSON once and Qwen3.7 Flash had no endpoint under the account's
 # data policy, so they are left out.
 DEFAULT_SELECTORS = (OPUS, SONNET, JEV, DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna")
+# Names for the visitor's notices; a model without one is shown by its id.
+OPENROUTER_NAMES = {
+    DEFAULT_FALLBACK_MODEL: "Gemini 3.1 Flash Lite",
+    "openai/gpt-6-luna": "GPT-6 Luna",
+}
 SELECTOR_CALLS_PER_ENTITY = 4  # Jev: one screen chunk, choose, gate, and one spare
 DEFAULT_CACHE_DIR = Path("/tmp/xwalk-ner-site")
 OFFLINE_MODEL = "offline"
@@ -538,6 +557,182 @@ def make_decider(
     return BudgetedDecider(client, budget)
 
 
+# --- Claude and the fallback chain (spec 2026-11-18, sections 3.2 and 5) ------------
+
+EXTRACT, SELECT = "extract", "select"
+# (settings, model, purpose) -> the unbudgeted client for one Claude model and one
+# purpose ("extract" or "select"). Tests pass a scripted one; nothing else should.
+ClaudeFactory = Callable[["Settings", str, str], LLMClient]
+LLMMaker = Callable[["Settings", str], LLMClient]
+
+
+def make_claude(settings: Settings, model: str, purpose: str) -> LLMClient:
+    """One Claude model on the operator's key. The token limit is the adapter's own per
+    purpose (thinking counts against it), not the engine's 2048 / 600."""
+    if not settings.anthropic_api_key:
+        raise ValueError("ANTHROPIC_API_KEY is not set")
+    return ClaudeClient(
+        model,
+        api_key=settings.anthropic_api_key,
+        max_tokens=EXTRACT_MAX_TOKENS if purpose == EXTRACT else SELECT_MAX_TOKENS,
+        effort=settings.claude_effort,
+        timeout=LLM_TIMEOUT_S,
+    )
+
+
+class StagedLLM:
+    """One step of a chain: the same model with one client per stage.
+
+    A chain serves the whole request, but extraction and selection are configured
+    differently on every provider (token limit, retries, call budget; on OpenRouter
+    exactly what :func:`make_llm` and :func:`make_select_llm` set). ``stage`` says which
+    client answers; :func:`enter_stage` moves a chain and its steps together."""
+
+    def __init__(self, clients: Mapping[str, LLMClient]) -> None:
+        if not clients:
+            raise ValueError("a staged step needs at least one client")
+        self.clients: dict[str, LLMClient] = dict(clients)
+        self.stage = next(iter(self.clients))
+
+    @property
+    def _current(self) -> LLMClient:
+        return self.clients.get(self.stage) or next(iter(self.clients.values()))
+
+    @property
+    def model(self) -> str:
+        return self._current.model
+
+    @property
+    def fingerprint(self) -> str:
+        return self._current.fingerprint
+
+    @property
+    def capabilities(self) -> LLMCapabilities:
+        return self._current.capabilities
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        return await self._current.complete(request)
+
+    async def aclose(self) -> None:
+        for client in self.clients.values():
+            close = getattr(client, "aclose", None)
+            if callable(close):
+                await close()
+
+
+def enter_stage(llm: object, stage: str) -> None:
+    """Tell a chain, and each staged step in it, which stage the next calls belong to
+    (what a step-down is recorded under, and which client answers). Anything that is not
+    a chain is left alone."""
+    if not isinstance(llm, FallbackLLM):
+        return
+    llm.stage = stage
+    for step in llm.steps:
+        if isinstance(step.client, StagedLLM):
+            step.client.stage = stage
+
+
+def chain_models(settings: Settings, wanted: str) -> tuple[str, ...]:
+    """The models a request for the Claude model `wanted` may run on, best first: the
+    Claude models from `wanted` down, then the OpenRouter fallback model when there is
+    an OpenRouter key (without one the chain ends at Sonnet)."""
+    if wanted not in CLAUDE_MODELS:
+        raise ValueError(f"{wanted!r} is not a Claude model of this site")
+    models = CLAUDE_MODELS[CLAUDE_MODELS.index(wanted) :]
+    return (*models, settings.fallback_model) if settings.api_key else models
+
+
+def make_chain(
+    settings: Settings,
+    wanted: str,
+    *,
+    start: int = 0,
+    purposes: Sequence[str] = (EXTRACT, SELECT),
+    claude_factory: ClaudeFactory | None = None,
+    llm_factory: LLMMaker | None = None,
+    select_factory: LLMMaker | None = None,
+) -> FallbackLLM:
+    """The fallback chain for one request that asked for the Claude model `wanted`,
+    started at step `start` of :func:`chain_models`.
+
+    Every step holds one client per purpose in `purposes`. A Claude client is wrapped in
+    its own ``BudgetedLLM`` with the limit the OpenRouter client of that purpose has: the
+    request's call cap for extraction, two calls per entity allowed for selection. The
+    last step is :func:`make_llm` / :func:`make_select_llm` for the fallback model, so on
+    OpenRouter a request behaves as it does without a chain. The factories exist for
+    tests. The caller closes the chain."""
+    build_claude = claude_factory or make_claude
+    makers: dict[str, LLMMaker] = {
+        EXTRACT: llm_factory or make_llm,
+        SELECT: select_factory or make_select_llm,
+    }
+    caps = {EXTRACT: settings.limits.llm_call_cap, SELECT: settings.limits.max_entities * 2}
+    steps: list[Step] = []
+    for model in chain_models(settings, wanted):
+        if is_claude(model):
+            label = "opus" if model == OPUS else "sonnet"
+            clients: dict[str, LLMClient] = {
+                purpose: BudgetedLLM(
+                    build_claude(settings, model, purpose), CallBudget(limit=caps[purpose])
+                )
+                for purpose in purposes
+            }
+        else:
+            label = "other"
+            clients = {purpose: makers[purpose](settings, model) for purpose in purposes}
+        steps.append(Step(label, StagedLLM(clients)))
+    chain = FallbackLLM(steps, start=start)
+    enter_stage(chain, purposes[0])
+    return chain
+
+
+def display_name(model: str) -> str:
+    """A model as a notice names it. An id without a name (a custom fallback model, or
+    the Claude id a server-side fallback answered with) is shown as it is."""
+    if is_claude(model):
+        return DISPLAY_NAMES.get(model, model)
+    return f"{OPENROUTER_NAMES.get(model, model)} through OpenRouter"
+
+
+BLOCK_TEXT = {"balance_exhausted": "balance exhausted", "key_refused": "key refused"}
+FOLLOWS_EXTRACTION = "follows_extraction"
+_WHY = {
+    "rate_limited": "{model} is rate limited",
+    "overloaded": "{model} is overloaded",
+    "transient": "{model} did not answer",
+    "refused": "{model} declined this text",
+    "call_limit": "{model} reached its call limit for this request",
+    "opus_allowance_used": "Your Opus allowance for this hour is used",
+    "limits_unavailable": "Visitor limits are unavailable",
+}
+
+
+def notice(note: FallbackNote) -> str:
+    """The sentence a visitor reads about one departure from the model they asked for."""
+    ran = "the remaining picks ran on" if note.stage == SELECT else "this ran on"
+    target = display_name(note.to)
+    if note.reason == FOLLOWS_EXTRACTION:
+        return f"Selection uses the model that extracted; the picks ran on {target}."
+    blocked = note.reason if note.reason in BLOCK_TEXT else None
+    if note.reason == "claude_unavailable":
+        blocked = fallback.claude_block()
+        if blocked is None:
+            return f"Claude is unavailable; {ran} {target}."
+    if blocked is not None:
+        # Named as Claude when the request left Claude altogether, else as the model.
+        who = display_name(note.from_) if is_claude(note.to) else "Claude"
+        return f"{who} is unavailable ({BLOCK_TEXT.get(blocked, blocked)}); {ran} {target}."
+    why = _WHY.get(note.reason, "{model} could not be used")
+    return f"{why.format(model=display_name(note.from_))}; {ran} {target}."
+
+
+def _notes(chain: FallbackLLM, since: int = 0) -> list[FallbackNote]:
+    return [
+        FallbackNote(stage=f.stage, from_=f.from_model, to=f.to_model, reason=f.reason)
+        for f in chain.fallbacks[since:]
+    ]
+
+
 # /api/health asks OpenRouter whether the key still works (GET /api/v1/key: free, no
 # model call), remembering the answer; an expired key otherwise shows "llm ok" while every
 # POST /api/ner fails with 502 (4 November 2026).
@@ -607,6 +802,29 @@ def check_key(
         if cached is not None and cached[0] > now:
             return cached[1]
     status = _key_status(settings, transport)
+    ttl = KEY_OK_TTL_S if status.status == "ok" else KEY_REFUSED_TTL_S
+    with _KEY_LOCK:
+        _KEY_CACHE[slot] = (now + ttl, status)
+    return status
+
+
+def check_claude_key(settings: Settings, *, client: Any | None = None) -> RetrieverStatus | None:
+    """Whether Anthropic accepts ``ANTHROPIC_API_KEY`` (None without a key): one free
+    Models API call (``claude.key_status``), remembered like :func:`check_key`. The
+    reason is a fixed phrase and never quotes the upstream. ``client`` is an SDK-shaped
+    object for tests."""
+    if not settings.anthropic_api_key:
+        return None
+    slot = "claude:" + hashlib.sha256(settings.anthropic_api_key.encode()).hexdigest()
+    now = time.monotonic()
+    with _KEY_LOCK:
+        cached = _KEY_CACHE.get(slot)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    state, reason = key_status(
+        settings.anthropic_api_key, client=client, timeout=KEY_CHECK_TIMEOUT_S
+    )
+    status = RetrieverStatus(status="ok" if state == "ok" else "unavailable", reason=reason)
     ttl = KEY_OK_TTL_S if status.status == "ok" else KEY_REFUSED_TTL_S
     with _KEY_LOCK:
         _KEY_CACHE[slot] = (now + ttl, status)
@@ -755,12 +973,22 @@ async def run(
     started_at: float | None = None,
     decider: DecisionClient | None = None,
     select_llm: LLMClient | None = None,
+    admitted: Sequence[FallbackNote] = (),
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
 
     The selection step runs when the request's selector is not ``retrieval``: Jev with
     ``decider``, any other selector with ``select_llm`` (``ner_site.http`` builds them
     with :func:`make_decider` and :func:`make_select_llm`).
+
+    When ``llm`` or ``select_llm`` is a fallback chain (:func:`make_chain`; one chain may
+    be both), the response says what it did: ``model`` is the model whose answer the
+    extraction used, ``fallbacks`` lists ``admitted`` (the step-downs decided before any
+    call) and then the chain's own, and ``notices`` has a sentence for each.
+
+    Calls and tokens are read from one place, the usage each answer carries: a chain's
+    answer already includes its failed attempts, and the steps' own ``BudgetedLLM``
+    totals count those same calls, so they are never added on top.
 
     ``started_at`` (``time.monotonic()``) is when the request began, if earlier than
     this call (opening the indexes on a cold start); the mapping deadline counts from it.
@@ -769,11 +997,15 @@ async def run(
     extraction, 429 ``call_budget_exhausted``, 502 ``provider_error``."""
     req = validate_request(request, settings)
     assert req.prompt is not None and req.model is not None
+    chain = llm if isinstance(llm, FallbackLLM) else None
+    enter_stage(chain, EXTRACT)
+    # A view remembers which model its answer came from; the chain may move on later.
+    reader = llm if chain is None else chain.view()
     started = time.monotonic()
     try:
         entities, warnings, usage = await asyncio.wait_for(
             extract(
-                llm,
+                reader,
                 req.text,
                 req.prompt,
                 max_entities=settings.limits.max_entities,
@@ -820,10 +1052,26 @@ async def run(
 
     selector = req.selector or RETRIEVAL_ONLY
     picked: SelectStats | None = None
+    taken = 0 if chain is None else len(chain.fallbacks)  # while extracting
+    departures = [*admitted, *(_notes(chain) if chain is not None else ())]
+    select_chain = select_llm if isinstance(select_llm, FallbackLLM) else None
     if selector != RETRIEVAL_ONLY:
         if (selector == JEV and decider is None) or (selector != JEV and select_llm is None):
             raise ServiceError("not_configured", f"selector {selector!r} has no client", status=503)
         picked = SelectStats()
+        if selector != JEV and select_chain is not None:
+            enter_stage(select_chain, SELECT)
+            if select_chain is chain and selector not in (req.model, select_chain.model):
+                # One chain serves the request, built from the extraction model: a
+                # different Claude selector runs where that chain is, and says so.
+                departures.append(
+                    FallbackNote(
+                        stage=SELECT,
+                        from_=selector,
+                        to=select_chain.model,
+                        reason=FOLLOWS_EXTRACTION,
+                    )
+                )
         results = await select_entities(
             results,
             stats.candidates,
@@ -848,6 +1096,10 @@ async def run(
             for r in results
         ]
     selected = time.monotonic()
+    if chain is not None:
+        departures += _notes(chain, taken)
+    if select_chain is not None and select_chain is not chain:
+        departures += _notes(select_chain)
 
     retrieval = retrieval_status(indexes, settings)
     notes: list[str] = list(warnings) + stats.warnings
@@ -863,7 +1115,8 @@ async def run(
         timing["select"] = _ms(selected - mapped)
     timing["total"] = _ms(selected - started)
     return NerResponse(
-        model=req.model,
+        # The model the answer names; after a step-down it is not the one asked for.
+        model=getattr(reader, "answered_by", None) or req.model,
         mode=settings.mode,
         selector=selector,
         entities=results,
@@ -873,6 +1126,8 @@ async def run(
         timing_ms=timing,
         requested_model=req.model,
         requested_selector=selector,
+        fallbacks=departures,
+        notices=list(dict.fromkeys(scrub(notice(d), settings) for d in departures)),
     )
 
 
@@ -882,9 +1137,16 @@ __all__ = [
     "ENV_NAMES",
     "OFFLINE_MODEL",
     "IndexView",
+    "StagedLLM",
     "Settings",
     "SettingsError",
+    "chain_models",
+    "check_claude_key",
     "check_key",
+    "display_name",
+    "enter_stage",
+    "make_chain",
+    "make_claude",
     "make_decider",
     "make_llm",
     "make_select_llm",

@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -5,6 +6,28 @@ import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
 E5_MODEL = "intfloat/multilingual-e5-small"
+
+
+@pytest.fixture(autouse=True)
+def _site_process_state(request: pytest.FixtureRequest) -> Iterator[None]:
+    """The NER site keeps a little state per warm instance: that Claude is unusable
+    (``fallback.block_claude``), what the key checks found, the settings and the visitor
+    limiter. A test that drives a chain into ``balance_exhausted`` would otherwise start
+    every later test on the OpenRouter step. Only the site's tests pay for the import."""
+    if not request.module.__name__.rsplit(".", 1)[-1].startswith("test_site_"):
+        yield
+        return
+    from ner_site import fallback, service
+    from ner_site import http as site_http
+
+    def clear() -> None:
+        fallback.reset()
+        service.reset_key_check()
+        site_http.reset()
+
+    clear()
+    yield
+    clear()
 
 
 def skip_if_loader_missing(target_kind: str) -> None:

@@ -76,9 +76,9 @@ from typing import Any, Literal
 from pydantic import (
     BaseModel,
     ConfigDict,
-    Field,
     SerializerFunctionWrapHandler,
     model_serializer,
+    model_validator,
 )
 
 EntityType = Literal["chemical", "disease", "gene", "food", "other"]
@@ -188,12 +188,17 @@ class FallbackNote(BaseModel):
     (``rate_limited``, ``opus_allowance_used`` ...); the sentence for the visitor is in
     ``NerResponse.notices``. ``from_`` is ``"from"`` on the wire (a Python keyword)."""
 
-    model_config = ConfigDict(populate_by_name=True)
-
     stage: str
-    from_: str = Field(alias="from")
+    from_: str
     to: str
     reason: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_off_the_wire(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "from" in data:
+            return {("from_" if key == "from" else key): value for key, value in data.items()}
+        return data
 
     @model_serializer(mode="plain")
     def _from_on_the_wire(self) -> dict[str, str]:

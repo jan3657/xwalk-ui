@@ -866,3 +866,533 @@ def test_every_new_variable_is_part_of_the_settings_cache_key() -> None:
         "NER_SITE_SONNET_PER_HOUR",
         "NER_SITE_VISITOR_SALT",
     } <= set(service.ENV_NAMES)
+
+
+# --- the fallback chain in a request (spec 2026-11-18, sections 5, 6 and 8) -----------
+
+TEXT = "She took haloperidol for a fever."
+EXTRACTED = _answer(("haloperidol", "chemical", 9, 20))
+PICK = '{"chosen_key": "C01", "confidence_score": 0.7, "explanation": "first"}'
+BOTH_KEYS = {"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY}
+
+
+def _failing(reason: str, message: str = "upstream said no", *, retryable: bool = False) -> Any:
+    """An error as ``ner_site.claude`` raises it: an engine class plus ``reason``."""
+    from xwalk.llm.base import LLMRetryableError
+
+    kind = LLMRetryableError if retryable else LLMFatalError
+    error = kind(f"Anthropic: {message}", usage=Usage.unreported())
+    error.reason = reason  # type: ignore[attr-defined]
+    return error
+
+
+class _Fakes:
+    """Scripted clients standing in for Claude and for the OpenRouter fallback model,
+    one per (model, purpose); also the factories ``make_chain`` takes."""
+
+    def __init__(self, **scripts: Any) -> None:
+        # Keys: opus_extract, sonnet_select, other_extract ...; the default answers well.
+        self.scripts = scripts
+        self.made: dict[tuple[str, str], FakeLLM] = {}
+
+    def _fake(self, model: str, purpose: str) -> FakeLLM:
+        tier = {OPUS: "opus", SONNET: "sonnet"}.get(model, "other")
+        default = [EXTRACTED] if purpose == "extract" else None
+        script = self.scripts.get(f"{tier}_{purpose}", default)
+        llm = (
+            FakeLLM(handler=lambda request: PICK, model=model)
+            if script is None
+            else FakeLLM(script, model=model)
+            if isinstance(script, list)
+            else FakeLLM(handler=script, model=model)
+        )
+        self.made[(model, purpose)] = llm
+        return llm
+
+    def claude(self, settings: Settings, model: str, purpose: str) -> FakeLLM:
+        assert model in (OPUS, SONNET)
+        return self._fake(model, purpose)
+
+    def chain(self, settings: Settings, wanted: str = OPUS, **kw: Any) -> Any:
+        return service.make_chain(
+            settings,
+            wanted,
+            claude_factory=self.claude,
+            llm_factory=lambda s, m: self._fake(m, "extract"),
+            select_factory=lambda s, m: self._fake(m, "select"),
+            **kw,
+        )
+
+    def calls(self, model: str, purpose: str) -> int:
+        made = self.made.get((model, purpose))
+        return 0 if made is None else len(made.requests)
+
+
+def _run_chain(
+    tmp_path: Path, bm25_only: Any, fakes: _Fakes, *, wanted: str = OPUS, **kw: Any
+) -> NerResponse:
+    s = _settings(tmp_path, **{**BOTH_KEYS, "NER_SITE_SELECTOR": wanted, **kw.pop("env", {})})
+    chain = fakes.chain(s, wanted, start=kw.pop("start", 0))
+    request = kw.pop("request", NerRequest(text=TEXT, model=wanted))
+    return asyncio.run(
+        run(request, settings=s, llm=chain, select_llm=chain, indexes=bm25_only, **kw)
+    )
+
+
+def test_make_chain_steps_follow_the_wanted_model_and_the_keys(tmp_path: Path) -> None:
+    from ner_site.fallback import FallbackLLM
+
+    s = _settings(tmp_path, **BOTH_KEYS)
+    assert service.chain_models(s, OPUS) == (OPUS, SONNET, GEMINI)
+    assert service.chain_models(s, SONNET) == (SONNET, GEMINI)
+    alone = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    assert service.chain_models(alone, OPUS) == (OPUS, SONNET)
+    assert service.chain_models(alone, SONNET) == (SONNET,)
+    with pytest.raises(ValueError):
+        service.chain_models(s, GEMINI)
+
+    seen: list[tuple[str, str]] = []
+
+    def claude(settings: Settings, model: str, purpose: str) -> FakeLLM:
+        seen.append((model, purpose))
+        return FakeLLM(["x"], model=model)
+
+    chain = service.make_chain(s, OPUS, start=1, claude_factory=claude)
+    assert isinstance(chain, FallbackLLM) and chain.position == 1 and chain.model == SONNET
+    assert [(step.label, step.client.model) for step in chain.steps] == [
+        ("opus", OPUS),
+        ("sonnet", SONNET),
+        ("other", GEMINI),
+    ]
+    assert seen == [(OPUS, "extract"), (OPUS, "select"), (SONNET, "extract"), (SONNET, "select")]
+    opus, _, other = (step.client for step in chain.steps)
+    assert isinstance(opus, service.StagedLLM)
+    # Each Claude client has its own budget, with the limit of its OpenRouter twin.
+    extract_client, select_client = opus.clients["extract"], opus.clients["select"]
+    assert isinstance(extract_client, BudgetedLLM) and isinstance(select_client, BudgetedLLM)
+    assert extract_client.budget is not select_client.budget
+    assert extract_client.budget.limit == 3 and select_client.budget.limit == 50
+    # The last step is what a request for that OpenRouter model gets today.
+    assert isinstance(other, service.StagedLLM)
+    last_extract, last_select = other.clients["extract"], other.clients["select"]
+    assert isinstance(last_extract, BudgetedLLM) and isinstance(last_select, BudgetedLLM)
+    assert isinstance(last_extract.inner, OpenAICompatClient)
+    assert last_extract.budget.limit == 3 and last_select.budget.limit == 50
+    assert last_extract.generation_defaults == {"temperature": 0.0, "max_tokens": 2048}
+    assert last_select.generation_defaults == {"temperature": 0.0, "max_tokens": 600}
+    asyncio.run(chain.aclose())
+
+    only_select = service.make_chain(s, SONNET, purposes=("select",), claude_factory=claude)
+    assert only_select.stage == "select" and len(only_select.steps) == 2
+    assert set(only_select.steps[0].client.clients) == {"select"}  # type: ignore[attr-defined]
+    asyncio.run(only_select.aclose())
+
+
+def test_make_claude_configures_the_adapter_per_purpose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real adapter class is replaced: no SDK client is built in a test."""
+    built: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(service, "ClaudeClient", lambda model, **kw: built.append((model, kw)))
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_CLAUDE_EFFORT="medium")
+    service.make_claude(s, OPUS, "extract")
+    service.make_claude(s, SONNET, "select")
+    assert built == [
+        (
+            OPUS,
+            {"api_key": ANTHROPIC_KEY, "max_tokens": 16000, "effort": "medium", "timeout": 60.0},
+        ),
+        (
+            SONNET,
+            {"api_key": ANTHROPIC_KEY, "max_tokens": 8000, "effort": "medium", "timeout": 60.0},
+        ),
+    ]
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        service.make_claude(_settings(tmp_path), OPUS, "extract")
+
+
+def test_opus_answers_extraction_and_selection(tmp_path: Path, bm25_only: Any) -> None:
+    fakes = _Fakes()
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == OPUS and out.requested_model == OPUS
+    assert out.selector == OPUS and out.requested_selector == OPUS
+    assert out.fallbacks == [] and out.notices == []
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == OPUS
+    assert entity.pick.status == "match" and entity.pick.id == "CHEBI:5613"
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 1
+    assert out.usage.prompt_tokens == 100 and out.usage.selector_prompt_tokens == 100
+    # Extraction and selection went to their own clients of the one step.
+    assert fakes.calls(OPUS, "extract") == 1 and fakes.calls(OPUS, "select") == 1
+    assert fakes.calls(SONNET, "extract") == fakes.calls(GEMINI, "extract") == 0
+
+
+@pytest.mark.parametrize(
+    ("reason", "sentence"),
+    [
+        ("rate_limited", "Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5."),
+        ("overloaded", "Claude Opus 5.5 is overloaded; this ran on Claude Sonnet 5.5."),
+        ("refused", "Claude Opus 5.5 declined this text; this ran on Claude Sonnet 5.5."),
+    ],
+)
+def test_opus_failing_while_extracting_moves_the_whole_request_to_sonnet(
+    tmp_path: Path, bm25_only: Any, reason: str, sentence: str
+) -> None:
+    fakes = _Fakes(opus_extract=[_failing(reason, retryable=reason != "refused")])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == SONNET and out.requested_model == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": reason}
+    ]
+    assert out.notices == [sentence]
+    (entity,) = out.entities
+    # Sticky: selection never tries Opus again, and the pick names who made it.
+    assert entity.pick is not None and entity.pick.selector == SONNET
+    assert out.selector == OPUS and out.requested_selector == OPUS
+    assert fakes.calls(OPUS, "select") == 0 and fakes.calls(SONNET, "select") == 1
+    # The failed call is counted once (its tokens unknown), not twice and not dropped.
+    assert out.usage.llm_calls == 2 and out.usage.prompt_tokens is None
+    assert out.usage.selector_calls == 1 and out.usage.selector_prompt_tokens == 100
+
+
+def test_a_transient_failure_is_retried_once_before_stepping_down(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    flaky = _Fakes(opus_extract=[_failing("transient", retryable=True), EXTRACTED])
+    out = _run_chain(tmp_path, bm25_only, flaky)
+    assert out.model == OPUS and out.fallbacks == [] and out.usage.llm_calls == 2
+    down = _Fakes(opus_extract=[_failing("transient", retryable=True)] * 2)
+    out = _run_chain(tmp_path, bm25_only, down)
+    assert out.model == SONNET and out.usage.llm_calls == 3
+    assert out.notices == ["Claude Opus 5.5 did not answer; this ran on Claude Sonnet 5.5."]
+
+
+def test_sonnet_rate_limited_too_ends_on_the_openrouter_model(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    fakes = _Fakes(opus_extract=[limited], sonnet_extract=[limited])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == GEMINI
+    assert [(f.from_, f.to, f.reason) for f in out.fallbacks] == [
+        (OPUS, SONNET, "rate_limited"),
+        (SONNET, GEMINI, "rate_limited"),
+    ]
+    assert out.notices[-1] == (
+        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter."
+    )
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == GEMINI
+    assert fakes.calls(GEMINI, "select") == 1
+
+
+def test_a_step_down_while_selecting_is_recorded_under_select(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes(opus_select=[_failing("overloaded", retryable=True)])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == OPUS  # the extraction was Opus's
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": OPUS, "to": SONNET, "reason": "overloaded"}
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 is overloaded; the remaining picks ran on Claude Sonnet 5.5."
+    ]
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == SONNET
+    assert entity.pick.status == "match"
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 2
+    assert out.usage.selector_prompt_tokens is None  # one of the two reported nothing
+
+
+@pytest.mark.parametrize(
+    ("reason", "text"), [("balance_exhausted", "balance exhausted"), ("key_refused", "key refused")]
+)
+def test_an_unusable_anthropic_account_ends_on_openrouter_and_is_remembered(
+    tmp_path: Path, bm25_only: Any, reason: str, text: str
+) -> None:
+    from ner_site import fallback
+
+    dead = _failing(reason, f"no credit for {ANTHROPIC_KEY}")
+    fakes = _Fakes(opus_extract=[dead], sonnet_extract=[dead])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == GEMINI and [f.reason for f in out.fallbacks] == [reason, reason]
+    assert out.notices == [
+        f"Claude Opus 5.5 is unavailable ({text}); this ran on Claude Sonnet 5.5.",
+        f"Claude is unavailable ({text}); this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    ]
+    assert fallback.claude_block() == reason
+    assert ANTHROPIC_KEY not in out.model_dump_json()
+
+
+def test_every_step_failing_while_extracting_is_a_scrubbed_502(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    last = LLMFatalError(f"HTTP 401 for {SENTINEL_KEY} and {ANTHROPIC_KEY}")
+    fakes = _Fakes(opus_extract=[limited], sonnet_extract=[limited], other_extract=[last])
+    with pytest.raises(ServiceError) as exc:
+        _run_chain(tmp_path, bm25_only, fakes)
+    assert exc.value.status == 502 and exc.value.code == "provider_error"
+    assert "HTTP 401" in exc.value.message  # names the last error
+    assert SENTINEL_KEY not in exc.value.message and ANTHROPIC_KEY not in exc.value.message
+    # Without an OpenRouter key the chain ends at Sonnet.
+    alone = _Fakes(opus_extract=[limited], sonnet_extract=[limited])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=alone.chain(s), indexes=bm25_only))
+    assert exc.value.status == 502 and "upstream said no" in exc.value.message
+
+
+def test_selection_failing_on_the_last_step_is_a_failed_pick_not_an_error(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    fakes = _Fakes(
+        opus_select=[limited],
+        sonnet_select=[limited],
+        other_select=[LLMFatalError(f"HTTP 500 with {SENTINEL_KEY}")],
+    )
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.status == "failed" and entity.pick.id is None
+    assert "HTTP 500" in entity.pick.explanation and SENTINEL_KEY not in entity.pick.explanation
+    assert entity.pick.selector == OPUS  # nobody answered: the selector that was asked for
+    assert [f.stage for f in out.fallbacks] == ["select", "select"]
+    # Three calls were dispatched for the pick, and all three are counted.
+    assert out.usage.selector_calls == 3 and out.usage.selector_prompt_tokens is None
+
+
+def test_a_claude_stop_reason_is_a_normal_finish(tmp_path: Path, bm25_only: Any) -> None:
+    """The adapter passes Anthropic's stop reasons through (``end_turn``); only
+    ``length`` (its name for ``max_tokens``) means a cut-off answer."""
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+
+    def claude(finish: str, extracted: str) -> Any:
+        return lambda settings, model, purpose: FakeLLM(
+            handler=lambda r: extracted if purpose == "extract" else PICK,
+            model=model,
+            finish_reason=finish,
+        )
+
+    chain = service.make_chain(s, OPUS, claude_factory=claude("end_turn", EXTRACTED))
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.status == "match" and out.warnings != []
+    assert not any("cut off" in w for w in out.warnings)
+    cut = service.make_chain(s, OPUS, claude_factory=claude("length", '{"entities": [{"te'))
+    with pytest.raises(ExtractionError) as exc:
+        asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=cut, indexes=bm25_only))
+    assert "cut off at the token limit" in exc.value.message
+
+
+def test_the_openrouter_step_is_sent_what_each_stage_sends_today(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """The chain reports no ``generation_defaults``, so what reaches OpenRouter is decided
+    by each stage's request and by the client behind it: extraction as ``make_llm``
+    (temperature 0, 2048 tokens), selection as ``make_select_llm`` (temperature 0, 600)."""
+    bodies: list[dict[str, Any]] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        content = PICK if "selection" in json.dumps(body.get("response_format", "")) else EXTRACTED
+        return httpx.Response(
+            200,
+            json={
+                "model": GEMINI,
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 5},
+            },
+        )
+
+    transport = httpx.MockTransport(chat)
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    limited = _failing("rate_limited", retryable=True)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        start=2,
+        claude_factory=lambda settings, model, purpose: FakeLLM([limited], model=model),
+        llm_factory=lambda st, m: make_llm(st, m, transport=transport),
+        select_factory=lambda st, m: service.make_select_llm(st, m, transport=transport),
+    )
+
+    async def go() -> NerResponse:
+        try:
+            return await run(
+                NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only
+            )
+        finally:
+            await chain.aclose()
+
+    out = asyncio.run(go())
+    assert out.model == GEMINI and out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == GEMINI and out.entities[0].pick.status == "match"
+    extraction, selection = bodies
+    assert extraction["model"] == selection["model"] == GEMINI
+    assert (extraction["temperature"], extraction["max_tokens"]) == (0, 2048)
+    assert (selection["temperature"], selection["max_tokens"]) == (0, 600)
+    assert extraction["reasoning"] == selection["reasoning"] == {"enabled": False}
+
+
+def test_the_claude_steps_are_sent_the_stage_requests_unchanged(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """What the adapter ignores (temperature, the engine's token limits) is its own
+    business (tests/test_site_claude.py); the chain passes each request through as is."""
+    fakes = _Fakes()
+    _run_chain(tmp_path, bm25_only, fakes)
+    (extraction,) = fakes.made[(OPUS, "extract")].requests
+    (selection,) = fakes.made[(OPUS, "select")].requests
+    assert (extraction.temperature, extraction.max_tokens) == (0.0, 2048)
+    assert (selection.temperature, selection.max_tokens) == (None, None)
+    assert extraction.schema is not None and selection.schema is not None
+
+
+def test_a_model_id_the_site_has_no_name_for_is_shown_as_it_is(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """After Anthropic's server-side refusal fallback the answer names another model."""
+
+    class Elsewhere(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            response = await super().complete(request)
+            return LLMResponse(text=response.text, usage=response.usage, model="claude-opus-4-9")
+
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        claude_factory=lambda settings, model, purpose: Elsewhere(
+            handler=lambda r: EXTRACTED if purpose == "extract" else PICK, model=model
+        ),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    assert out.model == "claude-opus-4-9" and out.requested_model == OPUS
+    assert out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == "claude-opus-4-9"
+    assert service.display_name("claude-opus-4-9") == "claude-opus-4-9"
+    assert service.display_name(OPUS) == "Claude Opus 5.5"
+    assert service.display_name("qwen/qwen3.7-flash") == "qwen/qwen3.7-flash through OpenRouter"
+
+
+def test_admission_step_downs_lead_the_fallbacks_and_have_their_sentences(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    from ner_site import fallback
+    from ner_site.schema import FallbackNote
+
+    def admit(reason: str, to: str = SONNET, start: int = 1) -> NerResponse:
+        note = FallbackNote(stage="admit", from_=OPUS, to=to, reason=reason)
+        return _run_chain(tmp_path, bm25_only, _Fakes(), start=start, admitted=[note])
+
+    used = admit("opus_allowance_used")
+    assert used.model == SONNET and used.requested_model == OPUS
+    assert used.fallbacks[0].model_dump(mode="json") == {
+        "stage": "admit",
+        "from": OPUS,
+        "to": SONNET,
+        "reason": "opus_allowance_used",
+    }
+    assert used.notices == [
+        "Your Opus allowance for this hour is used; this ran on Claude Sonnet 5.5."
+    ]
+    assert admit("limits_unavailable").notices == [
+        "Visitor limits are unavailable; this ran on Claude Sonnet 5.5."
+    ]
+    fallback.block_claude("balance_exhausted")
+    blocked = admit("claude_unavailable", to=GEMINI, start=2)
+    assert blocked.model == GEMINI and blocked.notices == [
+        "Claude is unavailable (balance exhausted); this ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter."
+    ]
+    for notice in [*used.notices, *blocked.notices]:
+        assert "—" not in notice and notice.endswith(".")
+
+
+def test_a_different_claude_selector_runs_on_the_requests_chain_and_says_so(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes()
+    out = _run_chain(
+        tmp_path,
+        bm25_only,
+        fakes,
+        request=NerRequest(text=TEXT, model=OPUS, selector=SONNET),
+    )
+    assert out.requested_selector == SONNET and out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": SONNET, "to": OPUS, "reason": "follows_extraction"}
+    ]
+    assert out.notices == [
+        "Selection uses the model that extracted; the picks ran on Claude Opus 5.5."
+    ]
+    # Already on the selector's model (Opus stepped down while extracting): nothing to say.
+    down = _Fakes(opus_extract=[_failing("rate_limited", retryable=True)])
+    out = _run_chain(
+        tmp_path, bm25_only, down, request=NerRequest(text=TEXT, model=OPUS, selector=SONNET)
+    )
+    assert [f.reason for f in out.fallbacks] == ["rate_limited"]
+
+
+def test_a_claude_selector_after_an_openrouter_extraction_has_its_own_chain(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes(sonnet_select=[_failing("overloaded", retryable=True)])
+    s = _settings(tmp_path, **BOTH_KEYS)
+    chain = fakes.chain(s, SONNET, purposes=("select",))
+    out = asyncio.run(
+        run(
+            NerRequest(text=TEXT, model=GEMINI, selector=SONNET),
+            settings=s,
+            llm=FakeLLM([EXTRACTED], model=GEMINI),
+            select_llm=chain,
+            indexes=bm25_only,
+        )
+    )
+    assert out.model == GEMINI and out.requested_selector == SONNET
+    assert out.entities[0].pick is not None and out.entities[0].pick.selector == GEMINI
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": SONNET, "to": GEMINI, "reason": "overloaded"}
+    ]
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 2
+
+
+def test_the_claude_key_check_is_remembered_per_key(tmp_path: Path) -> None:
+    import anthropic
+
+    calls: list[str] = []
+
+    class Models:
+        def __init__(self, error: Exception | None = None) -> None:
+            self.error = error
+
+        def retrieve(self, model: str, **kw: Any) -> None:
+            calls.append(model)
+            if self.error is not None:
+                raise self.error
+
+    class SDK:
+        def __init__(self, error: Exception | None = None) -> None:
+            self.models = Models(error)
+
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    assert service.check_claude_key(_settings(tmp_path), client=SDK()) is None
+    assert service.check_claude_key(s, client=SDK()) == service.RetrieverStatus(status="ok")
+    assert service.check_claude_key(s, client=SDK()) is not None and len(calls) == 1
+    service.reset_key_check()
+    refused = anthropic.AuthenticationError(
+        f"invalid x-api-key {ANTHROPIC_KEY}",
+        response=httpx.Response(401, request=httpx.Request("GET", "https://api.anthropic.com")),
+        body=None,
+    )
+    status = service.check_claude_key(s, client=SDK(refused))
+    assert status == service.RetrieverStatus(status="unavailable", reason="key refused")
+    assert service.check_claude_key(s, client=SDK()) == status and len(calls) == 2

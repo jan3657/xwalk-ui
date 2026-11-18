@@ -7,7 +7,8 @@ Retrieval ranks; a selector decides. The visitor chooses the selector per reques
   candidate, choose among the survivors or none, gate the choice on the slots'
   properties; thresholds fitted on the pilots, ``POLICIES``);
 - an LLM id (``openai/gpt-6-luna`` ...): ``xwalk.stages.select.Selector``, one call that
-  returns an opaque candidate key or null.
+  returns an opaque candidate key or null. A Claude id runs on a fallback chain, and each
+  pick's ``selector`` is then the model that made that pick.
 
 Both read the question sets in ``ner_site/slots/`` (copied from the examples). Both only
 ever resolve to a candidate retrieved for the entity: Jev chooses among keys, and an LLM's
@@ -29,7 +30,7 @@ from xwalk.decide.base import DecisionClient
 from xwalk.decide.matcher import DecisionMatcher
 from xwalk.decide.policy import DecisionPolicy
 from xwalk.decide.questions import QuestionSet
-from xwalk.llm.base import LLMClient
+from xwalk.llm.base import LLMClient, failure_usage
 from xwalk.prompts.contract import PromptSet, PromptSlots, load_slots
 from xwalk.records import Candidate, MatchStatus, Record, RetrievalHit
 from xwalk.records import Usage as XwalkUsage
@@ -265,14 +266,24 @@ async def _with_llm(
     stats: SelectStats,
 ) -> Pick:
     source = _source(entity, text)
+    # A fallback chain (ner_site.fallback) may answer this pick from another model than
+    # the one asked for, and may move on while other picks are in flight: a view of it
+    # remembers which model answered this one, and the pick names that model.
+    view = llm.view() if callable(getattr(llm, "view", None)) else None  # type: ignore[attr-defined]
     chooser = Selector(
-        llm,
+        llm if view is None else view,
         _prompts(entity.type),
         SELECT_TEMPLATES,
         policy=SelectorPolicy(max_candidates=MAX_CANDIDATES),
     )
-    outcome = await chooser.select(source, SELECT_TEMPLATES.render_context(source), candidates)
+    try:
+        outcome = await chooser.select(source, SELECT_TEMPLATES.render_context(source), candidates)
+    except Exception as exc:
+        # The caller turns this into a failed pick; its calls were dispatched all the same.
+        stats.add(failure_usage(exc))
+        raise
     stats.add(outcome.usage)
+    selector = getattr(view, "answered_by", None) or selector
     choice = outcome.choice
     if outcome.error is not None:
         return _pick(

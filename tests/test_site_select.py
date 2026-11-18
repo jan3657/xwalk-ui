@@ -226,3 +226,75 @@ def test_an_unsure_none_is_a_review_without_a_term_not_a_failure() -> None:
     (result,), _ = _run(JEV, decider=FakeDecider(handler=unsure))
     assert result.pick is not None
     assert result.pick.status == "review" and result.pick.id is None
+
+
+# --- a fallback chain as the selector (spec 2026-11-18, section 5 step 6) ------------
+
+
+def _pick_reply(request: LLMRequest) -> str:
+    return json.dumps(
+        {"chosen_key": _key_of(request, "CHEBI:15365"), "confidence_score": 0.9, "explanation": "x"}
+    )
+
+
+def test_a_pick_names_the_model_of_the_chain_that_answered_it() -> None:
+    from ner_site.fallback import FallbackLLM, Step
+    from xwalk.llm.base import LLMRetryableError
+
+    limited = LLMRetryableError("429")
+    limited.reason = "rate_limited"  # type: ignore[attr-defined]
+    opus = FakeLLM([limited], model="claude-opus-5-5")
+    sonnet = FakeLLM(handler=_pick_reply, model="claude-sonnet-5-5")
+    chain = FallbackLLM([Step("opus", opus), Step("sonnet", sonnet)])
+    chain.stage = "select"
+    (result,), stats = _run("claude-opus-5-5", llm=chain)
+    assert result.pick is not None and result.pick.status == "match"
+    assert result.pick.selector == "claude-sonnet-5-5"  # not the selector that was asked for
+    assert [(f.stage, f.from_model, f.to_model) for f in chain.fallbacks] == [
+        ("select", "claude-opus-5-5", "claude-sonnet-5-5")
+    ]
+    assert stats.calls == 2 and stats.prompt_tokens is None  # the failed call is counted
+
+
+def test_concurrent_picks_each_name_their_own_model() -> None:
+    """Two entities in flight on one chain that steps down between their answers."""
+    from ner_site.fallback import FallbackLLM, Step
+    from xwalk.llm.base import LLMFatalError
+
+    refused = LLMFatalError("declined")
+    refused.reason = "refused"  # type: ignore[attr-defined]
+    seen: list[str] = []
+
+    def opus_reply(request: LLMRequest) -> Any:
+        seen.append(request.user)
+        return _pick_reply(request) if len(seen) == 1 else refused
+
+    opus = FakeLLM(handler=opus_reply, model="claude-opus-5-5")
+    sonnet = FakeLLM(handler=_pick_reply, model="claude-sonnet-5-5")
+    chain = FallbackLLM([Step("opus", opus), Step("sonnet", sonnet)])
+    _, candidates = _setup()
+    first, second = _entity(), _entity(id="e2")
+    results, _ = _run(
+        "claude-opus-5-5",
+        llm=chain,
+        results=[first, second],
+        candidates={"e1": candidates["e1"], "e2": candidates["e1"]},
+    )
+    named = [r.pick.selector for r in results if r.pick is not None]
+    assert named == ["claude-opus-5-5", "claude-sonnet-5-5"]
+    assert all(r.pick is not None and r.pick.id == "CHEBI:15365" for r in results)
+
+
+def test_a_plain_client_keeps_the_selector_it_was_asked_as() -> None:
+    llm = FakeLLM(handler=_pick_reply, model="some-provider-name-for-it")
+    (result,), _ = _run("openai/gpt-6-luna", llm=llm)
+    assert result.pick is not None and result.pick.selector == "openai/gpt-6-luna"
+
+
+def test_a_failed_llm_pick_still_counts_its_call() -> None:
+    from xwalk.llm.base import LLMFatalError
+
+    (result,), stats = _run("openai/gpt-6-luna", llm=FakeLLM([LLMFatalError("HTTP 500")]))
+    assert result.pick is not None and result.pick.status == "failed"
+    assert result.pick.selector == "openai/gpt-6-luna" and "HTTP 500" in result.pick.explanation
+    assert stats.calls == 1 and stats.prompt_tokens is None
