@@ -86,8 +86,10 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 UNREADABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
 # The modules a JSON body is decoded in. The decoder can also give up with a plain
 # ``ValueError`` (an integer of more digits than Python converts), which is told from
-# any other ``ValueError`` by where it was raised (``_from_the_decoder``).
-_DECODERS = frozenset({"json", "json.decoder", "json.scanner"})
+# any other ``ValueError`` by where it was raised (``_from_the_decoder``). Not the
+# ``json`` package as a whole: its encoder raises ``ValueError`` too (``dumps`` of a
+# value it will not write), and that is a fault in what was sent, not in an answer.
+_DECODERS = frozenset({"json.decoder", "json.scanner"})
 MAX_MESSAGE_CHARS = 500
 
 
@@ -295,8 +297,9 @@ def _fatal(reason: str, message: str) -> LLMError:
 
 def _from_the_decoder(exc: BaseException) -> bool:
     """Whether `exc` was raised while a JSON body was being decoded: one of the frames
-    it passed through belongs to the ``json`` package. Its class and message are not
-    asked: a ``ValueError`` about anything else, raised anywhere else, is not this."""
+    it passed through belongs to the JSON decoder or its scanner. Its class and message
+    are not asked: a ``ValueError`` about anything else, raised anywhere else (the
+    JSON encoder included), is not this."""
     trace = exc.__traceback__
     while trace is not None:
         if trace.tb_frame.f_globals.get("__name__") in _DECODERS:

@@ -894,9 +894,21 @@ async def test_json_without_a_json_content_type_is_still_an_answer() -> None:
     assert response.text == '{"entities": []}' and response.model == claude.OPUS
 
 
+def _encoding_error() -> ValueError:
+    """What ``json.dumps`` raises for a value it will not write: a ``ValueError`` out
+    of the ``json`` package, but from its encoder."""
+    try:
+        json.dumps({"n": float("nan")}, allow_nan=False)
+    except ValueError as exc:
+        assert exc.__traceback__ is not None
+        return exc
+    raise AssertionError("json.dumps accepted NaN")
+
+
 @pytest.mark.parametrize(
     "error",
     [
+        _encoding_error(),
         ValueError("Streaming is required for operations that may take longer than 10 minutes"),
         ValueError("Exceeds the limit (4300 digits) for integer string conversion"),
         TypeError("create() got an unexpected keyword argument"),
