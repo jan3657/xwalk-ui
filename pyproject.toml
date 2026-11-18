@@ -12,7 +12,7 @@ license = "MIT"
 dependencies = ["xwalk-match @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cryptography>=42", "hatchling"]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cryptography>=42", "hatchling", "anthropic>=2.10,<3"]
 chatgpt = ["xwalk-match[chatgpt] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 dense = ["xwalk-match[dense] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 

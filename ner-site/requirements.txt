@@ -4,3 +4,5 @@
 xwalk-match @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856
 # DenseRetriever's exact search over the committed vectors; without it, pure Python.
 numpy
+# Claude is called on the operator's own key through the official SDK (ner_site/claude.py).
+anthropic>=2.10,<3
