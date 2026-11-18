@@ -28,9 +28,10 @@ The rules everything here follows:
   (``_claude``, ``_compat``), so the key goes to the provider's host and nowhere else.
   Every client sends through a transport of this module (``_Wire``) that looks at each
   request as it leaves and each response as it arrives: a request that is not for the
-  pinned host with the visitor's key is not sent, and a redirect or a response header
-  that echoes the key is cut down before the HTTP library can parse it into a cache
-  that outlives the request.
+  pinned host with the visitor's key is not sent, and of a response only the status,
+  the body and a handful of headers in a strict form reach the HTTP library, so that
+  nothing a provider echoes in a header (a redirect's target, a charset, a cookie) is
+  parsed into a cache or a cookie jar that outlives the call.
 - **The operator's keys are not used.** Each client is given the visitor's key
   explicitly; there is no fallback chain, no server-side refusal fallback, no Claude
   block and no key check. Nothing the operator's environment holds for the site's own
@@ -488,6 +489,61 @@ class _NotSent(RuntimeError):
     """Raised inside the transport; replaced by :class:`WireRefused` before it leaves."""
 
 
+def _not_sent(exc: BaseException) -> bool:
+    """Whether `exc` is, or was raised because of, a request the wire refused. The SDK
+    and the adapter wrap what a transport raises, so the causes and contexts are
+    followed. This is asked of one call's own error: a client is shared by picks that
+    run at the same time, and a flag on the client would blame them all."""
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or id(item) in seen:
+            continue
+        if isinstance(item, _NotSent):
+            return True
+        seen.add(id(item))
+        stack += [item.__cause__, item.__context__]
+    return False
+
+
+# What may fail a call on a visitor's key and is then the provider's failure, said in
+# fixed words: the engine's errors (a call limit among them), the SDK's, the two HTTP
+# libraries' (a stream read out of turn is a RuntimeError there), a timeout, and a
+# request the wire did not send. Anything else is a fault of this site's code and is
+# not caught: it must reach the handler, which logs its type and where it was raised
+# (and never its message) and answers 500.
+_PROVIDER_FAILURES: tuple[type[BaseException], ...] = (
+    LLMError,
+    anthropic.AnthropicError,
+    httpx.HTTPError,
+    httpx.StreamError,
+    httpx.InvalidURL,
+    httpx2.HTTPError,
+    httpx2.StreamError,
+    httpx2.InvalidURL,
+    asyncio.TimeoutError,
+    TimeoutError,
+    _NotSent,
+)
+
+# The response headers that reach the HTTP library, each only in this form. Everything
+# else a provider sends in a header is dropped at the wire.
+_RESPONSE_HEADERS: dict[bytes, re.Pattern[bytes]] = {
+    # The body's size and coding: the library needs the coding to read the body.
+    b"content-length": re.compile(rb"[0-9]{1,12}"),
+    b"content-encoding": re.compile(
+        rb"(?:gzip|deflate|br|zstd|identity)(?:, ?(?:gzip|deflate|br|zstd|identity))*"
+    ),
+    # Read by the engine's client and the Claude adapter (seconds), and by the SDK.
+    b"retry-after": re.compile(rb"[0-9]{1,6}(?:\.[0-9]{1,3})?"),
+    b"retry-after-ms": re.compile(rb"[0-9]{1,9}"),
+}
+_JSON_TYPE = re.compile(
+    rb"\s*application/(?:[a-z0-9.-]+\+)?json\s*(?:;.*)?", re.IGNORECASE | re.DOTALL
+)
+
+
 class _Wire:
     """The last thing a request passes and the first thing a response meets: a wrapper
     around the real transport of one own-key client (``_HttpxWire`` for the engine's
@@ -498,8 +554,8 @@ class _Wire:
     For Anthropic the whole header set is checked as well (``expect``): every name must
     be one the SDK sends on its own, once, with the value the SDK computes, so nothing
     from the operator's environment rides along under any name. Until ``expect`` has
-    been called such a wire refuses everything. A refusal sends nothing, names no header
-    and no value, and sets ``refused``.
+    been called such a wire refuses everything, and the ``Content-Length`` must be
+    the length of the body. A refusal sends nothing and names no header and no value.
 
     Coming back, before the HTTP library reads the response:
 
@@ -508,10 +564,15 @@ class _Wire:
       relative ``Location`` goes through ``urllib.parse``, whose ``urlsplit`` cache
       lives as long as the process: a ``Location`` that echoed the key would stay
       there on a warm instance after the client is closed.
-    - any other response loses each header whose value contains the key. A charset is
-      looked up through ``codecs`` and ``encodings`` remembers every name it did not
-      find; cookies and the rest are parsed too. The body is not touched: what a body
-      says is replaced further in (``_Sealed``)."""
+    - any other response keeps its status and body and gets a new set of headers
+      (``_headers_for``): a content type that is one of two fixed strings, and the
+      few headers of ``_RESPONSE_HEADERS`` that have exactly their strict form.
+      Searching the headers for the key is not enough: a charset is looked up through
+      ``codecs``, and ``encodings`` remembers every name it did not find, also one
+      that arrived encoded (``charset*=utf-8''%73%6B...``) and was decoded by the
+      library. And a ``Set-Cookie`` would be stored by the client and sent back with
+      its next request. The body is not touched: what a body says is replaced
+      further in (``_Sealed``)."""
 
     _response: Any  # the library's Response class
     _headers: Any  # the library's Headers class
@@ -522,7 +583,6 @@ class _Wire:
         self._token = credential.token  # a callable whose repr shows nothing
         self._strict = strict
         self._expected: dict[str, frozenset[str]] | None = None
-        self.refused = False
 
     def expect(self, headers: Mapping[str, Sequence[str]]) -> None:
         """The header names a request may carry beside ``Authorization``, ``Host`` and
@@ -548,25 +608,44 @@ class _Wire:
             if name in ("authorization", "host"):
                 continue
             if name == "content-length":
-                if not values[0].isascii() or not values[0].isdigit():
+                # Not any number: the length of the body that is about to be sent.
+                try:
+                    length = len(request.content)
+                except Exception:  # noqa: BLE001 - a body that cannot be measured
+                    return False
+                if values[0] != str(length):
                     return False
             elif values[0] not in self._expected.get(name, ()):
                 return False
         return True
 
+    def _headers_for(self, response: Any) -> Any:
+        """The headers the HTTP library is given for `response`."""
+        seen: dict[bytes, list[bytes]] = {}
+        for name, value in response.headers.raw:
+            seen.setdefault(name.lower(), []).append(value)
+        kinds = seen.get(b"content-type", [])
+        json_body = len(kinds) == 1 and _JSON_TYPE.fullmatch(kinds[0]) is not None
+        kept = [
+            (
+                b"content-type",
+                b"application/json; charset=utf-8" if json_body else b"text/plain; charset=utf-8",
+            )
+        ]
+        for name, pattern in _RESPONSE_HEADERS.items():
+            values = seen.get(name, [])
+            if len(values) == 1 and pattern.fullmatch(values[0]) is not None:
+                kept.append((name, values[0]))
+        return self._headers(kept)
+
     async def handle_async_request(self, request: Any) -> Any:
         if not self._allowed(request):
-            self.refused = True
             raise _NotSent("a request was not the one built for this key; nothing was sent")
         response = await self._inner.handle_async_request(request)
         if 300 <= response.status_code < 400:
             await response.aclose()
             return self._response(response.status_code, request=request)
-        key = self._token().encode("ascii")
-        if any(key in value for _, value in response.headers.raw):
-            response.headers = self._headers(
-                [(name, value) for name, value in response.headers.raw if key not in value]
-            )
+        response.headers = self._headers_for(response)
         return response
 
     async def aclose(self) -> None:
@@ -600,14 +679,15 @@ class _QuietBudget:
 
 class _Sealed:
     """An ``LLMClient`` over a client built with a visitor's key, through which no
-    upstream text passes: every error is replaced (``_sealed_error``), and the key is
-    removed from an answer's text and model name should either ever contain it."""
+    upstream text passes: every failure of the provider, the SDK or the HTTP library
+    is replaced (``_sealed_error``), and the key is removed from an answer's text and
+    model name should either ever contain it. An exception that is none of those
+    (``_PROVIDER_FAILURES``) is a bug here, and is left alone."""
 
-    def __init__(self, inner: LLMClient, credential: Credential, wire: _Wire | None = None) -> None:
+    def __init__(self, inner: LLMClient, credential: Credential) -> None:
         self._inner = inner
         self._provider = credential.provider
         self._token = credential.token
-        self._wire = wire
 
     @property
     def model(self) -> str:
@@ -638,9 +718,9 @@ class _Sealed:
     async def complete(self, request: LLMRequest) -> LLMResponse:
         try:
             response = await self._inner.complete(request)
-        except Exception as exc:  # noqa: BLE001 - every failure leaves in fixed words
+        except _PROVIDER_FAILURES as exc:
             failure = _seal(exc, self._provider)
-            if self._wire is not None and self._wire.refused:
+            if _not_sent(exc):
                 # Not a provider's failure: the request never left (``_Wire``). The
                 # libraries report it as a dropped connection; say what it was.
                 failure = WireRefused(
@@ -682,7 +762,7 @@ class _Budgeted(BudgetedLLM):
     async def complete(self, request: LLMRequest) -> LLMResponse:
         try:
             return await super().complete(request)
-        except Exception as exc:  # noqa: BLE001 - every failure leaves in fixed words
+        except _PROVIDER_FAILURES as exc:
             failure = _seal(exc, self._provider)
         raise failure
 
@@ -902,10 +982,10 @@ def own_llm(
 
         # No chain to leave time for, so both purposes get the ordinary request timeout
         # rather than the shorter one a chain's Claude extraction has.
-        claude, wire = _claude(credential, model, purpose, effort, service.LLM_TIMEOUT_S, transport)
-        return _Budgeted(_Sealed(claude, credential, wire), budget, credential.provider)
-    inner, wire = _compat(credential, model, purpose, transport, backoff_base)
-    return _Budgeted(_SealedGated(inner, credential, wire), budget, credential.provider)
+        claude, _ = _claude(credential, model, purpose, effort, service.LLM_TIMEOUT_S, transport)
+        return _Budgeted(_Sealed(claude, credential), budget, credential.provider)
+    inner, _ = _compat(credential, model, purpose, transport, backoff_base)
+    return _Budgeted(_SealedGated(inner, credential), budget, credential.provider)
 
 
 __all__ = [

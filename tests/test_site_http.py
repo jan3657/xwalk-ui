@@ -2778,3 +2778,181 @@ def test_a_close_that_fails_does_not_replace_the_runs_own_error(
     assert _error(result) == (401, "provider_key_refused")
     record = _last_log(capsys)
     assert (record["own_error"], record["own_close_error"]) == ("LLMFatalError", "RuntimeError")
+
+
+# --- second review round: cookies, a refusal during selection, a bug in an adapter -----
+
+PICKS_TEXT = "She took haloperidol, later ketamine, and aspirin."
+
+
+def _real_own_clients(monkeypatch: pytest.MonkeyPatch, respond: Any) -> list[Any]:
+    """The real own-key clients (``providers.own_llm``) over a mock Anthropic: `respond`
+    gets each request and whether it is a pick, and returns an ``httpx2.Response``."""
+    import httpx2
+    from ner_site import providers
+
+    seen: list[Any] = []
+    real = providers.own_llm
+
+    def handler(request: Any) -> Any:
+        seen.append(request)
+        return respond(request, "chosen_key" in request.content.decode())
+
+    def build(*args: Any, **kwargs: Any) -> Any:
+        return real(*args, transport=httpx2.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    return seen
+
+
+def _claude_message(text: str, **headers: str) -> Any:
+    import httpx2
+
+    return httpx2.Response(
+        200,
+        headers=headers,
+        json={
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-5-5",
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+        },
+    )
+
+
+def _three_drugs() -> str:
+    return _answer(
+        *(
+            (name, "chemical", PICKS_TEXT.index(name), PICKS_TEXT.index(name) + len(name))
+            for name in ("haloperidol", "ketamine", "aspirin")
+        )
+    )
+
+
+def test_a_provider_that_sets_a_cookie_does_not_break_the_picks_after_the_first(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Anthropic answers with ``Set-Cookie`` like any site behind a CDN. The HTTP client
+    replayed it on the next request of the same client, and the wire refused that."""
+    cookie = {"Set-Cookie": "__cf_bm=abc123; Path=/; HttpOnly"}
+    seen = _real_own_clients(
+        monkeypatch,
+        lambda request, pick: _claude_message(PICK if pick else _three_drugs(), **cookie),
+    )
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "anthropic", "text": PICKS_TEXT, "selector": "claude-haiku-5-5"},
+        headers=OWN_HEADERS,
+    )
+    assert result[0] == 200, result[2]
+    picks = [e["pick"] for e in _json(result)["entities"] if e.get("pick")]
+    assert len(picks) >= 2 and all(p["status"] != "failed" for p in picks), picks
+    assert len(seen) == 1 + len(picks)
+    assert all("cookie" not in request.headers for request in seen)
+    assert "own_error" not in _last_log(capsys)
+
+
+def test_a_request_refused_during_selection_is_named_in_the_log(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed pick is part of a 200. Without a word in the log nobody would learn that
+    the site itself stopped the request."""
+    from ner_site import providers
+
+    seen = _real_own_clients(
+        monkeypatch, lambda request, pick: _claude_message(PICK if pick else _three_drugs())
+    )
+    real = providers._Wire._allowed
+
+    def no_picks(self: Any, request: Any) -> bool:
+        return "candidates" not in request.content.decode().lower() and real(self, request)
+
+    monkeypatch.setattr(providers._Wire, "_allowed", no_picks)
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": "anthropic", "text": PICKS_TEXT, "selector": "claude-haiku-5-5"},
+        headers=OWN_HEADERS,
+    )
+    assert result[0] == 200, result[2]
+    picks = [e["pick"] for e in _json(result)["entities"] if e.get("pick")]
+    assert picks and {(p["status"], p["explanation"]) for p in picks} == {("failed", "error")}
+    assert len(seen) == 1  # the extraction; no pick left the process
+    record = _last_log(capsys)
+    assert record["status"] == 200 and record["own_error"] == "WireRefused"
+    assert OWN_KEY not in json.dumps(record)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "openrouter"])
+@pytest.mark.parametrize("stage", ["extract", "select"])
+def test_a_bug_inside_a_real_adapter_is_not_reported_as_the_providers_failure(
+    provider: str,
+    stage: str,
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The exception's message holds the key. During extraction it is a 500 whose log
+    line has the type and the frames; during selection it is a failed pick, named in
+    the log. The message goes nowhere."""
+    import httpx2
+    from ner_site import providers
+    from ner_site.claude import ClaudeClient
+
+    lib: Any = httpx2 if provider == "anthropic" else httpx
+    model = {"anthropic": "claude-haiku-5-5", "openai": "gpt-6-luna", "openrouter": GEMINI}[
+        provider
+    ]
+
+    def answer(request: Any) -> Any:
+        if provider == "anthropic":
+            return _claude_message(_three_drugs())
+        body = {
+            "model": model,
+            "choices": [{"message": {"role": "assistant", "content": _three_drugs()}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        }
+        return lib.Response(200, json=body)
+
+    real = providers.own_llm
+
+    def build(*args: Any, purpose: str, **kwargs: Any) -> Any:
+        llm = real(*args, purpose=purpose, transport=lib.MockTransport(answer), **kwargs)
+        if purpose == stage:
+            adapter = llm.inner._inner
+            name = "_arguments" if isinstance(adapter, ClaudeClient) else "_headers"
+
+            def broken(*a: Any, **k: Any) -> Any:
+                raise KeyError(OWN_KEY)
+
+            monkeypatch.setattr(adapter, name, broken)
+        return llm
+
+    monkeypatch.setattr(providers, "own_llm", build)
+    result = _ask(
+        _own_only(cache_dir, tmp_path),
+        {"provider": provider, "text": PICKS_TEXT, "selector": model},
+        headers=OWN_HEADERS,
+    )
+    record = _last_log(capsys)
+    if stage == "extract":
+        assert _error(result) == (500, "internal")
+        assert record["exception"] == "KeyError" and "own_error" not in record
+        assert any(frame.startswith("providers.py:") for frame in record["where"])
+    else:
+        assert result[0] == 200, result[2]
+        picks = [e["pick"] for e in _json(result)["entities"] if e.get("pick")]
+        assert picks and {(p["status"], p["explanation"]) for p in picks} == {("failed", "error")}
+        assert record["own_error"] == "KeyError"
+    for text in (json.dumps(record), result[2].decode(), str(result[1])):
+        assert OWN_KEY not in text and json.dumps(OWN_KEY)[1:-1] not in text

@@ -1450,3 +1450,195 @@ def test_the_anthropic_sdk_is_pinned_where_it_is_installed_from() -> None:
     assert [line for line in requirements if line.startswith("anthropic")] == [pin]
     assert f'"{pin}"' in (root / "pyproject.toml").read_text()
     assert providers.ANTHROPIC_VERSION == "2026-10-21"
+
+
+# --- second review round: what a response may bring back, per-call refusals, bugs -------
+
+
+def percent(text: str) -> str:
+    return "".join(f"%{ord(char):02X}" for char in text)
+
+
+@pytest.mark.parametrize("status", [200, 401])
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_key_echoed_as_an_encoded_charset_reaches_no_process_cache(
+    provider: str, status: int
+) -> None:
+    """RFC 2231: ``charset*=utf-8''%73%6B...`` is decoded by the HTTP library when it
+    reads the content type, after any search of the raw header for the key."""
+    import encodings
+
+    key = f"sk-ENCODED.{provider}.{status}.0123456789abcdef"
+
+    def respond(lib: Any, echoed: str) -> Any:
+        return lib.Response(
+            status,
+            headers={"Content-Type": f"text/plain; charset*=utf-8''{percent(echoed)}"},
+            content=b"not json",
+        )
+
+    needle = key[3:]
+    said, sent = await fail_once(provider, key, respond)
+    assert sent == 1 and needle not in said
+    marker = f"encoded.{provider}.{status}"
+    assert [name for name in encodings._cache if marker in name.lower()] == []  # noqa: SLF001
+    assert held_anywhere(needle, (key, needle)) == []
+
+
+@pytest.mark.parametrize("lib", [httpx, httpx2], ids=["httpx", "httpx2"])
+@pytest.mark.parametrize("status", [200, 429, 500])
+async def test_only_a_fixed_set_of_response_headers_reaches_the_http_library(
+    lib: Any, status: int
+) -> None:
+    provider = "openai" if lib is httpx else "anthropic"
+    credential = credential_for(provider)
+    sent = {
+        "Content-Type": "application/json; charset=latin-1; boundary=x",
+        "Content-Length": "2",
+        "Content-Encoding": "identity",
+        "Retry-After": "7",
+        "Retry-After-Ms": "7000",
+        "Set-Cookie": "session=abc; Path=/",
+        "Request-Id": "req_0123",
+        "X-Request-Id": KEY,
+        "Link": "</next>; rel=next",
+        "Location": "/elsewhere",
+        "X-Anything": "at all",
+    }
+    wire_class = providers._HttpxWire if lib is httpx else providers._Httpx2Wire  # noqa: SLF001
+    wire = wire_class(
+        lib.MockTransport(lambda request: lib.Response(status, headers=sent, content=b"{}")),
+        credential,
+    )
+    async with lib.AsyncClient(transport=wire) as client:
+        response = await client.post(f"https://{HOSTS[provider]}/v1/x", headers=bearer(), json={})
+        assert dict(response.headers) == {
+            "content-type": "application/json; charset=utf-8",
+            "content-length": "2",
+            "content-encoding": "identity",
+            "retry-after": "7",
+            "retry-after-ms": "7000",
+        }
+        assert len(client.cookies.jar) == 0
+        assert response.json() == {}
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        ("Retry-After", f"7; {KEY}"),
+        ("Retry-After", "1e9"),
+        ("Retry-After-Ms", "-1"),
+        ("Content-Encoding", "x-made-up"),
+        ("Content-Length", "2, 2"),
+        ("Content-Type", f"text/html; charset={KEY}"),
+    ],
+)
+async def test_a_response_header_outside_its_strict_form_is_dropped(name: str, value: str) -> None:
+    wire = providers._HttpxWire(  # noqa: SLF001
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, headers={name: value}, content=b"{}")
+        ),
+        credential_for("openai"),
+    )
+    async with httpx.AsyncClient(transport=wire) as client:
+        response = await client.post("https://api.openai.com/v1/x", headers=bearer(), json={})
+    kept = dict(response.headers)
+    assert KEY not in repr(kept)
+    if name == "Content-Type":
+        assert kept["content-type"] == "text/plain; charset=utf-8"  # not JSON: said so, fixed
+    else:
+        assert name.lower() not in kept
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_cookie_from_the_provider_is_never_stored_or_sent_back(provider: str) -> None:
+    """The HTTP client keeps cookies and sends them with the next request of the same
+    client. For Anthropic the wire then saw a header the SDK does not send and refused
+    every call after the first."""
+
+    def with_cookie(request: Any) -> Any:
+        lib: Any = httpx2 if provider == "anthropic" else httpx
+        model = json.loads(request.content)["model"]
+        body = message_body(model) if provider == "anthropic" else chat_body(model)
+        return lib.Response(200, headers={"Set-Cookie": "__cf_bm=abc123; Path=/"}, json=body)
+
+    wire = Wire(provider, with_cookie)
+    llm = build(wire, call_cap=8)
+    first = await llm.complete(REQUEST)
+    rest = await asyncio.gather(*(llm.complete(REQUEST) for _ in range(4)))
+    await llm.aclose()
+    assert [r.text for r in (first, *rest)] == ['{"entities": []}'] * 5
+    assert len(wire.requests) == 5
+    assert all("cookie" not in request.headers for request in wire.requests)
+
+
+async def test_a_refusal_belongs_to_the_call_that_was_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Several picks share one client. One refused request must not turn the provider
+    failures of the calls beside it, or after it, into refusals."""
+    calls = 0
+    real = providers._Wire._allowed  # noqa: SLF001
+
+    def first_refused(self: Any, request: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        return calls != 1 and real(self, request)
+
+    monkeypatch.setattr(providers._Wire, "_allowed", first_refused)  # noqa: SLF001
+    wire = Wire("anthropic", (500, anthropic_error("api_error")), None)
+    llm = build(wire, call_cap=8)
+    results = await asyncio.gather(
+        *(llm.complete(REQUEST) for _ in range(3)), return_exceptions=True
+    )
+    late = await asyncio.gather(llm.complete(REQUEST), return_exceptions=True)
+    await llm.aclose()
+    kinds = [type(result).__name__ for result in (*results, *late)]
+    assert kinds == ["WireRefused", "LLMRetryableError", "ClaudeResponse", "ClaudeResponse"]
+    assert len(wire.requests) == 3
+
+
+async def test_a_content_length_that_is_not_the_bodys_stops_the_anthropic_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anthropic
+
+    real = anthropic.AsyncAnthropic._build_request  # noqa: SLF001
+
+    def padded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        request = real(self, *args, **kwargs)
+        request.headers["Content-Length"] = str(len(request.content) + 64)
+        return request
+
+    monkeypatch.setattr(anthropic.AsyncAnthropic, "_build_request", padded)
+    wire = Wire("anthropic")
+    llm = build(wire)
+    with pytest.raises(providers.WireRefused):
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_fault_inside_an_adapter_is_not_dressed_up_as_the_providers(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only what a provider, the SDK or the HTTP library can do to a call is sealed. A
+    ``KeyError`` in the adapter's own code is a bug of the site and leaves as it is, to
+    be logged as one (``http.handle`` logs its type and frames, never its message)."""
+
+    def broken(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise KeyError(KEY)
+
+    if provider == "anthropic":
+        monkeypatch.setattr(ClaudeClient, "_arguments", broken)
+    else:
+        monkeypatch.setattr(providers.OpenAICompatClient, "_headers", broken)
+    wire = Wire(provider)
+    llm = build(wire)
+    with pytest.raises(KeyError):
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []

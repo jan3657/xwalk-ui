@@ -425,7 +425,7 @@ def test_a_cancelled_pick_through_the_own_key_reader_counts_its_call() -> None:
     from xwalk.llm.budget import BudgetedLLM, CallBudget
 
     credential = Credential("openai", lambda: "sk-SENTINEL-0123456789abcdef")
-    llm = _OwnJSONClient(BudgetedLLM(_Stalls(), CallBudget(limit=4)), credential)
+    llm = _OwnJSONClient(BudgetedLLM(_Stalls(), CallBudget(limit=4)), credential, {})
     (result,), stats = _run("gpt-6-luna", llm=llm, deadline=0.05, own_key=True)
     assert result.pick is not None and result.pick.explanation == "timeout"
     assert stats.calls == 1 and stats.prompt_tokens is None

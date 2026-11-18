@@ -522,11 +522,19 @@ class _OwnJSONClient:
     The adapter removes literal echoes. JSON escapes can hide the token until the
     stage parses its answer. Use the stage parser so fenced and repaired JSON go
     through the same check. Leave unreadable answers to the usual stage errors.
+
+    A call that fails is named in the request's log line (``own_error``, the class of
+    what was raised), here because this is the one place both stages pass: a failed
+    extraction becomes an error response, but a failed pick is part of a 200, and
+    without this a request the site itself refused to send would leave no trace.
     """
 
-    def __init__(self, client: LLMClient, credential: providers.Credential) -> None:
+    def __init__(
+        self, client: LLMClient, credential: providers.Credential, log: dict[str, Any]
+    ) -> None:
         self._client = client
         self._token = credential.token
+        self._log = log
 
     @property
     def model(self) -> str:
@@ -547,7 +555,11 @@ class _OwnJSONClient:
         return getattr(self._client, "budget", None)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        answer = await self._client.complete(request)
+        try:
+            answer = await self._client.complete(request)
+        except Exception as exc:
+            self._log.setdefault("own_error", type(exc).__name__)
+            raise
         key = self._token()
         if "\\" not in answer.text and key not in answer.text:
             return answer
@@ -612,8 +624,8 @@ async def _run_own(
             settings=settings,
             indexes=indexes,
             started_at=started,
-            llm=_OwnJSONClient(llm, credential),
-            select_llm=_OwnJSONClient(selector, credential) if selector is not None else None,
+            llm=_OwnJSONClient(llm, credential, log),
+            select_llm=_OwnJSONClient(selector, credential, log) if selector is not None else None,
             extra_secrets=(credential.token(),),
         )
 
@@ -770,6 +782,7 @@ def handle(
     except Exception as exc:  # noqa: BLE001 - a 500 with no detail; type and place to the log
         frames = traceback.extract_tb(exc.__traceback__)
         log["code"] = "internal"
+        log.pop("own_error", None)  # not a provider's failure: `exception` says what
         log["exception"] = type(exc).__name__
         log["where"] = [f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}:{f.name}" for f in frames]
         result = _error(
