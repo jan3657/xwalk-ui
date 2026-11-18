@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -301,6 +302,26 @@ def _usage_store(settings: Settings, timeout: float) -> usage.SiteRuns | None:
             executor = make_usage_executor(settings.database_url, timeout)
             found = _USAGE[key] = usage.SiteRuns(executor, settings.neon_schema, clock=_now)
         return found
+
+
+def _plain_address(headers: Mapping[str, str]) -> dict[str, str]:
+    """The address header of a request whose credential has not been read, for the
+    day's visitor of its row. It is the header the visitor id is made from (the first
+    of ``limits.ADDRESS_HEADERS`` with a value, as for an admitted request), kept only
+    when that value is an IP address: a request that is then refused for its credential
+    is counted under its own address, and what a client put there instead of one (a
+    key, pasted in the wrong place) is not hashed into a row."""
+    for name in limits.ADDRESS_HEADERS:
+        value = headers.get(name) or ""
+        first = (value.split(",", 1)[0] if name == "x-forwarded-for" else value).strip()
+        if not first:
+            continue
+        try:
+            ipaddress.ip_address(first)
+        except ValueError:
+            return {}
+        return {name: value}
+    return {}
 
 
 def _known_models(settings: Settings) -> frozenset[str]:
@@ -1103,9 +1124,10 @@ def _dispatch(
         raise passcode
     request = _check_encodable(_parse(body))
     if recorded is not None and settings.stats_passcode is not None:
-        # From here on the request is a run and gets a row. Its visitor has no address
-        # until the credential step has looked at the headers (below).
-        recorded["address"] = {}
+        # From here on the request is a run and gets a row. Until the credential step
+        # has looked at the headers (below) its visitor is the plain address it came
+        # from; a request refused at that step keeps it.
+        recorded["address"] = _plain_address(headers)
     # Record only a recognised mode, even when its credential is missing or refused.
     if request.provider in (None, providers.SITE):
         log.update(provider=providers.SITE, credential="site")

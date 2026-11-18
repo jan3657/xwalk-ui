@@ -370,11 +370,9 @@ def make_handler(
     rules: HeaderRules,
     delay: float,
     rewrites: dict[str, str] | None = None,
-    *,
-    pass_query: bool = False,
 ) -> type[SimpleHTTPRequestHandler]:
-    """``pass_query`` hands the backend the path with its query string (the canned
-    backend reads ``days`` from it); the service backend gets the bare path as before."""
+    """The backend is handed the path with its query string: the canned backend and the
+    real handler both read ``days`` from it (``GET /api/stats?days=7``)."""
     rewrites = rewrites or {}
 
     class Handler(SimpleHTTPRequestHandler):
@@ -423,7 +421,7 @@ def make_handler(
                 try:
                     parts = urlsplit(self.path)
                     target = parts.path
-                    if pass_query and parts.query:
+                    if parts.query:
                         target += "?" + parts.query
                     status, headers, body = backend(method, target, lowered, raw)
                 except Exception as exc:  # noqa: BLE001 - a local dev server reports and goes on
@@ -524,13 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         backend = service_backend(offline=args.offline)
         mode = "ner_site.http" + (" (offline)" if args.offline else " (live)")
 
-    handler = make_handler(
-        backend,
-        load_header_rules(),
-        args.delay,
-        load_rewrites(),
-        pass_query=args.canned is not None,
-    )
+    handler = make_handler(backend, load_header_rules(), args.delay, load_rewrites())
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     except OSError as exc:

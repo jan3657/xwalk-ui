@@ -4437,3 +4437,91 @@ def test_a_200_that_is_not_a_message_on_every_step_is_a_provider_error_not_a_422
     )
     assert _error(result) == (502, "provider_error")
     assert seen[:3] == [OPUS, OPUS, SONNET]
+
+
+# --- analytics fix wave, minor items (A6) ------------------------------------------------
+
+
+def test_a_request_refused_for_its_credential_is_counted_under_its_own_address(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    """Every such request used to share one ``visitor_day``, that of no address at all,
+    wherever it came from."""
+    from ner_site import limits, usage
+
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=ALL_OWN)
+    salt = limits.default_salt(DB_URL)
+
+    def day_of(address: str) -> str:
+        return usage.visitor_day(limits.visitor_id({"x-real-ip": address}, salt), salt, STATS_NOW)
+
+    def refused(**headers: str) -> dict[str, Any]:
+        result = _ask(s, {"provider": "openai"}, headers={**POST_HEADERS, **headers})
+        assert result[0] in (400, 401), result[2]
+        return _recorded(runs)[-1]
+
+    nobody = day_of("")
+    # No key at all, from two addresses: two visitors, the ones an admitted run has.
+    first = refused(**{"x-real-ip": RAW_IP})
+    second = refused(**{"x-real-ip": "198.51.100.9", "x-forwarded-for": RAW_IP})
+    assert first["visitor_day"] == day_of(RAW_IP) != nobody
+    assert second["visitor_day"] == day_of("198.51.100.9")
+    admitted = _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))
+    assert admitted[0] == 200 and _recorded(runs)[-1]["visitor_day"] == first["visitor_day"]
+    # The forwarded address alone, an IPv6 one, and a malformed key with a good address.
+    assert refused(**{"x-forwarded-for": f"{RAW_IP}, 10.0.0.1"})["visitor_day"] == day_of(RAW_IP)
+    assert refused(**{"x-real-ip": " 2001:db8::7 "})["visitor_day"] == day_of("2001:db8::7")
+    assert (
+        refused(**{"x-real-ip": RAW_IP, "Authorization": "Bearer short"})["visitor_day"]
+        == first["visitor_day"]
+    )
+    # What is not an address is never hashed into a row: a key pasted where one belongs
+    # (the first header that has a value is the one that counts, as for the limiter).
+    for junk in (OWN_KEY, "not-an-address", "203.0.113.77:443", "203.0.113.77 extra"):
+        row = refused(**{"x-real-ip": junk, "x-forwarded-for": RAW_IP})
+        assert row["visitor_day"] == nobody, junk
+    stored = json.dumps([runs.sent, [str(row) for row in runs.rows]], default=str)
+    assert OWN_KEY not in stored and RAW_IP not in stored and "198.51.100.9" not in stored
+    # A provider this deployment does not offer is refused the same way, under its address.
+    plain = _stats_site(cache_dir, tmp_path)
+    result = _ask(plain, {"provider": "openai"}, headers={**POST_HEADERS, "x-real-ip": RAW_IP})
+    assert _error(result) == (400, "bad_credential")
+    assert _recorded(runs)[-1]["visitor_day"] == first["visitor_day"]
+
+
+def test_the_local_server_hands_the_query_string_to_the_real_handler(
+    cache_dir: Path, tmp_path: Path, runs: Any
+) -> None:
+    """Outside canned mode ``?days=`` was dropped, so the page's period selector always
+    got 30 days from the real service."""
+    spec = importlib.util.spec_from_file_location(
+        "serve_local_query", PROJECT / "tools/serve_local.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    s = _stats_site(cache_dir, tmp_path)
+    seen: list[str] = []
+
+    def backend(method: str, path: str, headers: Any, body: bytes) -> Handled:
+        seen.append(path)
+        status, out_headers, out_body = http_mod.handle(method, path, headers, body, settings=s)
+        return status, dict(out_headers), out_body
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), module.make_handler(backend, [], 0.0))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        status, _, body = _request(port, "GET", "/api/stats?days=7", headers=STATS_HEADERS)
+        assert status == 200 and json.loads(body)["days"] == 7
+        status, _, body = _request(port, "GET", "/api/stats", headers=STATS_HEADERS)
+        assert status == 200 and json.loads(body)["days"] == 30
+        status, _, body = _request(port, "GET", "/api/stats?days=0", headers=STATS_HEADERS)
+        assert status == 400 and json.loads(body)["error"]["code"] == "bad_days"
+        status, _, _ = _request(port, "GET", "/api/nope?x=1")
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == ["/api/stats?days=7", "/api/stats", "/api/stats?days=0", "/api/nope?x=1"]

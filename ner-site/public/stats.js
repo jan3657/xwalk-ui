@@ -6,7 +6,9 @@
 
 (() => {
   // The stats passcode: one session storage entry of its own. It leaves the page only
-  // as the X-Stats-Passcode header of GET /api/stats: never in a URL, a log or the DOM.
+  // as the X-Stats-Passcode header of GET /api/stats: never in a URL or a log, and once
+  // it has been accepted not in the DOM either (the field is emptied; the copy kept
+  // for this tab is what later requests send).
   const PASSCODE_ENTRY = "xwalk-stats-passcode";
   const STATS_PATH = "/api/stats";
   const REQUEST_TIMEOUT_MS = 30000;
@@ -14,13 +16,15 @@
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   // Tiers in stacking order, bottom first. "none" is not a tier the server sends: it is
-  // the day's runs that were refused before a tier was chosen (runs minus the four).
+  // the day's runs that are in none of the four (runs minus the four). Most were refused
+  // before a tier was chosen, but not all: a run on a deployment without the allowance
+  // answers 200 and has no tier either.
   const TIERS = [
     { key: "opus", name: "Opus" },
     { key: "sonnet", name: "Sonnet" },
     { key: "other", name: "Other" },
     { key: "own", name: "Own key", hatched: true },
-    { key: "none", name: "Refused, no tier" },
+    { key: "none", name: "No tier" },
   ];
   const MESSAGES = {
     required: "Enter the stats passcode.",
@@ -53,7 +57,11 @@
     usdReadout: $("usd-readout"),
   };
 
-  const state = { data: null, picked: null, sticky: false, request: 0, controller: null, charts: [] };
+  const KEPT_HINT = "Kept for this tab";
+
+  // `passcode` is the accepted passcode of this tab (the session storage entry, and the
+  // same value in memory for a browser that blocks storage); "" when there is none.
+  const state = { data: null, picked: null, sticky: false, request: 0, controller: null, charts: [], passcode: "" };
 
   // ---------- small helpers ----------
 
@@ -251,7 +259,8 @@
   }
 
   async function load() {
-    const passcode = el.passcode.value;
+    // What was typed, else the passcode this tab has already had accepted.
+    const passcode = el.passcode.value || state.passcode;
     hideMessage();
     if (!passcode) {
       hideData();
@@ -282,7 +291,12 @@
     try {
       const data = await fetchStats(passcode, days, controller.signal);
       if (request !== state.request) return;
+      // Accepted: kept for this tab and taken out of the field, so that the page's
+      // DOM does not hold it. Later requests use the kept copy.
+      state.passcode = passcode;
       storageSet(PASSCODE_ENTRY, passcode);
+      el.passcode.value = "";
+      el.passcode.placeholder = KEPT_HINT;
       el.forget.hidden = false;
       render(data, Number(days));
     } catch (err) {
@@ -292,8 +306,11 @@
       const kind = err instanceof StatsError ? err.kind : "other";
       showMessage(err instanceof StatsError ? err.message : "The stats could not be shown.");
       if (kind === "required" || kind === "invalid") {
-        // A refused passcode is not kept; it stays in the field to be corrected.
+        // A refused passcode is not kept; one that was typed stays in the field to
+        // be corrected.
+        state.passcode = "";
         storageSet(PASSCODE_ENTRY, "");
+        el.passcode.placeholder = "";
         el.forget.hidden = true;
         el.passcode.focus();
         el.passcode.select();
@@ -335,7 +352,7 @@
       text: str(v) || "unknown",
       cls: "code",
     }));
-    renderCounts($("rows-fallback"), rows(data.by_fallback), "reason", runs, "No run stepped down in this period.", (v) => ({
+    renderCounts($("rows-fallback"), rows(data.by_fallback), "reason", runs, "No step-down notes in this period.", (v) => ({
       text: str(v) || "unknown",
       cls: "code",
     }));
@@ -380,10 +397,12 @@
     $("t-usd-note").textContent =
       `About ${usd(num(totals.estimated_usd) / Math.max(1, days))} a day, on the site's keys. An estimate.`;
     $("t-step").textContent = percent(stepped, runs);
-    $("t-step-note").textContent = `${int(stepped)} of ${plural(runs, "run", "runs")} ended on a lower model.`;
+    // A note says a step-down was decided or made. It may be a selector following the
+    // extraction model, or belong to a run that then failed: not always a lower model.
+    $("t-step-note").textContent = `${int(stepped)} of ${plural(runs, "run", "runs")} had a step-down note.`;
     $("t-runs").textContent = int(runs);
     $("t-runs-note").textContent = TIERS.filter((t) => tiers[t.key] > 0)
-      .map((t) => `${t.key === "none" ? "refused" : t.name} ${int(tiers[t.key])}`)
+      .map((t) => `${t.key === "none" ? "no tier" : t.name} ${int(tiers[t.key])}`)
       .join(", ");
     $("t-ok").textContent = int(ok);
     $("t-ok-note").textContent = `${percent(ok, runs)} of runs. ${plural(errors, "error", "errors")}.`;
@@ -393,8 +412,8 @@
     el.unpriced.hidden = unpriced <= 0;
     el.unpriced.textContent =
       unpriced > 0
-        ? `${plural(unpriced, "run", "runs")} on the site's keys used a model with no list price. ` +
-          "They add nothing to the estimate, so the real spend is higher."
+        ? `${plural(unpriced, "run", "runs")} on the site's keys used a model with no list price, ` +
+          "to extract or to select. That model's tokens add nothing to the estimate, so the real spend is higher."
         : "";
   }
 
@@ -425,7 +444,7 @@
           null,
           str(m.model)
             ? h("th", { scope: "row", class: "code", text: m.model })
-            : h("th", { scope: "row", class: "quiet", text: "No model (refused first)" }),
+            : h("th", { scope: "row", class: "quiet", text: "No model (refused or failed first)" }),
           cell(str(m.credential) || "unknown", null, "Key"),
           cell(int(m.runs), "num", "Runs"),
           cell(int(m.prompt_tokens), "num", "Tokens in"),
@@ -514,7 +533,7 @@
     return (
       `${longDay(d.day)}: ${plural(d.runs, "run", "runs")}` +
       (parts.length ? `. ${parts.join(", ")}` : "") +
-      (stepped > 0 ? `. ${int(stepped)} stepped down` : "") +
+      (stepped > 0 ? `. ${int(stepped)} with a step-down note` : "") +
       "."
     );
   }
@@ -734,15 +753,17 @@
   });
 
   el.days.addEventListener("change", () => {
-    if (el.passcode.value) load();
+    if (el.passcode.value || state.passcode) load();
   });
 
   el.forget.addEventListener("click", () => {
     if (state.controller) state.controller.abort();
     state.request += 1;
     setBusy(false);
+    state.passcode = "";
     storageSet(PASSCODE_ENTRY, "");
     el.passcode.value = "";
+    el.passcode.placeholder = "";
     el.forget.hidden = true;
     hideMessage();
     hideData();
@@ -762,10 +783,11 @@
   if (typeof ResizeObserver === "function") new ResizeObserver(onResize).observe(el.runsChart);
   else window.addEventListener("resize", onResize);
 
-  // A passcode kept from earlier in this tab goes back in the field and is used.
-  const kept = storageGet(PASSCODE_ENTRY);
-  if (kept) {
-    el.passcode.value = kept;
+  // A passcode kept from earlier in this tab is used as it is; it is not put back in
+  // the field.
+  state.passcode = storageGet(PASSCODE_ENTRY);
+  if (state.passcode) {
+    el.passcode.placeholder = KEPT_HINT;
     el.forget.hidden = false;
     load();
   } else {
