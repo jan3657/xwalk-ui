@@ -1121,17 +1121,21 @@ The per-model and per-day dollars both add up to the total. Not in the estimate:
 The Anthropic Console is the bill.
 
 **What recording costs a request.** One HTTPS round trip to Neon (a single `INSERT`),
-made after the response is built and before it is sent. The request waits for it at
-most 2 s, and that wait covers everything recording does, including finding or
-building the database client behind a lock the instance's requests share. The write
-has the same 2 s as a deadline of its own, on the clock, for the whole exchange (the
-name lookup, the connection, the request and the complete answer): when it is up the
-write is cancelled and its connection closed, whatever the database is doing, also
-one that keeps sending a byte at a time (`ner_site/deadline.py`; the engine's own
-client limits each read, not the exchange). So the place a write holds is free again
-when its deadline passes; the tests allow it one second more. At most four writes are
-under way on a warm instance at once; a run that finds all four taken is not recorded
-and does not wait. A name lookup is the one thing that cannot be cancelled: the write
+made after the response is built and before it is sent. One deadline covers the whole
+attempt: 2 s on the clock from the moment recording begins. Against it, in this
+order: the wait for a lock the instance's requests share (behind it the database
+client is found or built; a write that gets the lock after the deadline does not
+start), and then the exchange with what time is left (the name lookup, the
+connection, the request and the complete answer). When the deadline is up the write
+is cancelled and its connection closed, whatever the database is doing, also one that
+keeps sending a byte at a time (`ner_site/deadline.py`; the engine's own client
+limits each read, not the exchange), and a write that had not gone out yet is never
+sent. So the request waits at most 2 s, and the place a write holds is free again
+when its deadline passes; the tests hold it to one second after that, with the lock
+held, with an answer that trickles in the body or in the headers, with a silent
+server and with a resolver that never answers. At most four writes are under way on
+a warm instance at once; a run that finds all four taken is not recorded and does not
+wait. A name lookup is the one thing that cannot be cancelled: the write
 stops waiting for it at the deadline, and the lookup keeps a small thread until the
 system's resolver gives up; there are at most four such threads, and while all four
 are stuck a write fails at once. A database that hangs therefore costs a request at
@@ -1156,11 +1160,13 @@ DROP TABLE xwalk.site_runs;                              -- everything
 ```
 
 Nothing prunes the table. After a `DROP TABLE`, a deployment that still has
-`NER_SITE_STATS_PASSCODE` set creates the table again, but not always on its next
-run: a warm instance remembers that it created the table, so its next run fails to
-record (`usage: "PostgresError"`, that row is lost) and the run after it creates the
-table. To lose nothing, run `tools/setup_usage.py` right after the drop; a redeploy
-also starts every instance afresh. To stop recording instead, unset the passcode
+`NER_SITE_STATS_PASSCODE` set creates the table again, but not on its next run: a
+warm instance remembers that it created the table, so the first write it sends after
+the drop fails (`usage: "PostgresError"`, that row is lost), and the next write it
+sends after learning that creates the table. Writes that were already under way when
+the instance learned it fail the same way, so an instance loses one row, or a few
+when it was serving several requests at that moment; each warm instance learns it
+for itself. To lose nothing, run `tools/setup_usage.py` right after the drop. To stop recording instead, unset the passcode
 first.
 
 **Turning it off.** Unset `NER_SITE_STATS_PASSCODE` and redeploy: nothing is recorded,
@@ -1781,7 +1787,7 @@ after the fixes.
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1630 passed, 34
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1726 passed, 34
   deselected (1431 before the fixes). The fixes were written test first. Reproduced
   before the code changed: four requests in a row against a database that never
   answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
@@ -1805,11 +1811,27 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
   stalled, four lookups each kept a daemon thread and the following writes failed at
   once. The protocol of the new client was compared with the engine's, request for
   request and answer for answer, over mock transports.
+- After a third review: with the store's lock held for longer than the deadline and
+  writes waiting for it (four in the test, nine in a probe with the real client),
+  every place was free within one second after the deadline and no write went out
+  when the lock was released. A Neon answer that echoes the database URL in its
+  error code, in a body that is not JSON, or in an error page, and a connection
+  string that cannot be sent as a header, each end as a fixed-message error with no
+  cause or context and nothing of the URL in its message, attributes or `repr`, or
+  in the log line. Beyond the tests, 416 generated answers (statuses, bodies and
+  headers that echo the URL, deeply nested and oversized JSON, broken encodings) and
+  seven answers over raw sockets that are not HTTP or are cut short were run through
+  the client, looking also at the local variables of every frame of the errors:
+  that found one leak (a transaction's answer in a frame, since removed) and that
+  the HTTP library's pool did not recover from calls cancelled while they waited in
+  it, after which every write timed out; calls now wait at a semaphore of the
+  module, and a test covers it.
 - A failed run that had stepped down (a paid Opus refusal, then a Sonnet failure) is
   priced as Opus; a row with strings of its own in it adds none to `/api/stats`;
   a dropped table is created again after one lost row; a `DATABASE_URL` with a port
   that is no number is not kept where only analytics reads it.
-- `python -m pytest -q -m integration tests/test_site_usage.py`: 11 passed, against a
+- `python -m pytest -q -m integration tests/test_site_usage.py`: 11 passed (33 with
+  the limiter's), against a
   local PostgreSQL 16.15 on 127.0.0.1 through `psql`, in throwaway schemas that were
   dropped (none left), also with `PGTZ=Europe/Ljubljana` and
   `PGTZ=America/Los_Angeles`. These run the real statements, including the changed
@@ -1845,9 +1867,13 @@ Not run or not verified:
 - Python 3.10 (no interpreter on the machine; the code uses nothing newer and ruff
   targets it). A Vercel Firewall rule on `/api/stats`.
 - Two timing tests (`test_one_deadline_bounds_the_whole_mapping_step`,
-  `test_a_refusal_belongs_to_the_call_that_was_refused`) each failed once in a full
-  run while the machine was under heavy unrelated load and passed when run again,
-  with and without these changes.
+  `test_a_refusal_belongs_to_the_call_that_was_refused`) failed now and then in full
+  runs while the machine was under heavy unrelated load (a load average of 25 to 50)
+  and passed when run again; both fail the same way on the commit before this work
+  (the second 3 times in 12 there).
+- A connection the server closes just as a write is sent on it (an idle keep-alive
+  connection timing out) is a lost row with `usage: "PostgresError"`: nothing is
+  retried, because an insert is not idempotent.
 
 ### For the operator after deploying
 

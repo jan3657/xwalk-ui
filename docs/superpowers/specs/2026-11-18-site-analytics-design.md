@@ -193,10 +193,18 @@ The sections above are the design. Where the code differs, this section holds.
   recorded and does not wait, and its log line says `usage: "saturated"`. The write
   goes through an executor of the site's own (`ner_site/deadline.py`) whose timeout
   is a wall-clock deadline for the whole exchange, name lookup and complete answer
-  included: at 2 s the write is cancelled and its connection closed, so its place is
-  free again when the deadline passes (tested to within one second, against an
-  answer that trickles in the body or the headers, a silent server, and a resolver
-  that never answers). The engine's executor limits each read, and a database that
+  included: at the deadline the write is cancelled and its connection closed. The
+  deadline is one, for the whole attempt, taken on the monotonic clock before any
+  setup: the lock the store is found behind is waited for no longer than to it, a
+  write that gets the lock after it does not start, the SQL call is given only the
+  time that is left, and a write the loop had not got to by then is never sent. So a
+  place is free again when the deadline passes (tested to within one second: with
+  the store's lock held past the deadline and four writes waiting, none of which
+  starts when the lock is released; against an answer that trickles in the body or
+  the headers; a silent server; and a resolver that never answers). No failure of
+  that executor carries the connection string or anything the server sent: each is
+  one of a few fixed-message errors with no cause and no context, and a SQLSTATE is
+  kept only when it has the form of one. The engine's executor limits each read, and a database that
   sent a byte now and then held a place without end. A name lookup cannot be
   cancelled: it keeps one of at most four daemon threads until the system's resolver
   gives up, and while all four are stuck a write fails at once.
@@ -232,14 +240,18 @@ The sections above are the design. Where the code differs, this section holds.
   they are read as when a row is written, so a row from before the rule or written
   by hand adds nothing free-form to the answer; groups that become the same word are
   added up.
-- **A dropped table.** An instance remembers that it created the table. After a
-  `DROP TABLE` its next statement fails (SQLSTATE 42P01, that row is lost) and the
-  one after creates the table again; `tools/setup_usage.py` after the drop avoids
-  the loss.
+- **A dropped table.** An instance remembers that it created the table, and only a
+  statement that created it sets that memory (an insert's success does not: its
+  answer may be late, from before the drop). After a `DROP TABLE` the first
+  statement an instance sends fails (SQLSTATE 42P01, that row is lost, as are any
+  that were under way at that moment) and the next one it sends creates the table
+  again; `tools/setup_usage.py` after the drop avoids the loss.
 - **A port in an analytics-only `DATABASE_URL`.** "Unusable" includes what the URL
   parser only checks when asked: a port that is not a number in range, a host that
-  is not a plain name or bracketed address, any space or control character. Nothing
-  of an unusable URL is kept, so nothing of it is scrubbed from answers.
+  is not a DNS name (labels of 1 to 63 letters, digits and hyphens with no hyphen at
+  an end, one dot allowed at the very end; an address, bracketed or not, is refused:
+  a Neon host is a name), anything that is not printable ASCII. Nothing of an
+  unusable URL is kept, so nothing of it is scrubbed from answers.
 - **Null rows (amends 4).** `by_model` has a row with `"model": null` per credential
   for runs no model answered, and `by_country` a row with `"country": null` for runs
   without a country, so that each list's runs add up to every run.
