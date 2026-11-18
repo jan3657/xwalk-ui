@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 
@@ -108,13 +108,18 @@ _JEV_STATUS: dict[MatchStatus, PickStatus] = {
 @dataclass
 class SelectStats:
     """Filled in by `select_entities`: the selector's calls, tokens and reported cost.
-    Tokens and cost are None once any call did not report them ("unknown", not 0)."""
+    Tokens and cost are None once any call did not report them ("unknown", not 0).
+
+    ``served_elsewhere`` maps a model that answered a pick to the fallback-chain step
+    that had been asked, for every pick whose answer names another model than its step
+    (the provider answered from a substitute); the first step seen is kept."""
 
     calls: int = 0
     prompt_tokens: int | None = 0
     completion_tokens: int | None = 0
     cost_usd: float | None = 0.0
     cost_reported: bool = True  # False for selectors whose provider reports no cost
+    served_elsewhere: dict[str, str] = field(default_factory=dict)
 
     def add(self, usage: XwalkUsage) -> None:
         self.calls += usage.calls
@@ -283,7 +288,10 @@ async def _with_llm(
         stats.add(failure_usage(exc))
         raise
     stats.add(outcome.usage)
-    selector = getattr(view, "answered_by", None) or selector
+    answered, asked = getattr(view, "answered_by", None), getattr(view, "asked", None)
+    if answered and asked and answered != asked:
+        stats.served_elsewhere.setdefault(answered, asked)
+    selector = answered or selector
     choice = outcome.choice
     if outcome.error is not None:
         return _pick(

@@ -111,6 +111,12 @@ SITE_URL = "https://github.com/jan3657/xwalk"
 SITE_TITLE = "xwalk NER demo"
 LLM_TIMEOUT_S = 60.0  # one HTTP request
 LLM_MAX_RETRIES = 2  # so at most 3 requests, the same as the call budget
+# One Claude extraction request. Shorter than LLM_TIMEOUT_S because a Claude model that
+# does not answer in time is left at once for the next step (ner_site.fallback, reason
+# "timeout"): two such waits, Opus then Sonnet, must fit inside EXTRACT_TIMEOUT_S, or a
+# hung Opus would end the request before Sonnet was ever tried. Selection calls keep
+# LLM_TIMEOUT_S; the request deadline bounds that step.
+CLAUDE_EXTRACT_TIMEOUT_S = 40.0
 
 # Wall-clock bounds inside the function's 120 s maxDuration (vercel.json): the whole
 # extraction step, retries included; then the whole mapping step gets what is left of
@@ -568,7 +574,8 @@ LLMMaker = Callable[["Settings", str], LLMClient]
 
 def make_claude(settings: Settings, model: str, purpose: str) -> LLMClient:
     """One Claude model on the operator's key. The token limit is the adapter's own per
-    purpose (thinking counts against it), not the engine's 2048 / 600."""
+    purpose (thinking counts against it), not the engine's 2048 / 600; an extraction
+    request has the shorter ``CLAUDE_EXTRACT_TIMEOUT_S``."""
     if not settings.anthropic_api_key:
         raise ValueError("ANTHROPIC_API_KEY is not set")
     return ClaudeClient(
@@ -576,7 +583,7 @@ def make_claude(settings: Settings, model: str, purpose: str) -> LLMClient:
         api_key=settings.anthropic_api_key,
         max_tokens=EXTRACT_MAX_TOKENS if purpose == EXTRACT else SELECT_MAX_TOKENS,
         effort=settings.claude_effort,
-        timeout=LLM_TIMEOUT_S,
+        timeout=CLAUDE_EXTRACT_TIMEOUT_S if purpose == EXTRACT else LLM_TIMEOUT_S,
     )
 
 
@@ -715,6 +722,7 @@ _WHY = {
     "rate_limited": "{model} is rate limited",
     "overloaded": "{model} is overloaded",
     "transient": "{model} did not answer",
+    "timeout": "{model} did not answer in time",
     "refused": "{model} declined this text",
     "call_limit": "{model} reached its call limit for this request",
     "opus_allowance_used": "Your Opus allowance for this hour is used",
@@ -722,23 +730,50 @@ _WHY = {
 }
 
 
-def notice(note: FallbackNote) -> str:
-    """The sentence a visitor reads about one departure from the model they asked for."""
-    ran = "the remaining picks ran on" if note.stage == SELECT else "this ran on"
+def notice(note: FallbackNote, *, last: bool = True) -> str:
+    """The sentence a visitor reads about one departure from the model they asked for.
+
+    ``last`` is whether the request went no further in that part of it. Only then does
+    the sentence say what ran on the model the departure led to; an earlier one says
+    "moved on to", because nothing may have run there."""
     target = display_name(note.to)
+    if not last:
+        then = f"moved on to {target}"
+    elif note.reason == FOLLOWS_EXTRACTION:
+        then = f"the picks ran on {target}"
+    elif note.stage == SELECT:
+        then = f"the remaining picks ran on {target}"
+    else:
+        then = f"this ran on {target}"
     if note.reason == FOLLOWS_EXTRACTION:
-        return f"Selection uses the model that extracted; the picks ran on {target}."
+        return f"Selection uses the model that extracted; {then}."
     blocked = note.reason if note.reason in BLOCK_TEXT else None
     if note.reason == "claude_unavailable":
         blocked = fallback.claude_block()
         if blocked is None:
-            return f"Claude is unavailable; {ran} {target}."
+            return f"Claude is unavailable; {then}."
     if blocked is not None:
         # Named as Claude when the request left Claude altogether, else as the model.
         who = display_name(note.from_) if is_claude(note.to) else "Claude"
-        return f"{who} is unavailable ({BLOCK_TEXT.get(blocked, blocked)}); {ran} {target}."
+        return f"{who} is unavailable ({BLOCK_TEXT.get(blocked, blocked)}); {then}."
     why = _WHY.get(note.reason, "{model} could not be used")
-    return f"{why.format(model=display_name(note.from_))}; {ran} {target}."
+    return f"{why.format(model=display_name(note.from_))}; {then}."
+
+
+def _notices(departures: Sequence[FallbackNote], *, extracted_on_chain: bool) -> list[str]:
+    """A sentence per departure, in order. The departures fall into two parts, those
+    that decided where the extraction ran and those that decided where the picks ran,
+    and in each only the last one says what ran where it led (:func:`notice`). A
+    departure at admission belongs to the extraction, or to the selection when only
+    the selector runs on a chain."""
+
+    def part(note: FallbackNote) -> str:
+        return SELECT if note.stage == SELECT or not extracted_on_chain else EXTRACT
+
+    final = {part(note): position for position, note in enumerate(departures)}
+    return [
+        notice(note, last=final[part(note)] == position) for position, note in enumerate(departures)
+    ]
 
 
 def _notes(chain: FallbackLLM, since: int = 0) -> list[FallbackNote]:
@@ -746,6 +781,21 @@ def _notes(chain: FallbackLLM, since: int = 0) -> list[FallbackNote]:
         FallbackNote(stage=f.stage, from_=f.from_model, to=f.to_model, reason=f.reason)
         for f in chain.fallbacks[since:]
     ]
+
+
+def _served_elsewhere(
+    stage: str, asked: str | None, answered: str | None, chain: FallbackLLM
+) -> FallbackNote | None:
+    """The departure nobody decided here: the Claude step `asked` was sent the request
+    and the answer names `answered`, a model that is no step of the chain. The adapter
+    asks for Anthropic's server-side refusal fallback (``fallbacks="default"``), so that
+    is a model the API moved to when the one asked for declined. An OpenRouter step is
+    left alone: the name its provider reports may be spelt differently from the id."""
+    if not asked or not answered or not is_claude(asked):
+        return None
+    if answered in {step.client.model for step in chain.steps}:
+        return None
+    return FallbackNote(stage=stage, from_=asked, to=answered, reason="refused")
 
 
 # /api/health asks OpenRouter whether the key still works (GET /api/v1/key: free, no
@@ -999,7 +1049,9 @@ async def run(
     When ``llm`` or ``select_llm`` is a fallback chain (:func:`make_chain`; one chain may
     be both), the response says what it did: ``model`` is the model whose answer the
     extraction used, ``fallbacks`` lists ``admitted`` (the step-downs decided before any
-    call) and then the chain's own, and ``notices`` has a sentence for each.
+    call) and then the chain's own, and ``notices`` has a sentence for each. An answer
+    that Anthropic served from a model outside the chain (its server-side refusal
+    fallback) is listed too, once per stage and model, with the reason ``refused``.
 
     Calls and tokens are read from one place, the usage each answer carries: a chain's
     answer already includes its failed attempts, and the steps' own ``BudgetedLLM``
@@ -1069,6 +1121,11 @@ async def run(
     picked: SelectStats | None = None
     taken = 0 if chain is None else len(chain.fallbacks)  # while extracting
     departures = [*admitted, *(_notes(chain) if chain is not None else ())]
+    if chain is not None:
+        elsewhere = _served_elsewhere(
+            EXTRACT, getattr(reader, "asked", None), getattr(reader, "answered_by", None), chain
+        )
+        departures += [] if elsewhere is None else [elsewhere]
     select_chain = select_llm if isinstance(select_llm, FallbackLLM) else None
     if selector != RETRIEVAL_ONLY:
         if (selector == JEV and decider is None) or (selector != JEV and select_llm is None):
@@ -1115,6 +1172,10 @@ async def run(
         departures += _notes(chain, taken)
     if select_chain is not None and select_chain is not chain:
         departures += _notes(select_chain)
+    if select_chain is not None and picked is not None:
+        for answered, asked in picked.served_elsewhere.items():
+            elsewhere = _served_elsewhere(SELECT, asked, answered, select_chain)
+            departures += [] if elsewhere is None else [elsewhere]
 
     retrieval = retrieval_status(indexes, settings)
     notes: list[str] = list(warnings) + stats.warnings
@@ -1142,7 +1203,12 @@ async def run(
         requested_model=req.model,
         requested_selector=selector,
         fallbacks=departures,
-        notices=list(dict.fromkeys(scrub(notice(d), settings) for d in departures)),
+        notices=list(
+            dict.fromkeys(
+                scrub(sentence, settings)
+                for sentence in _notices(departures, extracted_on_chain=chain is not None)
+            )
+        ),
     )
 
 

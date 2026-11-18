@@ -170,6 +170,7 @@ def test_step_down_reasons_are_the_specified_set() -> None:
         "balance_exhausted",
         "key_refused",
         "refused",
+        "timeout",
     } == STEP_DOWN_REASONS
     assert {"balance_exhausted", "key_refused"} == fallback.BLOCK_REASONS
     assert BLOCK_TTL_S == 300.0
@@ -340,6 +341,145 @@ async def test_late_failure_on_an_abandoned_step_does_not_move_the_chain_again()
     assert sonnet.calls == 1
 
 
+async def test_concurrent_transient_failures_on_one_step_record_one_fallback() -> None:
+    """Each of the eight calls retries the step once on its own account; the chain still
+    moves once, and says so once."""
+    opus, sonnet = Scripted("opus-m", [failing("transient")]), Scripted("sonnet-m")
+    chain = chain_of(opus, sonnet)
+
+    responses = await asyncio.gather(*(chain.complete(REQUEST) for _ in range(8)))
+
+    assert [r.model for r in responses] == ["sonnet-m"] * 8
+    assert chain.fallbacks == [Fallback("extract", "opus-m", "sonnet-m", "transient")]
+    assert chain.position == 1
+    # The first failures arrive together, so every call may still retry; a retry that
+    # fails after the chain has moved is not tried a third time.
+    assert 9 <= opus.calls <= 16
+    assert all(r.usage.calls == 3 for r in responses)
+
+
+async def test_a_transient_failure_on_an_abandoned_step_is_not_retried_there() -> None:
+    """A call in flight on step 0 fails ``transient`` after another call has moved the
+    chain on: it goes to the current step, without the retry and without a record."""
+    release = asyncio.Event()
+
+    class Held(Scripted):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                await release.wait()
+                raise failing("transient")
+            raise failing("rate_limited")
+
+    opus, sonnet = Held("opus-m"), Scripted("sonnet-m")
+    chain = chain_of(opus, sonnet)
+
+    held = asyncio.create_task(chain.complete(REQUEST))
+    await asyncio.sleep(0)
+    assert (await chain.complete(REQUEST)).model == "sonnet-m"
+    recorded = list(chain.fallbacks)
+    release.set()
+    late = await held
+
+    assert late.model == "sonnet-m"
+    assert opus.calls == 2  # the held call and the one that moved the chain; no retry
+    assert (
+        chain.fallbacks == recorded == [Fallback("extract", "opus-m", "sonnet-m", "rate_limited")]
+    )
+    assert late.usage == ANSWERED + Usage.unreported()
+
+
+@pytest.mark.parametrize("reason", ["balance_exhausted", "key_refused"])
+async def test_a_block_reason_skips_the_other_claude_step(reason: str) -> None:
+    """Opus and Sonnet share the key and the balance: what stops one stops the other."""
+    opus = Scripted("opus-m", [failing(reason)])
+    sonnet, other = Scripted("sonnet-m"), Scripted("other-m")
+    chain = chain_of(opus, sonnet, other)
+
+    response = await chain.complete(REQUEST)
+
+    assert response.model == "other-m"
+    assert (opus.calls, sonnet.calls, other.calls) == (1, 0, 1)
+    assert chain.position == 2
+    assert chain.fallbacks == [Fallback("extract", "opus-m", "other-m", reason)]
+    assert response.usage == ANSWERED + Usage.unreported()
+    # Sticky: later calls stay on the last step.
+    assert (await chain.complete(REQUEST)).model == "other-m"
+    assert sonnet.calls == 0
+
+
+async def test_a_block_reason_without_an_other_step_moves_to_the_last_step() -> None:
+    dead = failing("balance_exhausted")
+    opus, sonnet = Scripted("opus-m", [dead]), Scripted("sonnet-m", [dead])
+    chain = chain_of(opus, sonnet)
+
+    with pytest.raises(LLMFatalError) as raised:
+        await chain.complete(REQUEST)
+
+    assert raised.value is dead
+    assert (opus.calls, sonnet.calls) == (1, 1)
+    assert chain.fallbacks == [Fallback("extract", "opus-m", "sonnet-m", "balance_exhausted")]
+
+
+async def test_a_block_reason_on_sonnet_moves_to_the_other_step() -> None:
+    chain = chain_of(
+        Scripted("opus-m"), Scripted("sonnet-m", [failing("key_refused")]), Scripted("o-m"), start=1
+    )
+
+    assert (await chain.complete(REQUEST)).model == "o-m"
+    assert chain.fallbacks == [Fallback("extract", "sonnet-m", "o-m", "key_refused")]
+
+
+async def test_a_late_block_reason_moves_a_chain_that_only_reached_sonnet() -> None:
+    """Opus was rate limited for one call and out of credit for another still in flight:
+    the second moves the chain past Sonnet, which shares the balance."""
+    release = asyncio.Event()
+
+    class Held(Scripted):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                await release.wait()
+                raise failing("balance_exhausted")
+            raise failing("rate_limited")
+
+    opus, sonnet, other = Held("opus-m"), Scripted("sonnet-m"), Scripted("other-m")
+    chain = chain_of(opus, sonnet, other)
+
+    held = asyncio.create_task(chain.complete(REQUEST))
+    await asyncio.sleep(0)
+    assert (await chain.complete(REQUEST)).model == "sonnet-m"
+    release.set()
+
+    assert (await held).model == "other-m"
+    assert chain.position == 2
+    assert chain.fallbacks == [
+        Fallback("extract", "opus-m", "sonnet-m", "rate_limited"),
+        Fallback("extract", "opus-m", "other-m", "balance_exhausted"),
+    ]
+    assert sonnet.calls == 1
+
+
+async def test_the_chain_says_which_step_gave_an_answer() -> None:
+    """``answer`` is ``complete`` plus the model of the step that answered, which a
+    server-side fallback can make differ from the model the answer names."""
+
+    class Elsewhere(Scripted):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            response = await super().complete(request)
+            return LLMResponse(text=response.text, usage=response.usage, model="served-m")
+
+    chain = chain_of(Scripted("opus-m", [failing("overloaded")]), Elsewhere("sonnet-m"))
+    view = chain.view()
+    assert view.asked is None
+
+    response, asked = await chain.answer(REQUEST)
+    await view.complete(REQUEST)
+
+    assert (response.model, asked) == ("served-m", "sonnet-m")
+    assert (view.answered_by, view.asked) == ("served-m", "sonnet-m")
+
+
 async def test_failed_attempts_are_in_the_returned_usage() -> None:
     reported = Usage(prompt_tokens=7, completion_tokens=3, calls=1)
     opus = Scripted("opus-m", [failing("refused", usage=reported)])
@@ -465,7 +605,9 @@ async def test_block_reasons_block_claude(reason: str) -> None:
     assert claude_block(now=time.monotonic() + BLOCK_TTL_S) is None
 
 
-@pytest.mark.parametrize("reason", ["rate_limited", "overloaded", "refused", "transient"])
+@pytest.mark.parametrize(
+    "reason", ["rate_limited", "overloaded", "refused", "transient", "timeout"]
+)
 async def test_other_reasons_do_not_block_claude(reason: str) -> None:
     chain = chain_of(Scripted("opus-m", [failing(reason)]), Scripted("other-m"))
 

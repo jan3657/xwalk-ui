@@ -12,7 +12,13 @@ that sets the same attribute takes part, and a wrapper that re-raises the inner 
 unchanged (the engine's ``BudgetedLLM``) is transparent.
 
 - ``STEP_DOWN_REASONS``, or the engine's ``CallLimitExceeded`` (recorded as
-  ``call_limit``): the step is unusable for now, so the chain moves down at once.
+  ``call_limit``): the step is unusable for now, so the chain moves down at once. A
+  ``timeout`` is one of them: a model that did not answer within its client's timeout
+  is not waited for a second time.
+- ``BLOCK_REASONS`` (``balance_exhausted``, ``key_refused``) are about the Anthropic
+  account, not the model, and the Claude steps share the key and the balance: the chain
+  moves straight to the first later step labelled ``other`` (to its last step when it
+  has none) and records that one move.
 - ``transient``: the same step is tried once more, then the chain moves down.
 - Anything else, ``bad_request`` and ``ParseError`` included: raised unchanged. A
   malformed request or an unreadable answer would fail the same way on every step.
@@ -54,7 +60,7 @@ from xwalk.llm.budget import CallLimitExceeded
 from xwalk.records import Usage
 
 STEP_DOWN_REASONS = frozenset(
-    {"rate_limited", "overloaded", "balance_exhausted", "key_refused", "refused"}
+    {"rate_limited", "overloaded", "balance_exhausted", "key_refused", "refused", "timeout"}
 )
 BLOCK_REASONS = frozenset({"balance_exhausted", "key_refused"})
 BLOCK_TTL_S = 300.0
@@ -165,7 +171,19 @@ class FallbackLLM:
     def capabilities(self) -> LLMCapabilities:
         return self._current.capabilities
 
+    def _past_claude(self, index: int) -> int:
+        """Where a ``BLOCK_REASONS`` failure on step `index` sends the chain: the first
+        later step that does not run on the Anthropic account, else the last step."""
+        last = len(self.steps) - 1
+        return next((i for i in range(index + 1, last + 1) if self.steps[i].label == "other"), last)
+
     async def complete(self, request: LLMRequest) -> LLMResponse:
+        return (await self.answer(request))[0]
+
+    async def answer(self, request: LLMRequest) -> tuple[LLMResponse, str]:
+        """``complete``, and the model of the step that gave the answer. The answer's
+        own ``model`` is what the provider reports, which is another model after a
+        server-side fallback."""
         failed = Usage.zero()
         index = self._position
         retried = False
@@ -187,30 +205,33 @@ class FallbackLLM:
                 if retry:
                     retried = True
                     continue
+                target = self._past_claude(index) if reason in BLOCK_REASONS else index + 1
                 # No await between this check and the assignment: of several calls that
                 # failed on the same step, exactly one moves the chain and records it.
-                if self._position == index:
-                    self._position = index + 1
+                # (A chain that has only reached Sonnet is still moved on by a late
+                # block reason from Opus: Sonnet is as unusable.)
+                if self._position < target:
+                    self._position = target
                     self.fallbacks.append(
                         Fallback(
                             stage=self.stage,
                             from_model=client.model,
-                            to_model=self.steps[index + 1].client.model,
+                            to_model=self.steps[target].client.model,
                             reason=reason,
                         )
                     )
                 index = self._position
                 retried = False
                 continue
-            if failed == Usage.zero():
-                return response
-            return LLMResponse(
-                text=response.text,
-                usage=response.usage + failed,
-                model=response.model,
-                structured=response.structured,
-                finish_reason=response.finish_reason,
-            )
+            if failed != Usage.zero():
+                response = LLMResponse(
+                    text=response.text,
+                    usage=response.usage + failed,
+                    model=response.model,
+                    structured=response.structured,
+                    finish_reason=response.finish_reason,
+                )
+            return response, client.model
 
     def view(self) -> ChainView:
         """A client over this chain that remembers which model answered it."""
@@ -237,12 +258,15 @@ class ChainView:
     Selection runs several picks at once on one chain, and the chain may step down in
     between, so "the chain's current model" does not say who made a given pick. Each pick
     takes its own view; ``answered_by`` is the model of that view's last successful
-    answer (as the answer itself reports it), None before the first.
+    answer (as the answer itself reports it), None before the first. ``asked`` is the
+    model of the step that gave that answer: the two differ when the provider answered
+    from another model than the one the step asked for.
     """
 
     def __init__(self, chain: FallbackLLM) -> None:
         self._chain = chain
         self.answered_by: str | None = None
+        self.asked: str | None = None
 
     @property
     def model(self) -> str:
@@ -257,8 +281,8 @@ class ChainView:
         return self._chain.capabilities
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        response = await self._chain.complete(request)
-        self.answered_by = response.model
+        response, asked = await self._chain.answer(request)
+        self.answered_by, self.asked = response.model, asked
         return response
 
 

@@ -439,6 +439,34 @@ async def test_text_blocks_are_joined_thinking_ignored_and_usage_counts_cache_to
     assert response.finish_reason == "end_turn"
 
 
+async def test_a_fallback_served_answer_names_the_serving_model() -> None:
+    """The SDK's signal that a server-side fallback model served the response is a
+    ``fallback_message`` entry in ``usage.iterations``; its model is who answered, also
+    should the top-level ``model`` still echo the requested id."""
+    served = "claude-opus-4-9"
+    usage = SimpleNamespace(
+        input_tokens=100,
+        cache_creation_input_tokens=None,
+        cache_read_input_tokens=None,
+        output_tokens=20,
+        iterations=[
+            SimpleNamespace(type="message", model=claude.OPUS),
+            SimpleNamespace(type="fallback_message", model=served),
+        ],
+    )
+    sdk = FakeSDK(message(text("{}"), model=claude.OPUS, usage=usage))
+    response = await make(sdk).complete(LLMRequest(system="s", user="u"))
+    assert response.model == served
+    # Without such an entry the answer's own ``model`` stands.
+    plain = SimpleNamespace(
+        input_tokens=1,
+        output_tokens=1,
+        iterations=[SimpleNamespace(type="message", model="claude-other")],
+    )
+    sdk = FakeSDK(message(text("{}"), model=claude.OPUS, usage=plain))
+    assert (await make(sdk).complete(LLMRequest(system="s", user="u"))).model == claude.OPUS
+
+
 async def test_missing_usage_is_unknown_not_zero() -> None:
     sdk = FakeSDK(message(text("ok"), usage=SimpleNamespace(input_tokens=None, output_tokens=3)))
     response = await make(sdk).complete(LLMRequest(system="s", user="u"))
@@ -543,15 +571,19 @@ async def test_connection_failure_is_transient() -> None:
     assert KEY not in str(caught.value)
 
 
-async def test_timeout_is_transient() -> None:
+async def test_timeout_has_its_own_reason() -> None:
+    """A timeout is not ``transient``: the chain must not wait out the same model again."""
+
     def handler(request: httpx2.Request) -> httpx2.Response:
-        raise httpx2.ReadTimeout("timed out", request=request)
+        raise httpx2.ReadTimeout(f"timed out with {KEY}", request=request)
 
     client = make(real_sdk(handler))
     with pytest.raises(LLMRetryableError) as caught:
         await client.complete(LLMRequest(system="s", user="u"))
     await client.aclose()
-    assert caught.value.reason == "transient"  # type: ignore[attr-defined]
+    assert caught.value.reason == "timeout"  # type: ignore[attr-defined]
+    assert "APITimeoutError" in str(caught.value) and KEY not in str(caught.value)
+    assert caught.value.usage == Usage.unreported()
 
 
 async def test_one_complete_is_one_request_with_no_hidden_retry() -> None:

@@ -1007,7 +1007,7 @@ def test_make_claude_configures_the_adapter_per_purpose(
     assert built == [
         (
             OPUS,
-            {"api_key": ANTHROPIC_KEY, "max_tokens": 16000, "effort": "medium", "timeout": 60.0},
+            {"api_key": ANTHROPIC_KEY, "max_tokens": 16000, "effort": "medium", "timeout": 40.0},
         ),
         (
             SONNET,
@@ -1016,6 +1016,9 @@ def test_make_claude_configures_the_adapter_per_purpose(
     ]
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         service.make_claude(_settings(tmp_path), OPUS, "extract")
+    # Two Claude extraction attempts fit inside the extraction bound, with room to spare.
+    assert service.CLAUDE_EXTRACT_TIMEOUT_S == 40.0
+    assert 2 * service.CLAUDE_EXTRACT_TIMEOUT_S < service.EXTRACT_TIMEOUT_S
 
 
 def test_opus_answers_extraction_and_selection(tmp_path: Path, bm25_only: Any) -> None:
@@ -1074,6 +1077,21 @@ def test_a_transient_failure_is_retried_once_before_stepping_down(
     assert out.notices == ["Claude Opus 5.5 did not answer; this ran on Claude Sonnet 5.5."]
 
 
+def test_a_timed_out_opus_extraction_answers_from_sonnet_after_one_opus_call(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """A timeout is not retried on the model that hung: one Opus call, then Sonnet."""
+    fakes = _Fakes(opus_extract=[_failing("timeout", "APITimeoutError", retryable=True)])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == SONNET and out.requested_model == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": "timeout"}
+    ]
+    assert out.notices == ["Claude Opus 5.5 did not answer in time; this ran on Claude Sonnet 5.5."]
+    assert fakes.calls(OPUS, "extract") == 1 and fakes.calls(SONNET, "extract") == 1
+    assert out.usage.llm_calls == 2 and out.usage.prompt_tokens is None
+
+
 def test_sonnet_rate_limited_too_ends_on_the_openrouter_model(
     tmp_path: Path, bm25_only: Any
 ) -> None:
@@ -1085,12 +1103,47 @@ def test_sonnet_rate_limited_too_ends_on_the_openrouter_model(
         (OPUS, SONNET, "rate_limited"),
         (SONNET, GEMINI, "rate_limited"),
     ]
-    assert out.notices[-1] == (
-        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter."
-    )
+    # Nothing ran on Sonnet, and the first sentence does not say it did.
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    ]
     (entity,) = out.entities
     assert entity.pick is not None and entity.pick.selector == GEMINI
     assert fakes.calls(GEMINI, "select") == 1
+
+
+def test_only_the_last_departure_of_a_stage_says_where_it_ran(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    from ner_site.schema import FallbackNote
+
+    limited = _failing("rate_limited", retryable=True)
+    # Twice while selecting.
+    out = _run_chain(tmp_path, bm25_only, _Fakes(opus_select=[limited], sonnet_select=[limited]))
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; the remaining picks ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter.",
+    ]
+    # Once while extracting and once while selecting: the extraction did run on Sonnet.
+    out = _run_chain(tmp_path, bm25_only, _Fakes(opus_extract=[limited], sonnet_select=[limited]))
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; the remaining picks ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter.",
+    ]
+    # Admitted on Sonnet, which then could not extract either: nothing ran there.
+    admitted = [FallbackNote(stage="admit", from_=OPUS, to=SONNET, reason="opus_allowance_used")]
+    out = _run_chain(
+        tmp_path, bm25_only, _Fakes(sonnet_extract=[limited]), start=1, admitted=admitted
+    )
+    assert out.model == GEMINI and out.notices == [
+        "Your Opus allowance for this hour is used; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    ]
+    for sentence in out.notices:
+        assert "\u2014" not in sentence and sentence.endswith(".")
 
 
 def test_a_step_down_while_selecting_is_recorded_under_select(
@@ -1121,15 +1174,28 @@ def test_an_unusable_anthropic_account_ends_on_openrouter_and_is_remembered(
     from ner_site import fallback
 
     dead = _failing(reason, f"no credit for {ANTHROPIC_KEY}")
-    fakes = _Fakes(opus_extract=[dead], sonnet_extract=[dead])
+    fakes = _Fakes(opus_extract=[dead], sonnet_extract=[dead], sonnet_select=[dead])
     out = _run_chain(tmp_path, bm25_only, fakes)
-    assert out.model == GEMINI and [f.reason for f in out.fallbacks] == [reason, reason]
-    assert out.notices == [
-        f"Claude Opus 5.5 is unavailable ({text}); this ran on Claude Sonnet 5.5.",
-        f"Claude is unavailable ({text}); this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    # Sonnet shares the key and the balance: it is not tried, here or while selecting.
+    assert out.model == GEMINI
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": GEMINI, "reason": reason}
     ]
+    assert out.notices == [
+        f"Claude is unavailable ({text}); this ran on Gemini 3.1 Flash Lite through OpenRouter."
+    ]
+    assert fakes.calls(SONNET, "extract") == fakes.calls(SONNET, "select") == 0
+    assert out.usage.llm_calls == 2
     assert fallback.claude_block() == reason
     assert ANTHROPIC_KEY not in out.model_dump_json()
+    # Without an OpenRouter step the chain can only go on to Sonnet.
+    fallback.reset()
+    alone = _Fakes(opus_extract=[dead])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    out = asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=alone.chain(s), indexes=bm25_only))
+    assert out.model == SONNET and out.notices == [
+        f"Claude Opus 5.5 is unavailable ({text}); this ran on Claude Sonnet 5.5."
+    ]
 
 
 def test_every_step_failing_while_extracting_is_a_scrubbed_502(
@@ -1284,9 +1350,77 @@ def test_a_model_id_the_site_has_no_name_for_is_shown_as_it_is(
     assert out.model == "claude-opus-4-9" and out.requested_model == OPUS
     assert out.entities[0].pick is not None
     assert out.entities[0].pick.selector == "claude-opus-4-9"
+    # Nothing substitutes silently: the model nobody asked for is a recorded departure.
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": "claude-opus-4-9", "reason": "refused"},
+        {"stage": "select", "from": OPUS, "to": "claude-opus-4-9", "reason": "refused"},
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 declined this text; this ran on claude-opus-4-9.",
+        "Claude Opus 5.5 declined this text; the remaining picks ran on claude-opus-4-9.",
+    ]
     assert service.display_name("claude-opus-4-9") == "claude-opus-4-9"
     assert service.display_name(OPUS) == "Claude Opus 5.5"
     assert service.display_name("qwen/qwen3.7-flash") == "qwen/qwen3.7-flash through OpenRouter"
+
+
+def test_a_server_side_fallback_is_recorded_once_per_stage_and_model(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """Three picks answered from the same substitute are one departure; the step that
+    was asked is named even after the chain has stepped down in between; and a model
+    name OpenRouter reports differently is not a refusal."""
+
+    class Elsewhere(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            response = await super().complete(request)
+            return LLMResponse(text=response.text, usage=response.usage, model=self.served)
+
+    def served(model: str, handler: Any, as_: str) -> FakeLLM:
+        llm = Elsewhere(handler=handler, model=model)
+        llm.served = as_  # type: ignore[attr-defined]
+        return llm
+
+    text = "haloperidol, ketamine and aspirin."
+    three = _answer(("haloperidol", "chemical", 0, 11), ("ketamine", "chemical", 13, 21))
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+
+    def claude(settings: Settings, model: str, purpose: str) -> FakeLLM:
+        if purpose == "extract":
+            return FakeLLM([three], model=model)
+        if model == OPUS:
+            return FakeLLM([_failing("rate_limited", retryable=True)], model=model)
+        return served(model, lambda r: PICK, "claude-sonnet-4-9")
+
+    chain = service.make_chain(s, OPUS, claude_factory=claude)
+    out = asyncio.run(
+        run(NerRequest(text=text), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    assert out.model == OPUS
+    assert {e.pick.selector for e in out.entities if e.pick} == {"claude-sonnet-4-9"}
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": OPUS, "to": SONNET, "reason": "rate_limited"},
+        {"stage": "select", "from": SONNET, "to": "claude-sonnet-4-9", "reason": "refused"},
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 declined this text; the remaining picks ran on claude-sonnet-4-9.",
+    ]
+
+    # The OpenRouter step: whatever name its answer carries, nothing was refused.
+    plain = service.make_chain(
+        s,
+        OPUS,
+        start=2,
+        claude_factory=claude,
+        llm_factory=lambda st, m: served(m, lambda r: three, "google/gemini-3.1-flash-lite-001"),
+        select_factory=lambda st, m: served(m, lambda r: PICK, "google/gemini-3.1-flash-lite-001"),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=text), settings=s, llm=plain, select_llm=plain, indexes=bm25_only)
+    )
+    assert out.model == "google/gemini-3.1-flash-lite-001"
+    assert out.fallbacks == [] and out.notices == []
 
 
 def test_admission_step_downs_lead_the_fallbacks_and_have_their_sentences(

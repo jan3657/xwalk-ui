@@ -1434,7 +1434,10 @@ def test_a_balance_error_in_one_request_moves_the_next_one_off_claude(
         llm_factory=_fake('{"entities": []}'),
     )
     assert first[0] == 200 and ANTHROPIC_KEY.encode() not in first[2]
-    assert [f["stage"] for f in _json(first)["fallbacks"]] == ["extract", "extract"]
+    # One move, past Sonnet: it runs on the same balance.
+    assert _json(first)["fallbacks"] == [
+        {"stage": "extract", "from": OPUS, "to": GEMINI, "reason": "balance_exhausted"}
+    ]
     second = _json(_ask(s, claude=_no_claude_calls(), llm_factory=_fake('{"entities": []}')))
     assert [f["reason"] for f in second["fallbacks"]] == ["claude_unavailable"]
 

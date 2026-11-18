@@ -279,10 +279,15 @@ def _translate(exc: anthropic.APIError, api_key: str) -> LLMError:
     credit balance
     ``AuthenticationError``,                   LLMFatalError     key_refused
     ``PermissionDeniedError``
-    other 5xx, 408, 409, connection errors,    LLMRetryableError transient
-    timeouts, an answer the SDK could not read
+    ``APITimeoutError`` (no answer within the  LLMRetryableError timeout
+    client's timeout)
+    other 5xx, 408, 409, other connection      LLMRetryableError transient
+    errors, an answer the SDK could not read
     other 4xx                                  LLMFatalError     bad_request
     ========================================== ================= =================
+
+    A timeout is kept apart from ``transient`` because the chain retries a transient
+    failure on the same model: waiting out a hung model twice would use up the request.
     """
     if isinstance(exc, anthropic.APIStatusError):
         message = _status_message(exc, api_key)
@@ -305,10 +310,12 @@ def _translate(exc: anthropic.APIError, api_key: str) -> LLMError:
         if status >= 500 or status in (408, 409):
             return _retryable("transient", message)
         return _fatal("bad_request", message)
-    # APIConnectionError (APITimeoutError is one), or a 2xx body the SDK could not parse.
-    return _retryable(
-        "transient", _scrub(f"Anthropic {type(exc).__name__}: {exc.message}", api_key)
-    )
+    message = _scrub(f"Anthropic {type(exc).__name__}: {exc.message}", api_key)
+    # APITimeoutError is an APIConnectionError: the more specific class first.
+    if isinstance(exc, anthropic.APITimeoutError):
+        return _retryable("timeout", message)
+    # Another APIConnectionError, or a 2xx body the SDK could not parse.
+    return _retryable("transient", message)
 
 
 def _usage(raw: Any) -> Usage:
@@ -321,6 +328,20 @@ def _usage(raw: Any) -> Usage:
             if isinstance(extra, int) and not isinstance(extra, bool) and extra > 0:
                 prompt += extra
     return reported_usage(prompt, getattr(raw, "output_tokens", None))
+
+
+def _served_by(message: Any) -> str | None:
+    """The model that answered, as the response reports it. After a server-side fallback
+    that is the model of the ``fallback_message`` entry in ``usage.iterations`` (the
+    SDK's signal that a fallback model served the response, 2.10.0
+    ``BetaFallbackMessageIterationUsage``); otherwise the response's own ``model``."""
+    for entry in getattr(getattr(message, "usage", None), "iterations", None) or ():
+        if getattr(entry, "type", None) == "fallback_message":
+            served = getattr(entry, "model", None)
+            if served:
+                return str(served)
+    model = getattr(message, "model", None)
+    return str(model) if model else None
 
 
 class ClaudeClient:
@@ -409,7 +430,8 @@ class ClaudeClient:
             raise _translate(exc, self._api_key) from None
 
         usage = _usage(getattr(message, "usage", None))
-        answered_by = str(getattr(message, "model", None) or self._model)
+        # Not always the model asked for: ``fallbacks`` lets the API answer from another.
+        answered_by = _served_by(message) or self._model
         # The stop reason is read before the content: a refusal may carry no content, or
         # a partial answer that must not be used.
         stop_reason = getattr(message, "stop_reason", None)
