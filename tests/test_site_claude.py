@@ -18,6 +18,7 @@ import httpx2
 import pytest
 from ner_site import claude
 from ner_site.claude import ClaudeClient, ClaudeRefused, key_status
+from ner_site.extract import DEFAULT_PROMPT, build_request, entity_schema
 from xwalk.llm.base import (
     LLMCapabilities,
     LLMClient,
@@ -25,6 +26,7 @@ from xwalk.llm.base import (
     LLMRequest,
     LLMRetryableError,
 )
+from xwalk.prompts.contract import SELECT_SCHEMA
 from xwalk.records import Usage
 
 KEY = "sk-ant-SENTINEL-do-not-leak-0123456789"
@@ -226,6 +228,141 @@ async def test_loose_schema_is_sent_normalised_and_the_callers_is_untouched() ->
     assert nested["required"] == ["note"]
 
 
+async def test_the_engines_selection_schema_is_sent_in_the_supported_subset() -> None:
+    """SELECT_SCHEMA has a list-valued ``type`` and numeric bounds, which the API's
+    schema-enforced output does not take; a 400 here would fail every pick."""
+    before = copy.deepcopy(dict(SELECT_SCHEMA))
+    sdk = FakeSDK()
+    await make(sdk).complete(LLMRequest(system="s", user="u", schema=SELECT_SCHEMA))
+
+    assert dict(SELECT_SCHEMA) == before
+    assert sdk.calls[0]["output_config"]["format"]["schema"] == {
+        "type": "object",
+        "properties": {
+            "chosen_key": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "confidence_score": {"type": "number", "description": "{minimum: 0, maximum: 1}"},
+            "explanation": {"type": "string"},
+        },
+        "required": ["chosen_key", "confidence_score", "explanation"],
+        "additionalProperties": False,
+    }
+
+
+async def test_the_sites_extraction_schema_is_sent_unchanged() -> None:
+    """What ``extract.build_request`` sends is already in the supported subset."""
+    request = build_request("Aspirin reduced fever.", DEFAULT_PROMPT)
+    assert request.schema is not None
+    sdk = FakeSDK()
+    await make(sdk).complete(request)
+    assert sdk.calls[0]["output_config"]["format"]["schema"] == request.schema
+    assert request.schema == entity_schema()
+
+
+def test_unsupported_keywords_move_into_the_description() -> None:
+    sent = claude.normalise_schema(
+        {
+            "type": "object",
+            "description": "An answer.",
+            "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 9, "pattern": "^a"},
+                "when": {"type": "string", "format": "date"},
+                "code": {"type": "string", "format": "ontology-id"},
+                "step": {"type": "integer", "multipleOf": 5, "description": "A step."},
+                "few": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "many": {
+                    "type": "array",
+                    "items": {"type": "integer", "maximum": 3},
+                    "minItems": 2,
+                    "maxItems": 4,
+                },
+            },
+            "required": ["name", "when", "code", "step", "few", "many"],
+            "additionalProperties": False,
+        }
+    )
+    props = sent["properties"]
+    assert props["name"] == {
+        "type": "string",
+        "description": "{minLength: 1, maxLength: 9, pattern: ^a}",
+    }
+    assert props["when"] == {"type": "string", "format": "date"}
+    assert props["code"] == {"type": "string", "description": "{format: ontology-id}"}
+    assert props["step"] == {"type": "integer", "description": "A step.\n\n{multipleOf: 5}"}
+    assert props["few"] == {"type": "array", "items": {"type": "string"}, "minItems": 1}
+    assert props["many"] == {
+        "type": "array",
+        "items": {"type": "integer", "description": "{maximum: 3}"},
+        "description": "{minItems: 2, maxItems: 4}",
+    }
+    assert sent["description"] == "An answer."
+
+
+def test_only_schema_nodes_are_treated_as_schemas() -> None:
+    """A property named like a keyword is a schema; enum and const values are data."""
+    literal = {"properties": {"x": 1}, "type": "object"}
+    sent = claude.normalise_schema(
+        {
+            "type": "object",
+            "properties": {
+                "properties": {"type": "string"},
+                "required": {"type": "integer"},
+                "minimum": {"type": "number"},
+                "kind": {"enum": ["a", "b", None]},
+                "fixed": {"const": "x"},
+                "odd": {"enum": [literal]},
+            },
+            "required": ["properties", "required", "minimum", "kind", "fixed", "odd"],
+        }
+    )
+    assert sent["required"] == ["properties", "required", "minimum", "kind", "fixed", "odd"]
+    assert sent["additionalProperties"] is False
+    assert sent["properties"]["properties"] == {"type": "string"}
+    assert sent["properties"]["required"] == {"type": "integer"}
+    assert sent["properties"]["minimum"] == {"type": "number"}
+    assert sent["properties"]["kind"] == {"enum": ["a", "b", None]}
+    assert sent["properties"]["fixed"] == {"const": "x"}
+    # An enum of objects is outside the supported subset, so it becomes a note; the
+    # object in it is data and was not rewritten as if it were a schema.
+    assert sent["properties"]["odd"] == {"description": f"{{enum: [{literal}]}}"}
+    assert "additionalProperties" not in sent["properties"]["odd"]["description"]
+
+
+def test_list_types_and_combinators_are_rewritten() -> None:
+    sent = claude.normalise_schema(
+        {
+            "type": "object",
+            "properties": {
+                "size": {"type": ["integer", "null"], "minimum": 0, "description": "A size."},
+                "only": {"type": ["string"]},
+                "either": {"oneOf": [{"type": "string", "minLength": 2}, {"type": "null"}]},
+                "maybe": {"type": ["string", "null"]},
+                "ref": {"$ref": "#/$defs/thing"},
+            },
+            "required": ["size", "only", "either", "ref"],
+            "$defs": {"thing": {"type": "object", "properties": {"a": {"type": "string"}}}},
+        }
+    )
+    props = sent["properties"]
+    assert props["size"] == {
+        "anyOf": [{"type": "integer", "description": "{minimum: 0}"}, {"type": "null"}],
+        "description": "A size.",
+    }
+    assert props["only"] == {"type": "string"}
+    assert props["either"] == {
+        "anyOf": [{"type": "string", "description": "{minLength: 2}"}, {"type": "null"}]
+    }
+    # Optional and already nullable: required, and not wrapped a second time.
+    assert props["maybe"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert props["ref"] == {"$ref": "#/$defs/thing"}
+    assert sent["required"] == ["size", "only", "either", "maybe", "ref"]
+    assert sent["$defs"]["thing"] == {
+        "type": "object",
+        "properties": {"a": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+
 async def test_refusal_fallback_is_requested() -> None:
     sdk = FakeSDK()
     await make(sdk).complete(LLMRequest(system="s", user="u", schema=SCHEMA))
@@ -352,6 +489,9 @@ ERROR_TABLE = [
     (500, "api_error", "internal", LLMRetryableError, "transient"),
     (503, "api_error", "unavailable", LLMRetryableError, "transient"),
     (504, "timeout_error", "gateway timeout", LLMRetryableError, "transient"),
+    # The engine's contract (xwalk.llm.base.LLMRetryableError) names 408 and 409 retryable.
+    (408, "timeout_error", "request timeout", LLMRetryableError, "transient"),
+    (409, "invalid_request_error", "conflict", LLMRetryableError, "transient"),
     (400, "invalid_request_error", "max_tokens: too large", LLMFatalError, "bad_request"),
     (404, "not_found_error", "model: nope", LLMFatalError, "bad_request"),
     (413, "request_too_large", "too large", LLMFatalError, "bad_request"),

@@ -76,32 +76,159 @@ class ClaudeRefused(LLMFatalError):
     reason = "refused"
 
 
+# What schema-enforced output takes, read from the SDK's own helper
+# (anthropic.transform_schema, anthropic/lib/_parse/_transform.py in 2.10.0). The helper
+# itself cannot be used here: it leaves optional properties optional and has no branch
+# for a list-valued ``type``, which the engine's selection schema has.
+_STRING_FORMATS = frozenset(
+    {
+        "date-time",
+        "time",
+        "date",
+        "duration",
+        "email",
+        "hostname",
+        "uri",
+        "ipv4",
+        "ipv6",
+        "uuid",
+    }
+)
+_NULL: Mapping[str, Any] = {"type": "null"}
+
+
+def _is_literal(value: object) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _allows_null(node: Mapping[str, Any]) -> bool:
+    if node.get("type") == "null" or node.get("const", "") is None:
+        return True
+    enum = node.get("enum")
+    if isinstance(enum, list) and None in enum:
+        return True
+    variants = node.get("anyOf")
+    return isinstance(variants, list) and any(
+        isinstance(variant, Mapping) and _allows_null(variant) for variant in variants
+    )
+
+
+def _nullable(node: dict[str, Any]) -> dict[str, Any]:
+    if _allows_null(node):
+        return node
+    return {"anyOf": [node, dict(_NULL)]}
+
+
+def _schema_node(schema: Any) -> Any:
+    """One schema node in the supported subset. Only called on schemas, never on the
+    ``properties`` map itself nor on ``enum`` / ``const`` values, which are data."""
+    if not isinstance(schema, Mapping):
+        return schema  # a boolean schema, or something the API will name in its 400
+    rest = dict(schema)
+    out: dict[str, Any] = {}
+
+    defs = rest.pop("$defs", None)
+    if isinstance(defs, Mapping):
+        out["$defs"] = {name: _schema_node(sub) for name, sub in defs.items()}
+    ref = rest.pop("$ref", None)
+    if ref is not None:
+        out["$ref"] = ref
+        return out
+
+    kind = rest.pop("type", None)
+    description = rest.pop("description", None)
+    title = rest.pop("title", None)
+
+    def finish(node: dict[str, Any], leftover: Mapping[str, Any]) -> dict[str, Any]:
+        """Keywords the API does not enforce go into the description, where the model
+        may still follow them; the caller validates the answer either way."""
+        notes = [description] if isinstance(description, str) else []
+        if leftover:
+            notes.append("{" + ", ".join(f"{k}: {v}" for k, v in leftover.items()) + "}")
+        if notes:
+            node["description"] = "\n\n".join(notes)
+        if title is not None:
+            node["title"] = title
+        return node
+
+    if isinstance(kind, list):
+        # ["string", "null"] is written as anyOf of single types; the constraints go
+        # with the variants they can apply to, the description stays on the outside.
+        variants = [
+            dict(_NULL) if single == "null" else _schema_node({**rest, "type": single})
+            for single in kind
+        ]
+        if len(variants) == 1:
+            return finish(variants[0], {})
+        out["anyOf"] = variants
+        return finish(out, {})
+
+    # Literal values are data and are copied, never walked. A ``type`` beside them is
+    # kept (the SDK helper drops it; the site's extraction schema has one and is accepted
+    # as it stands by the strict providers it already runs on).
+    if "enum" in rest and isinstance(rest["enum"], list) and all(map(_is_literal, rest["enum"])):
+        out["enum"] = list(rest.pop("enum"))
+    if "const" in rest and _is_literal(rest["const"]):
+        out["const"] = rest.pop("const")
+
+    any_of = rest.pop("anyOf", None)
+    one_of = rest.pop("oneOf", None)
+    all_of = rest.pop("allOf", None)
+    if isinstance(any_of, list):
+        out["anyOf"] = [_schema_node(variant) for variant in any_of]
+    elif isinstance(one_of, list):
+        out["anyOf"] = [_schema_node(variant) for variant in one_of]
+    elif isinstance(all_of, list):
+        out["allOf"] = [_schema_node(variant) for variant in all_of]
+    elif kind is not None:
+        out["type"] = kind
+
+    if kind == "object":
+        properties = rest.pop("properties", None)
+        required = rest.pop("required", None)
+        rest.pop("additionalProperties", None)
+        named = required if isinstance(required, list) else []
+        out["properties"] = {
+            # A property that was optional becomes required but nullable.
+            name: _schema_node(prop) if name in named else _optional(prop)
+            for name, prop in (properties if isinstance(properties, Mapping) else {}).items()
+        }
+        out["required"] = list(out["properties"])
+        out["additionalProperties"] = False
+    elif kind == "string":
+        if rest.get("format") in _STRING_FORMATS:
+            out["format"] = rest.pop("format")
+    elif kind == "array":
+        if "items" in rest:
+            out["items"] = _schema_node(rest.pop("items"))
+        if rest.get("minItems") in (0, 1) and not isinstance(rest["minItems"], bool):
+            out["minItems"] = rest.pop("minItems")
+    return finish(out, rest)
+
+
+def _optional(prop: Any) -> Any:
+    node = _schema_node(prop)
+    return _nullable(node) if isinstance(node, dict) else node
+
+
 def normalise_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     """The form of `schema` that Claude's schema-enforced output accepts.
 
-    Every object forbids additional properties and lists all of its properties as
-    required. A property that was optional becomes required but nullable, so the model
-    sends null where it would have left the key out; the stage parsers treat null and
-    absent alike. The input is not modified.
+    - Every object forbids additional properties and lists all of its properties as
+      required. A property that was optional becomes required but nullable, so the model
+      sends null where it would have left the key out; the stage parsers treat null and
+      absent alike.
+    - A list-valued ``type`` becomes ``anyOf`` of single types, and ``oneOf`` becomes
+      ``anyOf``.
+    - Keywords outside the supported subset (numeric bounds, string lengths and patterns,
+      array sizes beyond ``minItems`` 0 or 1, unknown string formats, anything else) are
+      moved into ``description`` instead of being sent, as the SDK's helper does. A 400
+      for one of them would be a ``bad_request``, which the fallback chain does not step
+      down on, so every call with that schema would fail.
+
+    The input is not modified.
     """
-
-    def walk(node: Any) -> Any:
-        if isinstance(node, list):
-            return [walk(item) for item in node]
-        if not isinstance(node, Mapping):
-            return node
-        out = {key: walk(value) for key, value in node.items()}
-        properties = out.get("properties")
-        if isinstance(properties, dict):
-            required = node.get("required", ())
-            for name, prop in properties.items():
-                if name not in required and isinstance(prop, dict):
-                    properties[name] = {"anyOf": [prop, {"type": "null"}]}
-            out["required"] = list(properties)
-            out["additionalProperties"] = False
-        return out
-
-    return dict(walk(schema))
+    return dict(_schema_node(schema))
 
 
 def _scrub(message: str, api_key: str) -> str:
@@ -152,8 +279,8 @@ def _translate(exc: anthropic.APIError, api_key: str) -> LLMError:
     credit balance
     ``AuthenticationError``,                   LLMFatalError     key_refused
     ``PermissionDeniedError``
-    other 5xx, connection errors, timeouts,    LLMRetryableError transient
-    an answer the SDK could not read
+    other 5xx, 408, 409, connection errors,    LLMRetryableError transient
+    timeouts, an answer the SDK could not read
     other 4xx                                  LLMFatalError     bad_request
     ========================================== ================= =================
     """
@@ -174,7 +301,8 @@ def _translate(exc: anthropic.APIError, api_key: str) -> LLMError:
             return _fatal("balance_exhausted", message)
         if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
             return _fatal("key_refused", message)
-        if status >= 500:
+        # 408 and 409 are transient in the engine's contract (xwalk.llm.base).
+        if status >= 500 or status in (408, 409):
             return _retryable("transient", message)
         return _fatal("bad_request", message)
     # APIConnectionError (APITimeoutError is one), or a 2xx body the SDK could not parse.
