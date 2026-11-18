@@ -134,6 +134,9 @@ MIN_SELECT_BUDGET_S = 5.0
 
 MAX_ERROR_DETAIL = 300
 MIN_SCRUBBED_CHARS = 8
+# The stats passcode guards the operator's numbers on a public site with no limiter in
+# front of it, so a short one is refused (site analytics design, section 3.1).
+MIN_STATS_PASSCODE_CHARS = 16
 
 # (env name, Limits field, lowest, highest). A value outside the range is a settings
 # error, not clamped: an operator who typed 500000 should learn that it was refused.
@@ -182,6 +185,7 @@ ENV_NAMES = (
     "NER_SITE_OWN_PROVIDERS",
     *(f"NER_SITE_OWN_MODELS_{p.upper()}" for p in providers.OWN_PROVIDERS),
     "NER_SITE_VISITOR_SALT",
+    "NER_SITE_STATS_PASSCODE",
 )
 
 
@@ -198,8 +202,11 @@ def _listed_own(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def uses_database(env: Mapping[str, str]) -> bool:
-    """The index backend or a live allowance needs the URL, including in the settings cache."""
+    """The index backend, a live allowance or the record of runs (which the stats
+    passcode turns on) needs the URL, including in the settings cache."""
     if env.get("NER_SITE_BACKEND", "").strip().lower() == "neon":
+        return True
+    if (env.get("NER_SITE_STATS_PASSCODE") or "").strip():
         return True
     if env.get("NER_SITE_OFFLINE", "").strip().lower() in _TRUE:
         return False
@@ -270,6 +277,8 @@ class Settings:
     fallback_model: str = DEFAULT_FALLBACK_MODEL
     allowance: Allowance = field(default_factory=Allowance)
     visitor_salt: str | None = field(default=None, repr=False)
+    # Set: runs are recorded and GET /api/stats answers to it. Unset: neither exists.
+    stats_passcode: str | None = field(default=None, repr=False)
 
     # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
     own_providers: tuple[providers.ProviderInfo, ...] = ()
@@ -337,6 +346,13 @@ class Settings:
             # http.server decodes header values as Latin-1 and browsers refuse other
             # characters in a header, so a non-ASCII passcode could never match.
             raise SettingsError("NER_SITE_PASSCODE must be ASCII (printable, no accents)")
+        stats_passcode = get("NER_SITE_STATS_PASSCODE") or None
+        if stats_passcode is not None and not stats_passcode.isascii():
+            raise SettingsError("NER_SITE_STATS_PASSCODE must be ASCII (printable, no accents)")
+        if stats_passcode is not None and len(stats_passcode) < MIN_STATS_PASSCODE_CHARS:
+            raise SettingsError(
+                f"NER_SITE_STATS_PASSCODE must be at least {MIN_STATS_PASSCODE_CHARS} characters"
+            )
 
         offline_raw = get("NER_SITE_OFFLINE").lower()
         if offline_raw not in _TRUE | _FALSE:
@@ -418,6 +434,7 @@ class Settings:
             allowance=Allowance(**allowance),
             own_providers=own_providers,
             visitor_salt=get("NER_SITE_VISITOR_SALT") or None,
+            stats_passcode=stats_passcode,
         )
         if not settings.offered_models:
             raise SettingsError(
@@ -516,6 +533,7 @@ class Settings:
             self.passcode,
             self.database_url,
             self.visitor_salt,
+            self.stats_passcode,
         ]
         if self.database_url:
             password = urlsplit(self.database_url).password

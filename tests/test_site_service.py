@@ -1794,3 +1794,63 @@ def test_only_enabled_providers_have_their_model_lists_validated() -> None:
     assert [p.id for p in s.own_providers] == ["openrouter"]
     with pytest.raises(SettingsError, match="NER_SITE_OWN_MODELS_OPENAI"):
         Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", **bad})
+
+
+# --- site analytics: the stats passcode (design 2026-11-18, sections 3.1 and 6) --------
+
+STATS_PASSCODE = "stats-SENTINEL-passcode-7781"
+
+
+def test_the_stats_passcode_is_off_by_default_and_a_scrubbed_secret_when_set() -> None:
+    assert Settings().stats_passcode is None
+    for env in ({}, {"NER_SITE_STATS_PASSCODE": ""}, {"NER_SITE_STATS_PASSCODE": "   "}):
+        s = Settings.from_env(env)
+        assert s.stats_passcode is None and s.database_url is None
+        assert not service.uses_database(env)
+    s = Settings.from_env({"NER_SITE_STATS_PASSCODE": f"  {STATS_PASSCODE} "})
+    assert s.stats_passcode == STATS_PASSCODE
+    assert STATS_PASSCODE in s.secrets() and STATS_PASSCODE not in repr(s)
+    assert service.scrub(f"given {STATS_PASSCODE}", s) == "given [redacted]"
+    assert "NER_SITE_STATS_PASSCODE" in service.ENV_NAMES
+
+
+@pytest.mark.parametrize("value", ["short", "fifteen-chars-0", "x" * 15])
+def test_a_stats_passcode_shorter_than_sixteen_characters_is_refused(value: str) -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": value})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "16" in str(exc.value)
+    assert value not in str(exc.value)
+    assert Settings.from_env({"NER_SITE_STATS_PASSCODE": "x" * 16}).stats_passcode == "x" * 16
+
+
+def test_a_stats_passcode_must_be_ascii_like_the_visitor_passcode() -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": "pässwort-geheim-lang-genug"})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "ASCII" in str(exc.value)
+    assert "geheim" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["bare", "openrouter_only", "offline"],
+)
+def test_the_stats_passcode_makes_the_database_url_read(env: dict[str, str]) -> None:
+    """Recording needs the database on any deployment, so the rule for when
+    ``DATABASE_URL`` is read gains exactly this case and no other."""
+    assert not service.uses_database({**env, "DATABASE_URL": DB_URL})
+    assert Settings.from_env({**env, "DATABASE_URL": DB_URL}).database_url is None
+    on = {**env, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE, "DATABASE_URL": DB_URL}
+    assert service.uses_database(on)
+    s = Settings.from_env(on)
+    assert s.database_url == DB_URL and DB_URL in s.secrets()
+    # Bundled indexes still never see the database.
+    assert s.index_settings().database_url is None
+    with pytest.raises(SettingsError, match="DATABASE_URL"):
+        Settings.from_env({**on, "DATABASE_URL": "mysql://u:p@h/db"})
+    # Set without a database: the settings are still good; recording has nowhere to go.
+    assert Settings.from_env({**on, "DATABASE_URL": ""}).database_url is None
