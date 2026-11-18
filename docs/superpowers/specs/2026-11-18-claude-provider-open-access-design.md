@@ -354,3 +354,8 @@ the sections named are to be read with them. As built, with reasons:
   could not be completed (unreachable, or an HTTP error other than 401 or 403), health
   reports `claude` as `ok` with a reason saying the key was not checked; only a missing
   key, a refused key or a remembered block is `unavailable`.
+- **A limiter that cannot be asked refuses the request (sections 3.3 and 8;
+  superseded the same day).** "Sonnet, uncounted" no longer holds: a request on the
+  site's keys is answered 503 `limits_unavailable`, by decision 7 of
+  `2026-11-18-own-key-daily-cap-design.md` (its sections 3 and 4), which also adds the
+  daily cap and replaces the detection of a server-side refusal fallback given above.

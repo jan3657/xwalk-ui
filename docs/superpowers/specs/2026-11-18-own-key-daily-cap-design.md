@@ -251,3 +251,58 @@ carry no credential.
 `ner-site/README.md` (variables, the own-key section, rollout checks, the changed
 limiter-outage behaviour), `docs/ner-site/PLAN.md` (a section 15), and an amendment note
 in the earlier spec pointing here for decision 7.
+
+## As built, 18 November 2026
+
+Where the code departs from this document, or settles what it left open. The code
+follows these; reasons are in `docs/ner-site/PLAN.md` section 15 (15.1 to 15.16).
+
+- **The day is the visitor's whole UTC day (section 3.1).** The scan is `hour >=
+  midnight AND hour < midnight + 24 hours`, not "through the current hour", and the
+  bound is written as 24 hours so that a session time zone with a clock change cannot
+  shorten or lengthen it.
+- **Balances (section 3.1).** `opus_left`, `sonnet_left` and `own_left` are capped by
+  the day's remainder. `resets_in_s` stays the hourly reset in `Admission` and in
+  health; `day_resets_in_s` and `window` carry the day. Only `VisitorLimitReached`
+  carries the reset of the window that binds. A refusal is for the day only when no
+  tier the request could start on has room left today.
+- **Allowance variables (section 3.1).** The four new ones take 0 to 10000; the two
+  hourly site ones keep 0 to 1000.
+- **Own-key errors (section 5).** The words are the six listed and `bad_answer`,
+  `call_limit` and `error`; a failed pick can also say `key_refused` or
+  `rate_limited`. An HTTP 404 from a provider is reported as the key being refused
+  (401 `provider_key_refused`), as are 402, Anthropic's credit-balance 400 and
+  OpenAI's 429 "exceeded your current quota". With an own key the request deadline
+  and the call cap are 502 `provider_error`; an unreadable extraction answer stays
+  422. `provider_rate_limited` carries no `Retry-After`.
+- **Signatures (section 5).** `read_credential(provider, headers, *, enabled, text,
+  prompt)` and `own_llm(credential, model, *, purpose, effort, max_entities, call_cap)`
+  take no `Settings`; `Credential.source` is a `str`; `token()` is called once per
+  stage, when the client is built.
+- **OpenAI direct (section 5).** A subclass of the engine's client sends
+  `max_completion_tokens` (16000 and 8000) and no `temperature` or
+  `reasoning_effort`. Never run against the live API.
+- **Own Anthropic keys (section 5).** No retry, no server-side refusal fallback, 60 s
+  per call for both steps. The client is built so that nothing from the operator's
+  environment reaches the request: `ANTHROPIC_CUSTOM_HEADERS` is stripped (through a
+  private attribute of the SDK, with a check that refuses to build the client
+  otherwise), and the SDK's other environment inputs (keys, profile, base URL,
+  telemetry, proxies) do not reach the request.
+- **A site request with an `Authorization` header (section 5)** is refused with 400
+  `bad_credential` also where own keys are off.
+- **Where requests are metered (section 4).** On an OpenRouter-only deployment (no
+  Anthropic key) site requests are still not metered, while own-key requests use the
+  flood limit when a database is configured. Health has a `visitor` block only where
+  Claude is offered. Because own keys are on by default, `DATABASE_URL` is read on
+  every deployment that is not offline unless `NER_SITE_OWN_PROVIDERS` is empty.
+  Offline mode has no own keys. A contended lock is a 429 for own-key requests too.
+- **Health without counters (section 4).** `own_left` and `own_left_today` are null
+  and `window` is `hour`; with a passcode and no database, `limits` is `off` and the
+  site numbers are the full allowance.
+- **The page (section 7).** The session entry holds the provider with the key and a
+  reload in the same tab restores both; the key's shape is checked before sending;
+  the own-key limit and the day's Opus step-down have sentences the spec does not
+  give (PLAN.md 15.15).
+- **The check tool (rollout).** `tools/claude_check.py --provider ... --key-env ...`;
+  it does not send a key to a site whose health does not offer the provider, nor over
+  plain http to another machine.

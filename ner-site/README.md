@@ -19,8 +19,9 @@ are in [docs/ner-site/PLAN.md](../docs/ner-site/PLAN.md).
 - `vercel.json`: function duration and bundled files, and the security headers.
 - `tools/serve_local.py`: a standard-library server for `public/` and `/api/*`.
 - `tools/claude_check.py`: posts text files to a running site and prints the model that
-  ran, the step-downs, timings and tokens per request (for the rollout below; every run
-  makes real requests).
+  ran, the step-downs, timings and tokens per request (for the rollouts below; every run
+  makes real requests, on the site's keys or, with `--provider` and `--key-env`, on an
+  API key of your own, which is then billed).
 - `tools/screenshot.mjs`: Playwright smoke check that loads the page, runs the example
   and writes a PNG.
 - `tools/fixtures/`: canned `/api` responses (`health*.json`, `ner*.json`,
@@ -37,7 +38,8 @@ From the repository root, with the venv active (`. .venv/bin/activate`):
 python ner-site/tools/serve_local.py --canned ner-site/tools/fixtures
 # ... the same with dense retrieval unavailable and offline mode, to see the banner
 python ner-site/tools/serve_local.py --canned ner-site/tools/fixtures --scenario degraded
-# ... or one of the Claude states: sonnet, blocked, fallback (see below)
+# ... or one of the other states: sonnet, blocked, day, unavailable, own-refused,
+# own-bad, own-off, fallback (see below)
 python ner-site/tools/serve_local.py --canned ner-site/tools/fixtures --scenario sonnet
 
 # The real service with the stand-in extractor (NER_SITE_OFFLINE=1; no key needed)
@@ -56,18 +58,29 @@ changes; the others fall back to `health.json` and `ner.json`:
 
 | Scenario | What the page is given |
 |---|---|
-| (none) | Claude Opus 5.5 extracted and picked; the visitor is on the Opus allowance (`visitor.tier: opus`). No notices. |
+| (none) | Claude Opus 5.5 extracted and picked; the visitor is on the Opus allowance (`visitor.tier: opus`). No notices. Own keys are offered for all three providers, so the page shows "Run with". |
 | `sonnet` | The hour's Opus allowance is used: health says `visitor.tier: sonnet`, and the response carries the `admit` step-down with its notice. |
-| `blocked` | The hour's requests are used: health says `visitor.tier: blocked`, and every POST answers 429 `visitor_limit_reached` with `Retry-After` (`error-blocked.json`). |
+| `blocked` | The hour's requests are used: health says `visitor.tier: blocked`, and every POST on the site's keys answers 429 `visitor_limit_reached` with `Retry-After` (`error-blocked.json`). |
+| `day` | The day's requests are used: health says `visitor.tier: blocked` with `window: day`, and every POST on the site's keys answers 429 `visitor_limit_reached` with the day wording (`error-day.json`). An own-key POST still runs. |
+| `unavailable` | The limiter cannot be asked: health says `visitor.limits: unavailable` with `tier: blocked`, and every POST on the site's keys answers 503 `limits_unavailable` (`error-unavailable.json`). An own-key POST still runs. |
+| `own-refused` | The provider refuses the visitor's key: every own-key POST answers 401 `provider_key_refused` (`error-own-refused.json`, which names Anthropic whichever provider was chosen). POSTs on the site's keys run. |
+| `own-bad` | The API refuses the credential: every own-key POST answers 400 `bad_credential` (`error-own-bad.json`). |
+| `own-off` | Own keys are turned off (`own_keys.enabled: false`): the page shows no "Run with". |
 | `fallback` | Opus stepped down while extracting (`rate_limited`) and Sonnet while selecting (`overloaded`): two notices, picks made by two models, one failed pick. |
 | `degraded` | Offline mode with dense retrieval unavailable, in the response shape of the API before the Claude change (no `claude`, `visitor`, `fallbacks` or `notices`), so it also checks the page against an older API. |
 
 The server binds `127.0.0.1`, port 8765 by default (`--port`), and adds the headers
 from `vercel.json` to every response, so the page runs under the production
 Content-Security-Policy. With `--canned`, posting text that contains `ERROR` returns
-`fixtures/error.json` with HTTP 400 to show the error box (a scenario with an
-`error-NAME.json` of its own answers every POST with it); `--delay SECONDS` slows the
-POST to show the busy state.
+`fixtures/error.json` with HTTP 400 to show the error box. A scenario with an
+`error-NAME.json` of its own answers POSTs with it, with the HTTP status of its code: an
+error about the visitor's own key answers the own-key POSTs only, any other error the
+POSTs on the site's keys only. A POST that names an own-key `provider` is answered with
+`ner-own.json`, and is refused with 400 `bad_credential` when it lacks a well-formed
+`Authorization: Bearer` header (as is a POST on the site's keys that carries one). The
+canned server logs each API request with `authorization=present` or `absent`, never the
+value, which is how to see that only `POST /api/ner` carries a key. `--delay SECONDS`
+slows the POST to show the busy state.
 
 Smoke check (Playwright is resolved from `NODE_PATH` or `npm root -g`):
 
@@ -90,7 +103,10 @@ colour scheme.
    sensitive). Optionally add `NER_SITE_PASSCODE` and `NER_SITE_MODELS`; see the table
    below. Redeploy after changing variables. `ANTHROPIC_API_KEY` puts Claude first and
    switches on the visitor allowance: follow "Rollout: Claude by default and open
-   access" below before adding it to a public deployment.
+   access" below before adding it to a public deployment. Since 18 November 2026 the
+   code also offers visitors' own API keys by default on every deployment that is not
+   offline: add `NER_SITE_OWN_PROVIDERS` with an empty value before deploying, and
+   leave it so until "Rollout: own keys and the daily cap" below is done.
 3. Open `https://<deployment>/api/health` and check `"mode": "live"`,
    `"retrieval": {"dense": {"status": "ok"}}` and the model list. `dense: unavailable`
    with a reason means the committed indexes under `indexes/` are missing or stale, or
@@ -110,10 +126,17 @@ Several things could not be checked offline. They are marked **Check** below, ea
 with what to look for, and all of them come before the passcode is removed (step 8).
 Until then the passcode is what stands between the public and the key.
 
+Two things in this section changed on the same day, with the daily cap and visitors'
+own keys ("Rollout: own keys and the daily cap" below, to be done together with this
+one): the allowance now also has a daily cap (20 requests starting on Opus and 40 on
+Sonnet per UTC day), and a limiter that cannot be asked no longer lets a request run on
+Sonnet uncounted: requests on the site's keys are refused with 503 (step 7). The steps
+below describe the code as it is now.
+
 `tools/claude_check.py` is the measuring tool. It GETs `/api/health` and POSTs
 `/api/ner` on the URL it is given and nothing else; every text is a real request that
-spends the balance of the key behind the site and counts against your own hourly
-allowance there (`--help` says the same). The 12 real-world texts of 4 November are not
+spends the balance of the key behind the site and counts against your own hourly and
+daily allowance there (`--help` says the same). The 12 real-world texts of 4 November are not
 in this repository, so save the texts you want to measure as UTF-8 files first.
 
 1. **Anthropic Console.** Create a workspace for the site and a key in it.
@@ -129,18 +152,23 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    for extraction and Jev stays the default selector. Keep `NER_SITE_PASSCODE` for now.
    Keep `OPENROUTER_API_KEY` (Jev, query embeddings, the last step of the chain) and
    `DATABASE_URL` (the allowance is counted there). Optionally set
-   `NER_SITE_VISITOR_SALT`.
+   `NER_SITE_VISITOR_SALT`. Add `NER_SITE_OWN_PROVIDERS` with an empty value, which keeps
+   visitors' own keys off until their own rollout below is done.
 3. **Deploy, then `GET /api/health`.** Look for `"claude": {"status": "ok"}`,
-   `"visitor": {"limits": "on", "tier": "opus", "opus_left": 10, "sonnet_left": 20, ...}`,
+   `"visitor": {"limits": "on", "tier": "opus", "opus_left": 10, "sonnet_left": 20,
+   "opus_left_today": 20, "sonnet_left_today": 40, "window": "hour", ...}`,
+   `"own_keys": {"enabled": false, "providers": []}`,
    `default_model` and `default_selector` both `claude-opus-5-5`, and
    `passcode_required: true`. This first call also creates the table
-   `<NER_SITE_NEON_SCHEMA>.site_visits`. `visitor.limits: "unavailable"` means the
-   limiter could not query Neon: do not go on (see step 7). `claude` may also be
+   `<NER_SITE_NEON_SCHEMA>.site_visits`. `visitor.limits: "unavailable"` (with
+   `tier: "blocked"`) means the limiter could not query Neon, and every request on the
+   site's keys is then refused with 503: do not go on (see step 7). `claude` may also be
    `{"status": "ok", "reason": "key not checked (...)"}`: Anthropic did not answer the
    key check, which says nothing about the key; ask again after a minute and go on
    only once it is `ok` without a reason.
    From here on the allowance is counted even with the passcode set, your own requests
-   included: 10 an hour start on Opus, the next 20 on Sonnet. A request is counted when
+   included: 10 an hour start on Opus, the next 20 on Sonnet, and of a UTC day's
+   requests 20 start on Opus and 40 on Sonnet. A request is counted when
    it is admitted, before any model is called, so one that then fails with 502 or 422
    has already been counted against the allowance; one refused earlier (400, 401, 413,
    or the 429 `visitor_limit_reached` of the allowance itself) has not.
@@ -149,8 +177,10 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    console shows it as idle; five minutes by default), then `GET /api/health` once:
    `visitor.limits` must be `on`. If it is `unavailable` on that first call and `on`
    on the next, waking the database takes longer than 3 s, and after every quiet
-   spell the first requests would run on Sonnet uncounted (step 7): keep the compute
-   from suspending, or accept that knowingly, before going on. Try it a few times.
+   spell the first requests on the site's keys would be refused with 503
+   `limits_unavailable` (step 7): a visitor's first run after a quiet spell would
+   fail. Keep the compute from suspending, or accept that knowingly, before going on.
+   Try it a few times.
    With `NER_SITE_BACKEND=neon`, a function instance that is itself cold opens the
    indexes first, which wakes the database and hides the wait, so an `on` from a slow
    first answer proves nothing.
@@ -170,13 +200,14 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    Accepted looks like `200`, `model claude-opus-5-5 -> claude-opus-5-5`, picks
    `by claude-opus-5-5`, `fallbacks none`.
    **Check (the model the API names).** The id after the arrow is the `model` the API
-   echoes, and it must equal the id that was requested, letter for letter. The site
-   takes any other name to mean that Anthropic's refusal fallback answered from
-   another model: if a harmless text shows, say, `claude-opus-5-5 -> claude-opus-5-5-<date>`
-   with `extract:claude-opus-5-5>...:refused`, the API reports the model under another
-   spelling and every request would carry a false "declined this text" notice. That
-   needs a code change (`_served_elsewhere` in `ner_site/service.py`) before going
-   further.
+   echoes. Since the change of 18 November 2026 the site no longer reads a refusal
+   fallback from that name: it records one only when the SDK signals it (a
+   `fallback_message` entry in `usage.iterations`). So an echo under another spelling,
+   say `claude-opus-5-5 -> claude-opus-5-5-<date>` with `fallbacks none`, is harmless
+   to the notices, but the page then shows that id instead of "Claude Opus 5.5", with
+   "(you asked for Claude Opus 5.5)". Note what the API echoes. A harmless text that
+   shows `extract:claude-opus-5-5>...:refused` does mean the API served it from its
+   fallback model.
    Rejected looks like `502 FAILED provider_error` naming an Anthropic HTTP 400 (the
    extraction request was refused), or a 200 whose picks are all `failed` with a
    `failed picks:` reason naming an Anthropic HTTP 400 (the selection schema was
@@ -208,10 +239,13 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    passcode goes, because the allowance sets a rate, it is not a budget: one address
    may make 10 requests an hour starting on Opus and 20 on Sonnet, and with Claude
    picking every entity (up to 25 calls a request) that can be on the order of ten
-   dollars an hour from a single address, against a balance of about $180. If the sum
-   says so, set `NER_SITE_SELECTOR=jev` (Opus then extracts and Jev picks) or lower
-   `NER_SITE_OPUS_PER_HOUR` and `NER_SITE_SONNET_PER_HOUR` for the open site. The
-   same applies when selection on Opus is too slow.
+   dollars an hour from a single address, against a balance of about $180. The daily
+   cap bounds the same address at 20 requests starting on Opus and 40 on Sonnet per
+   UTC day, so at two such hours a day; it still bounds one address, not the total.
+   If the sum says so, set `NER_SITE_SELECTOR=jev` (Opus then extracts and Jev picks)
+   or lower `NER_SITE_OPUS_PER_HOUR`, `NER_SITE_SONNET_PER_HOUR` and the two
+   `..._PER_DAY` variables for the open site. The same applies when selection on Opus
+   is too slow.
    **Check (the workspace's rate limits).** One 25-entity request sends its picks 8
    at a time, so its selection tokens arrive within a few seconds. Compare the tokens
    of the largest request with the per-minute limits noted in step 1: if one request,
@@ -220,7 +254,11 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    More than 10 texts in one clock hour start on Sonnet from the 11th (the line shows
    `admit:claude-opus-5-5>claude-sonnet-5-5:opus_allowance_used`). To measure them all
    on Opus, run 10 an hour (`visitor.resets_in_s` in the health block says when the
-   hour ends) or raise `NER_SITE_OPUS_PER_HOUR` while measuring and set it back.
+   hour ends) or raise `NER_SITE_OPUS_PER_HOUR` while measuring and set it back. The
+   day allows 20 starts on Opus: the 21st of a UTC day starts on Sonnet in the same
+   way whatever the hour (`visitor.opus_left_today`, `visitor.day_resets_in_s`), so
+   measuring more than 20 texts on Opus in one day needs `NER_SITE_OPUS_PER_DAY`
+   raised as well.
 6. **Check (the allowance holds under parallel requests).** One visitor's requests are
    serialised with a Postgres advisory lock, and the guarantee depends on Neon's batch
    endpoint running a transaction at READ COMMITTED, which was verified on a local
@@ -233,8 +271,9 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    ```
 
    The tool compares where the requests started with the `opus_left` and `sonnet_left`
-   health reported just before. Good: `within the allowance` and exit code 0, for
-   example 10 on Opus and 5 on Sonnet in a fresh hour. A request that waits more than
+   health reported just before (each is what can still start this hour, already capped
+   by what is left of the day). Good: `within the allowance` and exit code 0, for
+   example 10 on Opus and 5 on Sonnet in a fresh hour of a fresh day. A request that waits more than
    1.5 s for its turn at the visitor's lock is refused with 429 "too many requests at
    once; try again in a few seconds" and is not counted; the tool reports these as
    `429 too many at once`. That is what the tail of a large burst should get, and it
@@ -242,42 +281,57 @@ in this repository, so save the texts you want to measure as UTF-8 files first.
    line; do not open the site:
 
    - `OVER THE ALLOWANCE`: more starts on a tier than were left.
-   - `THE LIMITER IS FAILING`: more than a fifth of the burst came back as `uncounted
-     (limits_unavailable)`. Those requests ran on Sonnet outside the count because the
-     limiter's database call failed for them. Waiting for the lock no longer explains
-     them (that is the 429 above), so do not dismiss them: repeat with `--burst 3`,
-     and if uncounted requests persist in a burst that small, the limiter does not
-     work under concurrency. The reason is the SQLSTATE in the `limits` field of each
-     such request's log line. `40001` means the isolation level is wrong: Neon's
-     batch endpoint is not running the transaction at READ COMMITTED, and concurrent
-     visits fail instead of taking turns. That needs a code change before the site
-     opens.
+   - `THE LIMITER IS FAILING`: at least one request of the burst was refused with 503
+     `limits_unavailable` (the summary counts them as `503 limits_unavailable`). The
+     limiter's database call failed for those requests, and the site runs no request
+     on its own keys uncounted, so it refused them. Waiting for the lock does not
+     explain them (that is the 429 above), so do not dismiss them: repeat with
+     `--burst 3`, and if the 503s persist in a burst that small, the limiter does not
+     work under concurrency. The reason is the error class and SQLSTATE in the
+     `limits` field of each such request's log line. `40001` means the isolation
+     level is wrong: Neon's batch endpoint is not running the transaction at READ
+     COMMITTED, and concurrent visits fail instead of taking turns. That needs a code
+     change before the site opens. A `limits` field with no SQLSTATE means the call
+     did not come back from the database in time (step 7): the database was slow for
+     those calls, and the visitors behind them would have seen an error.
    - `NOTHING TO COMPARE WITH`: health showed no `visitor` block with `limits: "on"`
-     before the burst (step 3 was not met).
-
-   One or two uncounted requests in a burst of 15 whose `limits` field has no
-   SQLSTATE (the call did not come back from the database in time) are the database
-   being slow for those calls (step 7); the tool says how many there were.
+     before the burst (step 3 was not met). Requests that ran all the same are
+     reported as `not counted`, under no tier.
 7. **Check (know what a Neon outage does, by design).** When the limiter cannot query
-   its database (unreachable, or no answer within 3 s), no request is refused and none
-   is counted: a request for Opus starts on Sonnet, with the notice "Visitor limits are
-   unavailable; this ran on Claude Sonnet 5.5.". So for as long as Neon is down,
-   Sonnet is unmetered for everyone and only the prepaid balance bounds it. It shows as
-   `visitor.limits: "unavailable"` in `/api/health` and as a `limits` field (error
-   class and SQLSTATE) in the request log. (The one database answer that does refuse a
-   request is the contended lock of step 6, SQLSTATE `55P03`: a 429, not an outage.)
-   If it lasts, set `NER_SITE_PASSCODE` again until it is over. Removing
-   `ANTHROPIC_API_KEY` stops the spending on Claude, but do not do that alone: the
-   allowance runs only where Claude is offered, so without the key and without a
-   passcode the site is public and uncounted on the OpenRouter key. Remove the key
-   only together with setting `NER_SITE_PASSCODE` again.
+   its database (unreachable, or no answer within 3 s), nothing runs uncounted on the
+   site's keys: every request on them, whatever the model, is refused with 503
+   `limits_unavailable` ("the site cannot count requests right now; try again
+   shortly, or use your own API key", `Retry-After: 30`; the last clause only where
+   own keys are on), and nothing is recorded. This replaces the first design of the
+   same day, in which such a request ran on Sonnet uncounted. So for as long as Neon
+   is down, the site's models are down for everyone, and nothing is spent on them. A
+   visitor with an own key can still run; that run is not counted either, because the
+   own-key flood limit lives in the same database. It shows as `visitor.limits:
+   "unavailable"` with `tier: "blocked"` in `/api/health`, as "The site cannot count
+   requests right now. ..." under the model field on the page, and as a `limits`
+   field (error class and SQLSTATE) in the request log. (The contended lock of step 6,
+   SQLSTATE `55P03`, is a 429, not an outage.) The same 503, with the message
+   "visitor limits are not configured" and no `Retry-After`, answers every site-key
+   request on a deployment that has the Anthropic key, no passcode and no
+   `DATABASE_URL`.
+   There is no setting that makes the open site run without counting. If the outage
+   lasts and the site must answer, the choices are a private site (set
+   `NER_SITE_PASSCODE` and remove `DATABASE_URL`: with a passcode and no database the
+   site's models run unmetered, and with `NER_SITE_BACKEND=neon` the indexes need
+   that URL too, so this also means the bundled backend) or the site without Claude
+   (remove `ANTHROPIC_API_KEY`: site-key requests are then not counted at all). Never
+   the second without a passcode: without the key and without a passcode the site is
+   public and uncounted on the OpenRouter key.
 8. **Open the site.** Remove `NER_SITE_PASSCODE`, redeploy, and check
    `passcode_required: false`. Then confirm the allowance from one address in one
    clock hour (31 short requests; `--selector retrieval` keeps each to one call, and
    earlier requests of that hour count too): the 11th starts on Sonnet with the notice
    "Your Opus allowance for this hour is used; this ran on Claude Sonnet 5.5.", and
-   the 31st answers 429 `visitor_limit_reached` with a `Retry-After` header. With the
-   tool, in a fresh hour (the 429 makes its exit code 1, as it should):
+   the 31st answers 429 `visitor_limit_reached` ("you have used this hour's requests;
+   try again in N minutes", plus ", or use your own API key" where own keys are on)
+   with a `Retry-After` header. These 30 are also half of that address's day; the
+   daily boundaries are step 5 of the next rollout. With the tool, in a fresh hour of
+   a fresh day (the 429 makes its exit code 1, as it should):
 
    ```bash
    python ner-site/tools/claude_check.py --url https://www.xwalk.si \
@@ -293,26 +347,216 @@ Going back: set `NER_SITE_PASSCODE` again, remove `ANTHROPIC_API_KEY`, and redep
 Do both, and never the second without the first: removing the key takes Claude out of
 the lists and switches the allowance off with it, so once the passcode is gone,
 removing the key alone would leave a public site that counts nothing and spends the
-OpenRouter key.
+OpenRouter key. The passcode also stands in front of own-key requests; to take own
+keys away as well, set `NER_SITE_OWN_PROVIDERS` to an empty value.
 With the passcode back, the site runs on OpenRouter as before, with Jev as the default
 selector unless `NER_SITE_SELECTOR` says otherwise. Check `passcode_required: true` and
 `"claude": {"status": "unavailable", "reason": "key not set"}` in `/api/health`.
+
+### Rollout: own keys and the daily cap (operator)
+
+The code for this is on the branch `feat/own-key-daily-cap` and, as of 18 November
+2026, nothing below has been done: no deployment, no change to a production variable,
+no request with a real key to Anthropic, OpenAI or OpenRouter. OpenAI's own API in
+particular has never been called by anything in this repository. What the code does is
+in "The daily cap", "When the limiter cannot be asked" and "Own keys" further down; the
+checks that could not be made offline are marked **Check** here, each with what to look
+for.
+
+Deploying this code changes three things at once, with no variable touched:
+
+- where Claude is offered, the allowance gains a daily cap;
+- where Claude is offered, a limiter that cannot be asked refuses requests on the
+  site's keys with 503 instead of letting them run on Sonnet uncounted;
+- on every deployment that is not offline, visitors' own keys are offered for all three
+  providers, because that is the default of `NER_SITE_OWN_PROVIDERS`. This includes the
+  production deployment of 4 November (OpenRouter key, passcode, Neon), where the
+  passcode still stands in front of every request.
+
+`tools/claude_check.py` runs on a key of your own with `--provider anthropic|openai|openrouter
+--key-env NAME`: the key is read from the environment variable NAME only, sent as
+`Authorization: Bearer` on the `POST /api/ner` requests, and replaced by `[redacted]`
+in everything the tool prints. Such a run bills that key for the model calls. The tool
+sends nothing when `/api/health` does not list the provider under `own_keys`, and it
+refuses to send a key over plain http to another machine.
+
+1. **Keep own keys off while checking.** Before deploying this code anywhere, add
+   `NER_SITE_OWN_PROVIDERS` with an empty value to the Vercel environment (production
+   and preview). After the deployment `GET /api/health` must show
+   `"own_keys": {"enabled": false, "providers": []}` and the page must show no "Run
+   with" field. **Check:** that Vercel stores an empty value. A value of only spaces
+   is read the same way; any other value that is not a list of `anthropic`, `openai`,
+   `openrouter` makes every request answer 503 `not_configured`, `/api/health`
+   included. With own keys off, a POST that names an own provider answers 400
+   `bad_credential`.
+2. **Check (Vercel records no request headers).** A visitor's key arrives in the
+   `Authorization` header of `POST /api/ner`. The site's own log line never holds it,
+   and the SDK and HTTP client loggers are silenced for an own-key run, but what the
+   platform records is outside the code. In the Vercel project, look at everything
+   that can record a request: the runtime logs of the functions, every log drain,
+   every observability, tracing or error-reporting integration, and the firewall's
+   logs. None of them may store request headers, or `Authorization` must be excluded
+   by name. This check is made with step 3: do not turn own keys on for the public
+   before both are done.
+3. **Check (a wrong key is refused and appears nowhere).** On a preview deployment
+   with own keys on for it (`NER_SITE_OWN_PROVIDERS` removed or set to the provider),
+   send a made-up key that you can search for:
+
+   ```bash
+   export CHECK_KEY=sk-rollout-sentinel-4f9a71c2d08b4e5a   # made up, not a real key
+   python ner-site/tools/claude_check.py --url https://<preview> \
+       --provider openai --key-env CHECK_KEY one.txt
+   ```
+
+   The made-up key travels to the provider, which refuses it. Expected line:
+   `401 ... FAILED provider_key_refused: OpenAI refused this key. It may be mistyped,
+   revoked, out of credit, or not allowed to use this model. (sent as provider
+   openai)`, exit code 1. Then search the function log and every sink of step 2 for
+   the whole key, for its middle part (`sentinel-4f9a71c2`; providers echo keys
+   masked, as in `sk-ro...4e5a`) and for the word `Authorization`: nothing. The
+   request's log line shows `"provider": "openai", "credential": "visitor"`,
+   `"code": "provider_key_refused"` and no part of the key. Repeat for `anthropic`
+   and `openrouter`. A key of the wrong shape (shorter than 20 characters, a space)
+   never reaches the provider: the tool refuses it, and the API answers 400
+   `bad_credential`.
+4. **Check (one real run per provider).** With a real key for each provider (a
+   restricted one with a spending limit), one short text each, first with retrieval
+   picking and then with the model picking:
+
+   ```bash
+   read -rs MY_OPENAI_KEY && export MY_OPENAI_KEY          # typed, not in history
+   python ner-site/tools/claude_check.py --url https://<preview> \
+       --provider openai --key-env MY_OPENAI_KEY one.txt
+   python ner-site/tools/claude_check.py --url https://<preview> \
+       --provider openai --key-env MY_OPENAI_KEY --selector gpt-6-luna one.txt
+   ```
+
+   Good: `200`, `provider openai (credential visitor)`, `model gpt-6-luna ->
+   gpt-6-luna`, `entities` above 0, `fallbacks none`, and in the second run picks
+   `by gpt-6-luna` with none `failed`. On the page the same run reads "Extracted by
+   gpt-6-luna on your OpenAI key." (the page has names for the Claude models only,
+   for example "Extracted by Claude Haiku 5.5 on your Anthropic key."). In your own
+   dashboards for that minute: no usage on the Anthropic key, and on
+   the OpenRouter key the query embeddings only, no chat call. The provider's
+   dashboard for your key shows the calls.
+   **OpenAI direct needs the closest look**, because nothing has called it:
+   - *The default model id exists.* `gpt-6-luna` is the id OpenRouter uses; whether
+     OpenAI's API has it under that name is not known. A model the key cannot use, or
+     one that does not exist, comes back from OpenAI as HTTP 404, which the site
+     reports as the key being refused: so `401 provider_key_refused` with a key you
+     know to be good means the model id. Set `NER_SITE_OWN_MODELS_OPENAI` to ids that
+     exist.
+   - *The request is accepted.* The site sends `max_completion_tokens` (16000 for
+     extraction, 8000 for selection) and no `temperature`, with the JSON schema in
+     strict mode. `502 provider_error ... (bad_request)` means OpenAI rejected the
+     request's shape; picks that are all `failed` with `bad_request` mean it rejected
+     the selection request. Either needs a code change in `ner_site/providers.py`.
+     A rejected schema can also pass unseen: when OpenAI's error names
+     `response_format`, the engine's client asks once more with the JSON described
+     in the prompt instead, so also look at the key's usage for failed calls.
+   - *JSON comes back inside the token limit.* `422 extraction_unparseable` or
+     `extraction_schema`, or picks `failed` with `bad_answer`, mean the answer was
+     cut off or was not the JSON asked for.
+   - *Latency.* One request to the provider has 60 s, extraction as a whole 90 s
+     (up to three requests on OpenAI and OpenRouter, one on Anthropic). `timing_ms`
+     `extract` should be far below 60000; `502 provider_error ... (timeout)` means it
+     was not.
+
+   For Anthropic also run `--model claude-haiku-5-5`, which only own keys offer and
+   which has not met the live API through this adapter. An own Anthropic key gets one
+   request per call and no retry, so a single 5xx from Anthropic is a `502
+   provider_error ... (http_5xx)`: seen once, run it again before reading anything
+   into it.
+5. **Check (the daily cap at its boundaries).** Cheapest on a preview deployment with
+   the day lowered, `NER_SITE_OPUS_PER_DAY=3` and `NER_SITE_SONNET_PER_DAY=3`, from an
+   address with no requests that day:
+
+   ```bash
+   python ner-site/tools/claude_check.py --url https://<preview> \
+       --selector retrieval --sequential-delay 1 $(printf 'short.txt %.0s' {1..7})
+   ```
+
+   Lines 1 to 3 read `model claude-opus-5-5 -> claude-opus-5-5`; lines 4 to 6 carry
+   `admit:claude-opus-5-5>claude-sonnet-5-5:opus_allowance_used`, and the response's
+   notice is "Your Opus allowance for today is used; this ran on Claude Sonnet 5.5.";
+   line 7 reads `429 ... FAILED visitor_limit_reached: you have used today's
+   requests; they reset at midnight UTC` (plus ", or use your own API key" where own
+   keys are on), with `Retry-After` the seconds to midnight UTC. Health then shows
+   `"tier": "blocked", "window": "day"`, and the page "You have used today's
+   requests. They reset at midnight UTC...".
+   With the defaults the same shows over two clock hours from one address: 31
+   requests in the first (step 8 of the rollout above), 31 in the second. In the
+   second hour requests 1 to 10 start on Opus, 11 to 30 on Sonnet with the "for
+   today" notice (the day's 20 Opus starts are used), and the 31st is refused with
+   the day wording; every request after it, in any hour, is refused the same way
+   until midnight UTC.
+6. **Check (a failing limiter fails closed, and own keys still run).** On a preview
+   deployment that has the Anthropic key, set `DATABASE_URL` to a Postgres URL that
+   cannot work (the right host with a wrong password). Use the bundled backend for this: with
+   `NER_SITE_BACKEND=neon` the indexes read the same URL and retrieval fails too.
+   `/api/health` shows `"visitor": {"limits": "unavailable", "tier": "blocked", ...}`
+   and the page says "The site cannot count requests right now. Try again shortly, or
+   use your own API key." A request on the site's keys answers `503 ... FAILED
+   limits_unavailable` with `Retry-After: 30`; `--burst 3` prints `THE LIMITER IS
+   FAILING` and exits 1. A run with `--provider ... --key-env ...` still answers
+   200: it is not counted, and its log line has `"tier": "own"` and a `limits` field.
+7. **Check (the browser's password manager).** In Chrome and in Safari, choose "My
+   ... key" on the page, type a key and run. The field is a password field without a
+   name and with `autocomplete="off"`, in the same form as the passcode field, and
+   whether a browser then offers to save it was not tested. If one does, a saved key
+   outlives the tab, which the sentence under the field ("Your key stays in this
+   browser tab ...") denies: say so on the page (a change in `public/`), or accept it
+   knowingly. Also press "Forget key", change "Run with", and reload: the field must
+   be empty after the first two and hold the key after a reload in the same tab.
+8. **`ANTHROPIC_CUSTOM_HEADERS` does not reach own-key requests.** The site's own
+   Claude client honours that variable as before. A client built for a visitor's
+   Anthropic key drops it (a header there could replace the visitor's key with the
+   operator's), so nothing that depends on such a header, a gateway or an
+   attribution header, applies to own-key requests: do not rely on it. The same
+   holds for `ANTHROPIC_BASE_URL`, `NER_SITE_BASE_URL` and proxy variables: own-key
+   requests go to the provider's own host. The drop relies on a private attribute of
+   the `anthropic` SDK and is checked on every request: after an SDK upgrade that
+   moves it, own-key Anthropic requests fail with `502 provider_error ... (error)`
+   instead of sending the header, so repeat step 4 for Anthropic after upgrading.
+9. **Turn own keys on.** Remove `NER_SITE_OWN_PROVIDERS` (all three providers), or
+   list the providers that passed step 4 (for example `anthropic,openrouter`), and
+   redeploy. `/api/health` shows `own_keys.enabled: true` with each provider's
+   models, and the page shows "Run with". The flood limit can be confirmed at your
+   own key's expense: the 31st own-key request of an hour answers 429 "too many
+   requests with your own key; try again in N minutes".
+10. **Sign-in with ChatGPT is not built.** OpenAI's programme covers loopback
+    callbacks only and a hosted app has to apply: submit OpenAI's interest form if
+    sign-in on the hosted site is wanted. Nothing changes on the site until then;
+    the code has a place for it (a provider whose credential returns a refreshed
+    token) and nothing more.
+11. Record what was verified in the "Verified" section.
+
+Turning own keys off again: set `NER_SITE_OWN_PROVIDERS` to an empty value and
+redeploy. Health reports `own_keys.enabled: false`, the page drops the field and
+forgets a key kept in the tab the next time it loads, and a POST with an own
+provider answers 400 `bad_credential`.
 
 ### Environment variables (function runtime)
 
 | Name | Default | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | unset | The operator's Anthropic key. With it the Claude models are offered and the visitor allowance applies (below). Mark it sensitive; it is scrubbed from every response and log line like the other secrets. |
-| `OPENROUTER_API_KEY` | unset | The operator's OpenRouter key, used for the OpenRouter models, Jev, query embeddings and the last step of the fallback chain. With neither key (and not offline) `/api/ner` answers 503 `not_configured`. |
+| `ANTHROPIC_API_KEY` | unset | The operator's Anthropic key. With it the Claude models are offered and the visitor allowance applies (below). Mark it sensitive; it is scrubbed from every response and log line like the other secrets. A request on a visitor's own key never uses it. |
+| `OPENROUTER_API_KEY` | unset | The operator's OpenRouter key, used for the OpenRouter models, Jev, query embeddings and the last step of the fallback chain. With neither key (and not offline) a request on the site's keys answers 503 `not_configured`; a request on a visitor's own key still runs, without dense retrieval. |
 | `NER_SITE_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL for the **chat call only**. Query embeddings always go to OpenRouter (`https://openrouter.ai/api/v1/embeddings`) with `OPENROUTER_API_KEY`, whatever this says: the committed dense indexes record that embeddings URL in their identity, so embedding elsewhere would need a code change and rebuilt indexes. |
 | `NER_SITE_MODELS` | `claude-opus-5-5,claude-sonnet-5-5,google/gemini-3.1-flash-lite,openai/gpt-6-luna` | Comma-separated model allowlist. An id starting with `claude-` is called on the Anthropic key, anything else through OpenRouter; only ids whose key is set are offered, and the first offered one is the default. The only Claude ids are `claude-opus-5-5` and `claude-sonnet-5-5`; another `claude-` id is refused (503 `not_configured`), as is a list that no set key can run. |
 | `NER_SITE_SELECTORS` | `claude-opus-5-5,claude-sonnet-5-5,jev,google/gemini-3.1-flash-lite,openai/gpt-6-luna` | What may pick the match, after `retrieval`, which is always offered first. The same rule: only ids whose key is set are offered (Jev needs the OpenRouter key). |
 | `NER_SITE_SELECTOR` | unset | The default selector. It must be `retrieval` or in the list above; unset, or when its key is not set, the default is the first selector that can run: `claude-opus-5-5` with the Anthropic key, `jev` with only the OpenRouter key. |
 | `NER_SITE_CLAUDE_EFFORT` | `low` | `output_config.effort` of every Claude request: `low`, `medium` or `high`. |
 | `NER_SITE_FALLBACK_MODEL` | `google/gemini-3.1-flash-lite` | The OpenRouter model at the end of the fallback chain, for extraction and for selection. Must be an OpenRouter model id (not a Claude id, `jev` or `retrieval`). Used only when `OPENROUTER_API_KEY` is set; without it the chain ends at Sonnet. |
-| `NER_SITE_OPUS_PER_HOUR` / `NER_SITE_SONNET_PER_HOUR` | 10 / 20 | The per-visitor allowance for a clock hour (UTC): requests that start on Opus, then requests that start on Sonnet. Their sum is the hour's total for every kind of request. Whole numbers 0 to 1000; anything else is refused. |
-| `NER_SITE_VISITOR_SALT` | derived | Salt for the visitor ids (a keyed hash of the client address). Unset, it is the SHA-256 of `DATABASE_URL`. Changing it, or the database URL when it is unset, gives every visitor a new id, which resets the current hour's counts. |
-| `NER_SITE_PASSCODE` | unset | When set, every `/api/ner` request must send it as `X-Passcode`; the page asks for it and keeps it in `sessionStorage`. ASCII only (8 characters or more recommended): header values arrive as Latin-1, so a non-ASCII passcode could never match and is refused with 503 `not_configured`. It does not exempt anyone from the visitor allowance. |
+| `NER_SITE_OPUS_PER_HOUR` / `NER_SITE_SONNET_PER_HOUR` | 10 / 20 | The per-visitor allowance for a clock hour (UTC): requests that start on Opus, then requests that start on Sonnet. Their sum is the hour's total for every kind of request on the site's keys. Whole numbers 0 to 1000; anything else is refused. |
+| `NER_SITE_OPUS_PER_DAY` / `NER_SITE_SONNET_PER_DAY` | 20 / 40 | The same for a UTC calendar day, on top of the hourly allowance: their sum is the day's total for every kind of request on the site's keys. Whole numbers 0 to 10000; anything else is refused. |
+| `NER_SITE_OWN_PER_HOUR` / `NER_SITE_OWN_PER_DAY` | 30 / 60 | The flood limit for requests on a visitor's own key, per visitor and clock hour and per UTC day. Counted apart from the allowance above. Whole numbers 0 to 10000; anything else is refused. 0 refuses every own-key request where the limiter can be asked. |
+| `NER_SITE_OWN_PROVIDERS` | `anthropic,openai,openrouter` | The providers a visitor may bring an own key for. An empty value turns own keys off; an unknown name is refused (503 `not_configured`). Offline mode turns them off whatever this says. |
+| `NER_SITE_OWN_MODELS_ANTHROPIC` | `claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5` | The models an own Anthropic key may run; the first is the default. Only these three ids are accepted. |
+| `NER_SITE_OWN_MODELS_OPENAI` | `gpt-6-luna` | The models an own OpenAI key may run on `https://api.openai.com/v1`; the first is the default. Any ids except `jev` and `retrieval`; an empty list is refused. Not checked against the live API. |
+| `NER_SITE_OWN_MODELS_OPENROUTER` | `google/gemini-3.1-flash-lite,openai/gpt-6-luna` | The models an own OpenRouter key may run; the first is the default. The same rules. |
+| `NER_SITE_VISITOR_SALT` | derived | Salt for the visitor ids (a keyed hash of the client address). Unset, it is the SHA-256 of `DATABASE_URL`. Changing it, or the database URL when it is unset, gives every visitor a new id, which resets the current hour's and day's counts. |
+| `NER_SITE_PASSCODE` | unset | When set, every `/api/ner` request must send it as `X-Passcode`; the page asks for it and keeps it in `sessionStorage`. ASCII only (8 characters or more recommended): header values arrive as Latin-1, so a non-ASCII passcode could never match and is refused with 503 `not_configured`. It does not exempt anyone from the visitor allowance, and a request on a visitor's own key needs it too. |
 | `NER_SITE_MAX_CHARS` | 5000 | Maximum text length (characters). |
 | `NER_SITE_MAX_ENTITIES` | 25 | Maximum entities kept per request; the default prompt (and `/api/health`'s `default_prompt`) states this number. |
 | `NER_SITE_MAX_PROMPT_CHARS` | 4000 | Maximum prompt length (characters). |
@@ -320,7 +564,7 @@ selector unless `NER_SITE_SELECTOR` says otherwise. Check `passcode_required: tr
 | `NER_SITE_DENSE_DIR` | `<project root>/indexes` | Where the committed dense indexes live. |
 | `NER_SITE_CACHE_DIR` | `/tmp/xwalk-ner-site` | Where BM25 indexes are built at cold start. |
 | `NER_SITE_BACKEND` | `bundled` | `neon` reads the records, BM25 and vectors from Neon Postgres instead of building BM25 in `/tmp` and opening the committed dense indexes (see "Neon backend" below). |
-| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, where Claude is offered (`ANTHROPIC_API_KEY` is set and the site is not offline), because the visitor allowance is counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key, or offline) it is ignored unread, as before. |
+| `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (which they are unless `NER_SITE_OWN_PROVIDERS` is empty), because the visitor allowance and the own-key flood limit are counted there. Where it is read, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. |
 | `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` is created in it; the schema itself must already exist. |
 | `NER_SITE_NEON_DIMENSIONS` | 1024 | The loaded vector dimension (`load_neon.py --dimensions`); a different value makes dense stale. |
 | `NER_SITE_NEON_CATALOG` | `samples` | `full` serves the full catalogs (`chebi`, `ctd-disease`, `ncbi-gene`, `foodon`) once they are loaded; needs `NER_SITE_BACKEND=neon`. |
@@ -361,9 +605,12 @@ has) and 60 s while selecting.
 
 On the last step the error is returned as it is: a failed provider request while
 extracting is 502 `provider_error`. Steps decided before any call have stage `admit`:
-`opus_allowance_used` (the visitor's Opus allowance), `limits_unavailable` (the limiter
-could not be asked) and `claude_unavailable` (a remembered exhausted balance or refused
-key: the request starts on the OpenRouter step). One more reason,
+`opus_allowance_used` (the visitor's Opus allowance for the hour or for the day) and
+`claude_unavailable` (a remembered exhausted balance or refused key: the request starts
+on the OpenRouter step). A third, `limits_unavailable`, belonged to the first design, in
+which a request ran on Sonnet when the limiter could not be asked; the code no longer
+produces it (such a request is now refused with 503, below), and only its sentence is
+kept for pages that still hold an old response. One more reason,
 `follows_extraction` (stage `select`), is not a failure: when the model and the selector
 are two different Claude ids, selection runs on the request's one chain, that is where
 extraction ended, and the response says so. A Claude selector with an OpenRouter
@@ -372,9 +619,13 @@ extraction model gets a chain of its own for the picks. Every departure is in
 each `pick.selector` the model that made that pick.
 
 The refusal fallback on Anthropic's side can also answer from a model nobody asked for.
-When the answer of a Claude step names a model that is no step of the chain, that is
+The adapter recognises that by the SDK's own signal (a `fallback_message` entry in
+`usage.iterations`), not by comparing model names, and then uses only the text of the
+model that served the answer (the text after the last `fallback` content block). It is
 recorded like any other departure: stage `extract` or `select`, from the model asked to
-the model that answered, reason `refused`, once per stage and answering model.
+the model that answered, reason `refused`; for the picks once per pair of models, and
+the notice names the entities whose picks it concerns ("... the picks for e2, e5 ran
+on ..."). A request on a visitor's own Anthropic key does not ask for this fallback.
 
 A notice says what ran only where that is known. Of the departures that decided where
 the extraction ran (those of stage `admit` included), and again of those that decided
@@ -396,11 +647,12 @@ required but nullable, a list-valued `type` and `oneOf` become `anyOf`, and keyw
 outside the supported subset (numeric bounds, lengths, patterns) are moved into the
 `description`. The site validates the answer itself, as before.
 
-**The visitor allowance.** It applies where Claude is offered (the Anthropic key is
-set and the site is not offline); a deployment without the key counts nothing and
-behaves as before. A visitor is the first 32 hex characters of an HMAC-SHA256 of the
-client address (`x-real-ip`, else `x-vercel-forwarded-for`, else the first entry of
-`x-forwarded-for`) under the salt. The address itself is never stored or logged; the
+**The visitor allowance.** It applies to requests on the site's keys where Claude is
+offered (the Anthropic key is set and the site is not offline); a deployment without
+the key counts no such request and behaves as before (requests on a visitor's own key
+are counted apart, on any deployment with a database: "Own keys" below). A visitor is
+the first 32 hex characters of an HMAC-SHA256 of the client address (`x-real-ip`, else
+`x-vercel-forwarded-for`, else the first entry of `x-forwarded-for`) under the salt. The address itself is never stored or logged; the
 id is stored only in the table below and is never logged or returned. Requests with no
 address header share one allowance.
 
@@ -413,11 +665,12 @@ address header share one allowance.
   counted. It is counted under the tier it starts on: `opus`, `sonnet`, or `other` for
   an OpenRouter model with a non-Claude selector. The tier wanted comes from the model,
   or from the selector when only the selector is Claude.
-- Opus is granted while fewer than 10 Opus starts are recorded for the hour, then
-  Sonnet while fewer than 20 Sonnet starts are. When the hour's total (all three tiers)
-  reaches 30, or a request for Sonnet finds the Sonnet allowance used, the answer is
-  429 `visitor_limit_reached` with `Retry-After` (seconds to the next clock hour) and
-  nothing is recorded.
+- Opus is granted while fewer than 10 Opus starts are recorded for the hour and fewer
+  than 20 for the day, then Sonnet while fewer than 20 Sonnet starts are recorded for
+  the hour and fewer than 40 for the day. When the total of the three site tiers
+  reaches 30 for the hour or 60 for the day, or a request for Sonnet finds a Sonnet
+  allowance used, the answer is 429 `visitor_limit_reached` with `Retry-After` and
+  nothing is recorded ("The daily cap" below has the windows and the wording).
 - One visitor's concurrent requests are serialised with a Postgres advisory lock taken
   in the same transaction, so a parallel burst cannot be granted more than the
   allowance. The wait for that lock is bounded (`SET LOCAL lock_timeout = '1500ms'`
@@ -426,10 +679,60 @@ address header share one allowance.
   at once; try again in a few seconds" and `Retry-After: 5`, and nothing is recorded.
   The limiter has its own Neon executor: 3 s timeout and no retries (a retried
   increment could count one visit twice).
-- When the limiter cannot be asked for any other reason, the request is not counted
-  and a request for Opus starts on Sonnet (`limits_unavailable`). The same happens with
-  no `DATABASE_URL` and no passcode; with no `DATABASE_URL` and a passcode (a private
-  deployment) Claude is unmetered and starts on Opus.
+- When the limiter cannot be asked for any other reason, a request on the site's keys
+  is refused with 503 `limits_unavailable` and nothing runs uncounted ("When the
+  limiter cannot be asked" below).
+
+**The daily cap.** On top of the hour, each visitor has a UTC calendar day: 20 requests
+starting on Opus and 40 starting on Sonnet (`NER_SITE_OPUS_PER_DAY`,
+`NER_SITE_SONNET_PER_DAY`), and their sum, 60, is the day's total for every request on
+the site's keys. Nothing new is stored: the day's counts are the sum of that visitor's
+hour rows from midnight UTC to the next midnight, read in the same statement and under
+the same lock as the hour's.
+
+- The whole day is summed, not the day up to the request's own hour. A request stamped
+  14:59 that gets its turn at the lock after a 15:00 request has committed therefore
+  sees that request, and the cap cannot be passed at an hour boundary. The upper bound
+  is written as 24 hours after midnight, so a database session in a time zone with a
+  clock change still reads a UTC day.
+- A request for Opus that finds the day's Opus allowance used starts on Sonnet like one
+  that finds the hour's used, with the same reason `opus_allowance_used`; its notice
+  says which: "Your Opus allowance for today is used; this ran on Claude Sonnet 5.5."
+- The refusal names the window that binds. The hour: "you have used this hour's
+  requests; try again in N minutes", `Retry-After` the seconds to the next clock hour.
+  The day: "you have used today's requests; they reset at midnight UTC", `Retry-After`
+  the seconds to midnight UTC. Both end ", or use your own API key" where own keys are
+  on. A request is refused for the day only when no tier it could start on has room
+  left today; while one has, the refusal is the hour's.
+- In `/api/health`, `opus_left` and `sonnet_left` are what can still start this hour,
+  each capped by what is left of the day, so a page written before the daily cap stays
+  truthful. `opus_left_today` and `sonnet_left_today` are the day's remainders.
+  `resets_in_s` is always the seconds to the next clock hour and `day_resets_in_s` the
+  seconds to midnight UTC. `window` is `hour` or `day`: which of the two binds the
+  next request for Opus (when it is refused or steps down), or would bind first.
+- Rows older than 24 hours are still deleted, which keeps every row of the current UTC
+  day.
+
+**When the limiter cannot be asked.** A request on the site's keys never runs
+uncounted on an open site. This replaces the first design of 18 November 2026, in
+which it ran on Sonnet outside the count.
+
+| The limiter | A request on the site's keys | A request on a visitor's own key | `visitor` in `/api/health` |
+|---|---|---|---|
+| answers | counted, allowed or refused (429) | counted under the flood limit, allowed or refused (429) | `limits: "on"` with the balances |
+| does not answer (database unreachable, an error, or no answer in 3 s) | 503 `limits_unavailable`, "the site cannot count requests right now; try again shortly" (", or use your own API key" where own keys are on), `Retry-After: 30` | runs, not counted | `limits: "unavailable"`, `tier: "blocked"` |
+| has a queue on the visitor's lock longer than 1.5 s | 429 `visitor_limit_reached`, "too many requests at once; try again in a few seconds", `Retry-After: 5` | the same 429 | not affected |
+| is not configured (no `DATABASE_URL`), no passcode | 503 `limits_unavailable`, "visitor limits are not configured", no `Retry-After` | runs, not counted | `limits: "unavailable"`, `tier: "blocked"` |
+| is not configured, with a passcode (a private deployment) | runs unmetered, a request for Opus on Opus | runs, not counted | `limits: "off"`, `tier: "opus"`, the full allowance |
+
+The first column applies where Claude is offered. On a deployment without the
+Anthropic key, requests on the site's keys are not metered at all, as before (and a
+public one needs a passcode, see the security notes), health has no `visitor` block,
+and own-key requests are still counted when `DATABASE_URL` is set. Where the limiter
+gives no counts, the numbers in `visitor` say what admission would do (0, or the full
+allowance in the last row), `own_left` and `own_left_today` are null, and `window` is
+`hour`. The page shows "The site cannot count requests right now. Try again shortly,
+or use your own API key." for `limits: "unavailable"` with `tier: "blocked"`.
 
 `/api/health` reports `claude`: `{"status": "ok"}`, or `unavailable` with the reason
 "key not set", "key refused" (from the key check, or from a request of that warm
@@ -440,8 +743,95 @@ outage: `claude` is then `ok` with the reason "key not checked (Anthropic unreac
 for 300 s, any other result for 60 s. Where the allowance applies, health also reports
 `visitor` for the caller: `limits` (`on`, `off`, `unavailable`), `tier` (where a request
 for Opus would start: `opus`, `sonnet`, `blocked`), `opus_left`, `sonnet_left` (each
-capped by what remains of the hour's total) and `resets_in_s`. Offline mode reports
-neither.
+capped by what remains of the hour's total and of the day), `resets_in_s`, and since the
+daily cap `opus_left_today`, `sonnet_left_today`, `own_left`, `own_left_today` (the
+own-key flood limit's remainders), `day_resets_in_s` and `window`. Offline mode reports
+neither. `own_keys` is reported on every deployment: `{"enabled": true, "providers":
+[{"id", "name", "models", "default_model"}, ...]}`, or `{"enabled": false,
+"providers": []}`.
+
+**Own keys.** A visitor may run the demo on their own API key for Anthropic, OpenAI or
+OpenRouter instead of the site's keys (binding design:
+[the spec of 18 November 2026](../docs/superpowers/specs/2026-11-18-own-key-daily-cap-design.md),
+with an "As built" section; decisions in docs/ner-site/PLAN.md section 15). On by
+default for all three providers on a site that is not offline.
+
+*What travels where.*
+
+- The page keeps the key in the tab's session storage (one entry, with the provider),
+  puts it back in the field after a reload in the same tab, and removes it on "Forget
+  key", on any change of "Run with", and at load when its provider is no longer
+  offered. It sends it only as `Authorization: Bearer <key>` on `POST /api/ner`, with
+  `redirect: "error"`, and with `"provider": "<id>"` in the body. Health requests carry
+  nothing.
+- The API reads the key from that one header, builds a client for that request, and
+  closes it after. The key is not written to the settings, a cache, the database, a log
+  line or a response, and no length or digest of it is kept. For the length of the
+  request it is one more value scrubbed from the response and the log line, and the
+  SDK and HTTP client loggers are silent during an own-key run.
+- The key goes to the provider's own host and nowhere else: `https://api.anthropic.com`,
+  `https://api.openai.com/v1` or `https://openrouter.ai/api/v1`. These are constants:
+  `NER_SITE_BASE_URL`, `ANTHROPIC_BASE_URL`, proxy variables, `.netrc` and
+  `ANTHROPIC_CUSTOM_HEADERS` do not apply, and redirects are not followed. The text
+  and the prompt go to that provider with the key. An own OpenRouter request carries
+  the site's `HTTP-Referer` and `X-Title` headers, as the site's own do.
+- A provider's error text is never repeated (it can echo the key, whole or masked):
+  the visitor gets a fixed sentence with the provider's name, and the log the error
+  code.
+
+*What a request may ask for.* `provider` is absent or `site` (the site's keys), or one
+of the enabled providers. With an own provider, `model` must be in that provider's list
+(`NER_SITE_OWN_MODELS_*`; the first is the default) and `selector` is `retrieval` (the
+default) or a model of the same list: picks run on the same key or not at all, and Jev
+is not offered, because it bills the operator. The response says `provider` and
+`credential_source: "visitor"`, `model` is the model asked for, and `fallbacks` and
+`notices` are empty: there is no chain, no step-down and no server-side refusal
+fallback, so the visitor is billed for the model they chose and no other. A set
+`NER_SITE_PASSCODE` is required as for any request.
+
+*What each provider is sent.* Anthropic: the same request as on the site's key (effort,
+token limits, schema-enforced output) without the refusal fallback, 60 s per call for
+both steps, and no retry, so one transient failure is a 502. Claude Haiku 5.5 is
+offered here and only here. OpenAI: the engine's OpenAI-compatible client with
+`max_completion_tokens` (16000 for extraction, 8000 for selection) in place of
+`max_tokens`, no `temperature` and no `reasoning_effort`, the schema in strict mode;
+60 s per request, up to three requests for an extraction and two for a pick. This path
+has never met the live API. OpenRouter: the site's own OpenRouter client and limits
+with the visitor's key. The call caps per request are the site's.
+
+*What the operator still pays for.* The model calls are billed to the visitor. The
+operator pays for the term lookup: the query embeddings for dense retrieval (OpenRouter,
+`OPENROUTER_API_KEY`; without that key own-key requests run on BM25 alone), the Neon
+queries, and the function's time, up to about 105 s a request. An own-key request needs
+neither of the site's LLM keys to be set.
+
+*The flood limit.* Own-key requests do not count against the Opus and Sonnet
+allowance. They have their own: 30 per visitor and clock hour and 60 per UTC day
+(`NER_SITE_OWN_PER_HOUR`, `NER_SITE_OWN_PER_DAY`), counted in the same table under the
+tier `own`, on any deployment with `DATABASE_URL`, also one without the Anthropic key.
+Over it: 429 `visitor_limit_reached`, "too many requests with your own key; try again
+in N minutes" (N counts to the reset of the window that binds, the hour or midnight
+UTC), with `Retry-After`. It bounds what one address can make the operator pay for
+lookups; it is not counted when the limiter cannot be asked or is not configured (the
+table above), and then nothing bounds it but the function's own limits.
+
+*Errors.* All with fixed text.
+
+| Status and code | When |
+|---|---|
+| 400 `bad_credential` | An own provider without exactly one `Authorization: Bearer <key>` header; a key that is not 20 to 512 printable ASCII characters without spaces; a provider that is unknown or not enabled; the key also present in the text or the prompt; or a request on the site's keys that carries an `Authorization` header at all (also where own keys are off). |
+| 401 `provider_key_refused` | "<Provider> refused this key. It may be mistyped, revoked, out of credit, or not allowed to use this model." The provider answered 401, 402, 403 or 404 (a model the key may not use, or one that does not exist, is a 404), Anthropic named the credit balance, or OpenAI answered 429 "exceeded your current quota". |
+| 429 `provider_rate_limited` | "<Provider> is rate limiting this key; try again shortly." No `Retry-After`. |
+| 502 `provider_error` | "<Provider> could not complete the request (<word>)." The word is one of `timeout`, `overloaded`, `http_5xx`, `bad_request`, `refused`, `unreachable`, `bad_answer`, `call_limit`, `error`. The request deadline and the call cap are reported this way too (`timeout`, `call_limit`), not as the site-key codes. |
+
+An extraction answer that cannot be read is 422 as on the site's keys. A pick that
+failed carries one of the same words as its explanation (also `key_refused` and
+`rate_limited`), never the provider's text.
+
+*Turning it off.* `NER_SITE_OWN_PROVIDERS` with an empty value turns own keys off; a
+list keeps only the providers named. Offline mode has none. The log line of a `POST /api/ner`
+that passed the passcode and JSON checks says `provider` and `credential` (`site` or
+`visitor`), also when the credential was then refused.
 
 Tests for the limiter's SQL need a real Postgres and are not part of the default suite.
 With a Postgres URL in `NER_SITE_TEST_DATABASE_URL` and the `psql` client (16 or later)
@@ -488,18 +878,31 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   deadline for the rest; Vercel cuts a run off at 120 s), but nothing stops many
   addresses from sending requests.
 - **Without the Anthropic key, set `NER_SITE_PASSCODE` for a public deployment.**
-  Nothing counts requests there, so anyone who finds the URL can spend the OpenRouter
-  key up to its limit. Share the passcode out of band; the service compares it in
-  constant time. For more, Vercel's firewall rate limiting is an option.
+  Nothing counts requests on the site's keys there, so anyone who finds the URL can
+  spend the OpenRouter key up to its limit. Share the passcode out of band; the service
+  compares it in constant time. For more, Vercel's firewall rate limiting is an option.
 - **With the Anthropic key, the visitor allowance is what makes an open deployment
-  bounded per visitor** (30 requests an hour by default, 10 of them starting on Opus).
-  It bounds one address, not the total: many addresses can still spend the balance,
-  which is why the balance must be the ceiling. It is a rate, not a budget: what one
-  address can spend in an hour is the allowance times the cost of a request (rollout
-  step 5). It needs `DATABASE_URL`; when the database cannot be asked, requests run on
-  Sonnet uncounted (rollout step 7). It exists only with the Anthropic key: removing
-  the key from an open deployment without setting the passcode again leaves the site
-  public and uncounted on the OpenRouter key.
+  bounded per visitor** (by default 30 requests an hour, 10 of them starting on Opus,
+  and 60 a day, 20 of them starting on Opus). It bounds one address, not the total:
+  many addresses can still spend the balance, which is why the balance must be the
+  ceiling. It is a rate, not a budget: what one address can spend in a day is the
+  daily cap times the cost of a request (rollout step 5). It needs `DATABASE_URL`;
+  when the database cannot be asked, requests on the site's keys are refused with 503
+  and none runs uncounted (rollout step 7), so a database outage takes the site's
+  models down rather than opening them. It exists only with the Anthropic key:
+  removing the key from an open deployment without setting the passcode again leaves
+  the site public and uncounted on the OpenRouter key.
+- **A visitor's own key is the visitor's secret, and the site must not keep it.** It
+  arrives in the `Authorization` header of `POST /api/ner`. The code never stores,
+  logs or returns it ("Own keys" above), but the platform in front of the code must
+  not either: confirm that Vercel's logs, log drains and integrations record no
+  request headers before turning own keys on (own-key rollout, steps 2 and 3), and
+  keep `NER_SITE_OWN_PROVIDERS` empty until then. The page keeps the key in session
+  storage, which any script of the origin can read: the Content-Security-Policy
+  below, which allows scripts from the site only, is what protects it, so do not
+  loosen it. Own-key requests cost the operator the term lookup; the flood limit (30
+  an hour, 60 a day per address) bounds that, and does not count while the limiter
+  cannot be asked.
 - The keys live only in the function environment. `/api/health` never returns them, and
   error messages pass URLs through redaction. Do not put a key in `NER_SITE_BASE_URL`.
 - `vercel.json` sends `Content-Security-Policy: default-src 'self'; connect-src
@@ -509,11 +912,14 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   sites cannot call it from a browser.
 - Visitors' text is sent to the model provider (Anthropic for the Claude models;
   OpenRouter and the model's host for the others, and OpenRouter for query embeddings
-  and Jev). The function log records sizes, counts, timings and status only, never the
-  text, the prompt or a key; since 18 November 2026 also the tier a request started on,
-  its step-downs and the model that ran, and never the visitor id or the client
-  address. The page's footer tells visitors that requests are limited per visitor using
-  a salted hash of their IP address, kept for one day.
+  and Jev). With an own key it is sent to the provider the visitor chose, on their
+  key; the entity names still go to OpenRouter on the operator's key for the query
+  embeddings. The function log records sizes, counts, timings and status only, never
+  the text, the prompt or a key; since 18 November 2026 also the tier a request
+  started on, its step-downs, the model that ran, the provider and whose credential
+  it ran on (`site` or `visitor`), and never the visitor id, the client address or
+  any part of a visitor's key. The page's footer tells visitors that requests are
+  limited per visitor using a salted hash of their IP address, kept for one day.
 
 ## Verified
 
@@ -801,8 +1207,104 @@ Not run, and therefore not known:
 - Any Vercel build or deployment with `anthropic` installed, Python 3.12 or 3.10, and
   the cold-start time with the SDK imported.
 
-Known and accepted: while the limiter's database cannot be asked, requests run on
-Sonnet uncounted (step 7).
+Known and accepted when this section was written: while the limiter's database cannot
+be asked, requests run on Sonnet uncounted. That is no longer so: the change recorded
+in the next section refuses them with 503 instead (step 7 as it reads now). The same
+change added the daily cap and replaced the way a server-side refusal fallback is
+recognised, so the fourth item of the list above (the model the API echoes) no longer
+decides whether a false notice appears.
+
+### Own keys and a daily cap, 18 November 2026
+
+**Nothing was deployed, no production variable was changed, and no request was made
+with a real key to Anthropic, OpenAI, OpenRouter, Neon or https://www.xwalk.si.**
+Production still runs the deployment of 4 November. This section records code and
+offline tests only; the live checks are the operator's, in "Rollout: own keys and the
+daily cap" above.
+
+What is implemented (branch `feat/own-key-daily-cap`, on top of the Claude change; how
+it behaves is in "The daily cap", "When the limiter cannot be asked" and "Own keys"
+above, the decisions in docs/ner-site/PLAN.md section 15):
+
+- `ner_site/limits.py`: the daily cap and the own-key tier, in the same table and the
+  same single round trip.
+- `ner_site/providers.py` (new): the credential, the per-request clients for the three
+  providers, the fixed error words.
+- `ner_site/claude.py`, `fallback.py`: the refusal fallback can be switched off, Claude
+  Haiku 5.5 is a known id, and a server-side fallback is recognised by the SDK's
+  signal.
+- `ner_site/service.py`, `http.py`, `schema.py`, `select.py`: the new settings, the
+  `provider` field, admission for both kinds of request, 503 `limits_unavailable`,
+  `own_keys` and the new `visitor` fields in health, `provider` and `credential` in
+  the log line.
+- `public/`: "Run with", the key field and its sentences, the allowance line for the
+  day and for the unavailable limiter.
+- `tools/claude_check.py` (`--provider`, `--key-env`, the own-key tier, the day and
+  the 503 in the burst summary) and the `day`, `unavailable`, `own-refused`, `own-bad`
+  and `own-off` scenarios of `tools/serve_local.py`.
+
+What was run, and nothing more (Python 3.13.3, the repository venv, no key in the
+environment):
+
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1000 passed, 23
+  deselected. Offline only: the fakes of the earlier section, plus `httpx` and
+  `httpx2` mock transports for the three own-key clients. They cover the daily cap
+  at its boundaries (the 20th and 21st Opus start and the 60th and 61st request of a
+  day across hours, midnight UTC, a late request at an hour boundary), the own-key
+  limits apart from the site's, `peek` giving the same numbers; the credential header
+  (missing, repeated, malformed, too long, the key inside the text), each provider's
+  client built with the visitor's key and the fixed host, no redirect followed, no
+  proxy or environment header used, the fixed error sentences with the key echoed in
+  the fake provider's errors, two overlapping requests with different keys; through
+  `handle`, 503 for the site's keys and a successful run for an own key when the
+  limiter fails, own-key requests not counted as site visits, `own_keys` in health,
+  and that a sentinel key appears in no body, header or log line; for the tool, the
+  cases in `tests/test_site_claude_check.py` against a stub on 127.0.0.1.
+- `ruff check` and `ruff format --check` on `src tests scripts ner-site`: passing.
+- `tools/claude_check.py` against `tools/serve_local.py --canned` on 127.0.0.1, with a
+  made-up key, in the plain, `unavailable`, `day`, `own-refused` and `own-off`
+  scenarios (one text and a burst of 3, on the site's keys and with `--provider`): it
+  printed the provider and credential of each run, the 503 and the day refusals in
+  the burst summary, sent nothing in `own-off`, and the canned server logged
+  `authorization=present` for the own-key POSTs only and the key nowhere. Canned
+  answers, so this shows the tool's output and nothing about the service.
+- By the implementing sessions: the 22 `-m integration` tests of
+  `tests/test_site_limits.py` on a throwaway local Postgres 16 (not Neon), with the
+  session in a time zone that has a clock change, among them eight requests racing
+  for the last daily slot; and the page in headless Chromium against the canned
+  scenarios at 1280 and 390 px, light and dark, with a request listener asserting that
+  only `POST /api/ner` carried the key and that it appeared nowhere in the document,
+  the URL, local storage or the console.
+
+Not run, and therefore not known:
+
+- Anything against OpenAI's API: whether `gpt-6-luna` exists there, whether it accepts
+  `max_completion_tokens`, the system role and the two schemas in strict mode, whether
+  JSON comes back inside the token limit, and how long it takes (own-key rollout,
+  step 4).
+- Any real key on any provider, Claude Haiku 5.5 through this adapter, and whether
+  OpenAI's out-of-credit answer still carries the phrase the code looks for.
+- Whether Vercel, its log drains or an integration record request headers (step 2).
+- Whether Chrome or Safari offer to save the key field; Firefox, Safari and a screen
+  reader on the changed page at all (step 7).
+- The daily cap and the 503 on Neon and on a deployment (steps 5 and 6); whether Vercel
+  stores an empty `NER_SITE_OWN_PROVIDERS` (step 1).
+- Python 3.10 and 3.12 (no such interpreter was at hand; the code is checked by ruff
+  against the 3.10 target only), and any Vercel build.
+
+Known and accepted:
+
+- Deploying this code turns own keys on wherever `NER_SITE_OWN_PROVIDERS` is not set
+  to an empty value, and makes `DATABASE_URL` read (and refused when it is not a
+  Postgres URL) on every such deployment that is not offline.
+- A request on the site's keys that carries any `Authorization` header is refused
+  with 400 `bad_credential`. A proxy or client that adds one to every request would
+  break the site.
+- An own Anthropic key gets no retry: one transient failure is a 502.
+- Own-key requests are not counted while the limiter cannot be asked, and a response
+  does not say whether it was counted.
+- On a deployment without the Anthropic key, health has no `visitor` block, so the
+  page cannot show an own-key flood limit before the 429 arrives.
 
 ### For the operator after deploying
 
@@ -810,7 +1312,10 @@ Sonnet uncounted (step 7).
    `OPENROUTER_API_KEY` health still answers 200 with `llm` unavailable and says why;
    `POST /api/ner` then answers 503 `not_configured`, unless `ANTHROPIC_API_KEY` is set,
    in which case only the Claude models are offered. With the Anthropic key also
-   `claude: {"status": "ok"}` and `visitor.limits: "on"`.
+   `claude: {"status": "ok"}` and `visitor.limits: "on"`; `visitor.limits:
+   "unavailable"` there means every request on the site's keys answers 503
+   `limits_unavailable`. `own_keys` says whether visitors' own keys are on, and for
+   which providers and models.
 2. That Vercel passes `self.path` as `/api/ner` and `/api/health` (with any query
    string): anything else gets a 404 `not_found` from `handle`. Also that a POST from the
    page carries `Content-Length` (fetch does; a missing one gets 411 `length_required`).
@@ -820,6 +1325,8 @@ Sonnet uncounted (step 7).
    sizes, counts, timings, status and model, and no text, prompt or key. Where Claude
    is offered it also has `tier`, `fallbacks` and `ran` (the model that extracted), and
    `limits` when the limiter could not be asked; never the visitor id or the address.
+   A `POST /api/ner` also has `provider` and `credential` (`site` or `visitor`), and
+   for a visitor's own key `tier` is `own`; no part of that key is in the line.
    Also note the cold-start time (the first request builds four BM25 indexes in
    `/tmp`).
 5. With `NER_SITE_PASSCODE` set: 401 `passcode_required` without it, 401
