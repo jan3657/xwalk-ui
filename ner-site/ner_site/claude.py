@@ -23,6 +23,16 @@ What the adapter sends, and why it differs from what the engine asks for:
   ``fallbacks`` and ``output_config.format`` on that same call, and its fallback entries
   document how a fallback attempt inherits the request's ``format``, so both are sent
   together. This could not be tried against the live API from the offline tests.
+  ``refusal_fallback=False`` sends neither the parameter nor the beta flag: a request on
+  a visitor's own key (``ner_site.providers``) must not be answered by a substitute
+  model billed to them at another price.
+
+What comes back (docs/superpowers/specs/2026-11-18-own-key-daily-cap-design.md section 8):
+``complete`` returns a :class:`ClaudeResponse`, an ``LLMResponse`` that also says whether
+a server-side fallback model served the answer (``served_by_fallback``, read from the
+SDK's own signal, the ``fallback_message`` entry in ``usage.iterations``). Text written
+before the last ``fallback`` content block belongs to a model that declined and is left
+out of the answer.
 
 One ``complete`` is one Messages request (SDK ``max_retries=0``): retrying and stepping
 down to another model are the fallback chain's job (``ner_site.fallback``), so nothing is
@@ -34,6 +44,7 @@ the API key.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import anthropic
@@ -53,8 +64,15 @@ ADAPTER_VERSION = 1
 
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
+# Known to the adapter and named in notices, but not one of the site's own models: it
+# is offered only to a visitor running on their own Anthropic key (ner_site.providers).
+HAIKU = "claude-haiku-5-5"
 CLAUDE_MODELS: tuple[str, ...] = (OPUS, SONNET)
-DISPLAY_NAMES: dict[str, str] = {OPUS: "Claude Opus 5.5", SONNET: "Claude Sonnet 5.5"}
+DISPLAY_NAMES: dict[str, str] = {
+    OPUS: "Claude Opus 5.5",
+    SONNET: "Claude Sonnet 5.5",
+    HAIKU: "Claude Haiku 5.5",
+}
 
 # Thinking tokens count against max_tokens, so these are far above the engine's own limits.
 EXTRACT_MAX_TOKENS = 16000
@@ -74,6 +92,23 @@ class ClaudeRefused(LLMFatalError):
     """Claude declined the request (``stop_reason: refusal``), after any server fallback."""
 
     reason = "refused"
+
+
+@dataclass(frozen=True)
+class ClaudeResponse(LLMResponse):
+    """What :meth:`ClaudeClient.complete` returns: an ``LLMResponse`` that also carries
+    the SDK's signal that a server-side fallback model served the answer.
+
+    ``served_by_fallback`` is True exactly when ``usage.iterations`` has a
+    ``fallback_message`` entry; ``model`` is then that entry's model. Comparing ``model``
+    with the model asked for cannot tell: a fallback may land on a model the caller also
+    uses, and the API may echo the requested id in another spelling. The flag travels
+    with the answer rather than on the client, so answers to concurrent calls on one
+    client cannot be mixed up. A wrapper that rebuilds the response must keep it
+    (``dataclasses.replace``); a plain ``LLMResponse`` has no such attribute, so read it
+    with ``getattr(response, "served_by_fallback", False)``."""
+
+    served_by_fallback: bool = False
 
 
 # What schema-enforced output takes, read from the SDK's own helper
@@ -330,18 +365,37 @@ def _usage(raw: Any) -> Usage:
     return reported_usage(prompt, getattr(raw, "output_tokens", None))
 
 
-def _served_by(message: Any) -> str | None:
-    """The model that answered, as the response reports it. After a server-side fallback
-    that is the model of the ``fallback_message`` entry in ``usage.iterations`` (the
-    SDK's signal that a fallback model served the response, 2.10.0
-    ``BetaFallbackMessageIterationUsage``); otherwise the response's own ``model``."""
+def _served_by(message: Any) -> tuple[str | None, bool]:
+    """The model that answered, as the response reports it, and whether it is a
+    server-side fallback model. The SDK's signal for the latter is a ``fallback_message``
+    entry in ``usage.iterations`` (2.10.0 ``BetaFallbackMessageIterationUsage``: the
+    terminal entry of a fallback-served turn), whose model is then the one that answered;
+    otherwise it is the response's own ``model``."""
+    model = getattr(message, "model", None)
+    answered = str(model) if model else None
+    fallback = False
     for entry in getattr(getattr(message, "usage", None), "iterations", None) or ():
         if getattr(entry, "type", None) == "fallback_message":
+            fallback = True
             served = getattr(entry, "model", None)
             if served:
-                return str(served)
-    model = getattr(message, "model", None)
-    return str(model) if model else None
+                answered = str(served)
+    return answered, fallback
+
+
+def _answer_text(message: Any) -> str:
+    """The text of the model whose answer this is. A ``fallback`` content block
+    (2.10.0 ``BetaFallbackBlock``) marks the point where a model that declined gives way
+    to the next one, so only the text blocks after the last of them count; with no such
+    block that is every text block."""
+    parts: list[str] = []
+    for block in getattr(message, "content", None) or ():
+        kind = getattr(block, "type", None)
+        if kind == "fallback":
+            parts.clear()
+        elif kind == "text" and isinstance(block.text, str):
+            parts.append(block.text)
+    return "".join(parts)
 
 
 class ClaudeClient:
@@ -359,6 +413,7 @@ class ClaudeClient:
         max_tokens: int,
         effort: str = "low",
         timeout: float = 60.0,
+        refusal_fallback: bool = True,
         client: Any | None = None,
     ) -> None:
         if effort not in EFFORTS:
@@ -367,6 +422,7 @@ class ClaudeClient:
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._effort = effort
+        self._refusal_fallback = refusal_fallback
         self._client = (
             client
             if client is not None
@@ -400,6 +456,9 @@ class ClaudeClient:
                 "model": self._model,
                 "effort": self._effort,
                 "max_tokens": self._max_tokens,
+                # Only when it is off, so every fingerprint from before the switch
+                # existed is unchanged.
+                **({} if self._refusal_fallback else {"refusal_fallback": False}),
             }
         )
 
@@ -415,14 +474,15 @@ class ClaudeClient:
             "max_tokens": self._max_tokens,
             "messages": [{"role": "user", "content": request.user}],
             "output_config": output_config,
-            "fallbacks": "default",
-            "betas": [FALLBACK_BETA],
         }
+        if self._refusal_fallback:
+            arguments["fallbacks"] = "default"
+            arguments["betas"] = [FALLBACK_BETA]
         if request.system:
             arguments["system"] = request.system
         return arguments
 
-    async def complete(self, request: LLMRequest) -> LLMResponse:
+    async def complete(self, request: LLMRequest) -> ClaudeResponse:
         """Send one Messages request. Never retries; errors carry ``reason``."""
         try:
             message = await self._client.beta.messages.create(**self._arguments(request))
@@ -431,7 +491,8 @@ class ClaudeClient:
 
         usage = _usage(getattr(message, "usage", None))
         # Not always the model asked for: ``fallbacks`` lets the API answer from another.
-        answered_by = _served_by(message) or self._model
+        served, fallback = _served_by(message)
+        answered_by = served or self._model
         # The stop reason is read before the content: a refusal may carry no content, or
         # a partial answer that must not be used.
         stop_reason = getattr(message, "stop_reason", None)
@@ -441,18 +502,14 @@ class ClaudeClient:
             raise ClaudeRefused(
                 _scrub(f"{answered_by} declined the request{detail}", self._api_key), usage=usage
             )
-        text = "".join(
-            block.text
-            for block in getattr(message, "content", None) or ()
-            if getattr(block, "type", None) == "text" and isinstance(block.text, str)
-        )
-        return LLMResponse(
-            text=text,
+        return ClaudeResponse(
+            text=_answer_text(message),
             usage=usage,
             model=answered_by,
             structured=request.schema is not None,
             # "length" is what the engine and extract.py recognise as a truncated answer.
             finish_reason="length" if stop_reason == "max_tokens" else stop_reason,
+            served_by_fallback=fallback,
         )
 
     async def aclose(self) -> None:
@@ -497,11 +554,13 @@ __all__ = [
     "DISPLAY_NAMES",
     "EFFORTS",
     "EXTRACT_MAX_TOKENS",
+    "HAIKU",
     "OPUS",
     "SELECT_MAX_TOKENS",
     "SONNET",
     "ClaudeClient",
     "ClaudeRefused",
+    "ClaudeResponse",
     "is_claude",
     "key_status",
     "normalise_schema",

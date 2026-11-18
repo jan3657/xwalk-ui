@@ -17,7 +17,7 @@ import anthropic
 import httpx2
 import pytest
 from ner_site import claude
-from ner_site.claude import ClaudeClient, ClaudeRefused, key_status
+from ner_site.claude import ClaudeClient, ClaudeRefused, ClaudeResponse, key_status
 from ner_site.extract import DEFAULT_PROMPT, build_request, entity_schema
 from xwalk.llm.base import (
     LLMCapabilities,
@@ -97,6 +97,21 @@ def real_sdk(handler: Any) -> anthropic.AsyncAnthropic:
     )
 
 
+def wire_message(model: str, **extra: Any) -> dict[str, Any]:
+    """A Messages response body as the API sends it."""
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": '{"entities": []}'}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 7, "output_tokens": 3},
+        **extra,
+    }
+
+
 def error_body(type_: str, text_: str) -> dict[str, Any]:
     return {"type": "error", "error": {"type": type_, "message": text_}}
 
@@ -108,9 +123,14 @@ def test_constants_and_is_claude() -> None:
     assert claude.OPUS == "claude-opus-5-5"
     assert claude.SONNET == "claude-sonnet-5-5"
     assert claude.CLAUDE_MODELS == (claude.OPUS, claude.SONNET)
+    # Haiku is an id the adapter knows and names, for a visitor's own key; it is not one
+    # of the site's own models.
+    assert claude.HAIKU == "claude-haiku-5-5"
+    assert claude.HAIKU not in claude.CLAUDE_MODELS
     assert claude.DISPLAY_NAMES == {
         "claude-opus-5-5": "Claude Opus 5.5",
         "claude-sonnet-5-5": "Claude Sonnet 5.5",
+        "claude-haiku-5-5": "Claude Haiku 5.5",
     }
     assert claude.EXTRACT_MAX_TOKENS == 16000
     assert claude.SELECT_MAX_TOKENS == 8000
@@ -143,6 +163,9 @@ def test_fingerprint_follows_what_is_sent_and_never_the_key() -> None:
     assert base != make(FakeSDK(), model=claude.SONNET).fingerprint
     assert base != make(FakeSDK(), max_tokens=8000).fingerprint
     assert base != make(FakeSDK(), effort="high").fingerprint
+    # Asking for no server-side fallback is another request; asking for it is the default.
+    assert base == make(FakeSDK(), refusal_fallback=True).fingerprint
+    assert base != make(FakeSDK(), refusal_fallback=False).fingerprint
 
 
 def test_unknown_effort_is_refused_at_construction() -> None:
@@ -372,6 +395,40 @@ async def test_refusal_fallback_is_requested() -> None:
         assert sent["betas"] == ["server-side-fallback-2026-07-01"]
 
 
+async def test_without_refusal_fallback_neither_the_parameter_nor_the_beta_is_sent() -> None:
+    """A visitor's own key is never asked for a substitute model (spec 2026-11-18 own
+    keys, section 5): no ``fallbacks``, and no beta flag, in the arguments or on the wire."""
+    sdk = FakeSDK()
+    await make(sdk, refusal_fallback=False).complete(
+        LLMRequest(system="s", user="u", schema=SCHEMA)
+    )
+    (sent,) = sdk.calls
+    assert "fallbacks" not in sent and "betas" not in sent
+    assert sent["output_config"]["format"] == {"type": "json_schema", "schema": SCHEMA}
+
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json=wire_message(claude.HAIKU))
+
+    client = make(real_sdk(handler), model=claude.HAIKU, refusal_fallback=False)
+    response = await client.complete(LLMRequest(system="s", user="u", schema=SCHEMA))
+    await client.aclose()
+    (request,) = seen
+    body = json.loads(request.content)
+    assert request.url.path == "/v1/messages"
+    assert "anthropic-beta" not in request.headers
+    assert "fallbacks" not in body and "betas" not in body
+    assert body["model"] == claude.HAIKU
+    assert body["output_config"] == {
+        "effort": "low",
+        "format": {"type": "json_schema", "schema": SCHEMA},
+    }
+    assert response.model == claude.HAIKU
+    assert isinstance(response, ClaudeResponse) and response.served_by_fallback is False
+
+
 async def test_the_real_sdk_accepts_and_sends_the_request() -> None:
     """The keyword arguments are real SDK parameters: the body and the beta header the SDK
     builds from them carry structured output and the refusal fallback together."""
@@ -420,7 +477,7 @@ async def test_text_blocks_are_joined_thinking_ignored_and_usage_counts_cache_to
         message(
             SimpleNamespace(type="thinking", thinking="hidden reasoning", signature="x"),
             text('{"entities": '),
-            SimpleNamespace(type="fallback"),
+            SimpleNamespace(type="thinking", thinking="more", signature="y"),
             text("[]}"),
             model=claude.SONNET,
             usage=SimpleNamespace(
@@ -434,9 +491,48 @@ async def test_text_blocks_are_joined_thinking_ignored_and_usage_counts_cache_to
     response = await make(sdk).complete(LLMRequest(system="s", user="u"))
     assert response.text == '{"entities": []}'
     assert response.usage == Usage(prompt_tokens=135, completion_tokens=42, calls=1)
-    # The model that answered, which differs from the requested one after a fallback.
     assert response.model == claude.SONNET
     assert response.finish_reason == "end_turn"
+
+
+def fallback_usage(served: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=100,
+        cache_creation_input_tokens=None,
+        cache_read_input_tokens=None,
+        output_tokens=20,
+        iterations=[
+            SimpleNamespace(type="message", model=claude.OPUS),
+            SimpleNamespace(type="fallback_message", model=served),
+        ],
+    )
+
+
+async def test_text_before_the_last_fallback_block_is_dropped() -> None:
+    """A ``fallback`` content block marks where a model that declined gives way to the
+    next one. What the declined model had written is not part of the answer: joined to
+    the serving model's text it would corrupt the JSON (spec own keys, section 8)."""
+    sdk = FakeSDK(
+        message(
+            text('{"entities": [{"text": "Asp'),
+            SimpleNamespace(type="fallback"),
+            text("I would rather"),
+            SimpleNamespace(type="fallback"),
+            SimpleNamespace(type="thinking", thinking="hidden", signature="x"),
+            text('{"entities": '),
+            text("[]}"),
+            usage=fallback_usage("claude-opus-4-8"),
+        )
+    )
+    response = await make(sdk).complete(LLMRequest(system="s", user="u"))
+    assert response.text == '{"entities": []}'
+    assert isinstance(response, ClaudeResponse) and response.served_by_fallback is True
+    assert response.model == "claude-opus-4-8"
+
+
+async def test_a_fallback_block_with_nothing_after_it_leaves_no_text() -> None:
+    sdk = FakeSDK(message(text("partial"), SimpleNamespace(type="fallback")))
+    assert (await make(sdk).complete(LLMRequest(system="s", user="u"))).text == ""
 
 
 async def test_a_fallback_served_answer_names_the_serving_model() -> None:
@@ -457,6 +553,12 @@ async def test_a_fallback_served_answer_names_the_serving_model() -> None:
     sdk = FakeSDK(message(text("{}"), model=claude.OPUS, usage=usage))
     response = await make(sdk).complete(LLMRequest(system="s", user="u"))
     assert response.model == served
+    # The flag travels with the answer, so concurrent picks cannot mix theirs up.
+    assert isinstance(response, ClaudeResponse) and response.served_by_fallback is True
+    # A fallback onto a model the caller also knows is flagged all the same.
+    sdk = FakeSDK(message(text("{}"), model=claude.OPUS, usage=fallback_usage(claude.SONNET)))
+    again = await make(sdk).complete(LLMRequest(system="s", user="u"))
+    assert (again.model, again.served_by_fallback) == (claude.SONNET, True)  # type: ignore[attr-defined]
     # Without such an entry the answer's own ``model`` stands.
     plain = SimpleNamespace(
         input_tokens=1,
@@ -464,7 +566,49 @@ async def test_a_fallback_served_answer_names_the_serving_model() -> None:
         iterations=[SimpleNamespace(type="message", model="claude-other")],
     )
     sdk = FakeSDK(message(text("{}"), model=claude.OPUS, usage=plain))
-    assert (await make(sdk).complete(LLMRequest(system="s", user="u"))).model == claude.OPUS
+    unflagged = await make(sdk).complete(LLMRequest(system="s", user="u"))
+    assert unflagged.model == claude.OPUS
+    # A differently spelt echo of the requested id is not a fallback.
+    sdk = FakeSDK(message(text("{}"), model="claude-opus-5-5-20260901", usage=plain))
+    echoed = await make(sdk).complete(LLMRequest(system="s", user="u"))
+    for answer in (unflagged, echoed):
+        assert isinstance(answer, ClaudeResponse) and answer.served_by_fallback is False
+
+
+async def test_the_real_sdk_reports_a_fallback_served_answer() -> None:
+    """The names are the SDK's own (2.10.0): a ``fallback`` content block and a
+    ``fallback_message`` entry in ``usage.iterations``, parsed by the real client."""
+    served = "claude-opus-4-8"
+    hop = {"from": {"model": claude.OPUS}, "to": {"model": served}}
+    body = wire_message(
+        claude.OPUS,
+        content=[
+            {"type": "text", "text": '{"entities": [{"te'},
+            {"type": "fallback", **hop, "trigger": {"type": "refusal", "category": "bio"}},
+            {"type": "text", "text": '{"entities": []}'},
+        ],
+        usage={
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "iterations": [
+                {"type": "message", "model": claude.OPUS, "input_tokens": 7, "output_tokens": 1},
+                {
+                    "type": "fallback_message",
+                    "model": served,
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            ],
+        },
+    )
+    client = make(real_sdk(lambda request: httpx2.Response(200, json=body)))
+    response = await client.complete(LLMRequest(system="s", user="u"))
+    await client.aclose()
+    assert response.text == '{"entities": []}'
+    assert response.model == served
+    assert isinstance(response, ClaudeResponse) and response.served_by_fallback is True
 
 
 async def test_missing_usage_is_unknown_not_zero() -> None:
