@@ -1083,9 +1083,15 @@ once the passcode is accepted; "Forget passcode" removes it), and calls one endp
 `GET /api/stats?days=N` with the header `X-Stats-Passcode`. `days` is 1 to 365, default
 30; the page offers 7, 30 and 90. Answers: 401 `stats_passcode_required` or
 `stats_passcode_invalid`; 400 `bad_days` for a `days` outside the range (after the
-passcode check); 404 when analytics is off; 503 `stats_unavailable` when the database
-cannot be read (no usable `DATABASE_URL`, an error, or no answer within 10 s); else
-200 with `totals`, `by_day` (every UTC day of the period, zeros included), `by_model`,
+passcode check); 404 when analytics is off; 503 `stats_unavailable` when the
+statistics cannot be read: no usable `DATABASE_URL`, a database client that cannot be
+built, an error, a step of the exchange that takes longer than 10 s, or an answer in
+which any value is not what it has to be (the days are exactly the UTC days asked for,
+counts are whole numbers that are not negative, words are strings; nothing is passed
+on from an answer that fails this). The 10 s are the client's timeout for each
+operation (connecting, sending, each read), not a deadline for the whole read: a
+database that answers very slowly can keep the request longer, up to the function's
+own limit. Else 200 with `totals`, `by_day` (every UTC day of the period, zeros included), `by_model`,
 `by_code`, `by_fallback` and `by_country`. `by_model` has a row with `model: null` for
 runs no model answered, a row `other` for model names the site does not know, and a
 row `jev` (with `runs: 0`) for what Jev reported; `by_country` has a row with
@@ -1788,7 +1794,7 @@ after the fixes.
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1715 passed, 34
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1765 passed, 34
   deselected (1431 before the fixes). The fixes were written test first. Reproduced
   before the code changed: four requests in a row against a database that never
   answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
@@ -1821,7 +1827,13 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
   client cannot send: the log lines hold the error's class and a SQLSTATE of the
   right form, and nothing of the URL, also with the HTTP library's own logging at
   DEBUG (it logs the reason phrase; its loggers are now silent during the limiter's
-  and the record's database exchanges, as they were during own-key exchanges).
+  and the record's database exchanges, as they were during own-key exchanges). That
+  holds for every logger under `httpx` and `httpcore` that exists when an exchange
+  begins, also with `HTTPS_PROXY` set, where `httpcore.proxy` logs the host it is
+  asked to reach (tested through a local socket standing in for a proxy).
+- A reply to the statistics statement that is right in shape and carries something
+  else in one value (the database host as a day; 42 more cases, one or more for each
+  kind of field) is 503 `stats_unavailable` and nothing of it is returned.
 - A failed run that had stepped down (a paid Opus refusal, then a Sonnet failure) is
   priced as Opus; a row with strings of its own in it adds none to `/api/stats`;
   a dropped table is created again after one lost row; a `DATABASE_URL` with a port

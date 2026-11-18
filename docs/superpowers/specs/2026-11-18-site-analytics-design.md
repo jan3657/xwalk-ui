@@ -207,9 +207,17 @@ The sections above are the design. Where the code differs, this section holds.
 - **Errors and logs.** Of a database failure the site keeps the error's class and a
   SQLSTATE that has the form of one, as the limiter does; the replacement is raised
   outside the handler, so the executor's error (it quotes the server) is neither its
-  cause nor its context. The HTTP libraries' loggers are silent during the limiter's
-  and the record's database exchanges (they log the reason phrase, which can echo
-  the connection string).
+  cause nor its context. Every logger under `httpx` and `httpcore` is silent during
+  the limiter's and the record's database exchanges (they log the reason phrase,
+  which can echo the connection string, and through a proxy the host).
+- **The statistics reply is checked value by value.** The days must be exactly the
+  UTC days asked for, in order (the answer carries the site's own dates, not the
+  reply's); counts are whole JSON numbers from 0 to 10^15, the reported cost a finite
+  number that is not negative; a word is a string (or null where the column may be
+  null) and is then mapped to the site's own. One value that fails makes the reply
+  unreadable: 503 `stats_unavailable`, nothing passed on. The read has the client's
+  per-operation timeouts of 10 s, not a total deadline. An executor that cannot be
+  built is 503 as well.
 - **The table can be provisioned (amends 3.2).** The lazy `CREATE TABLE IF NOT EXISTS`
   stays; two cold instances racing on a database without the table may lose one row.
   `tools/setup_usage.py` creates the schema, the table and the index once from
@@ -261,9 +269,10 @@ The sections above are the design. Where the code differs, this section holds.
   without a country, so that each list's runs add up to every run.
 - **`days` is refused, not clamped (amends 4).** Outside 1 to 365, repeated, signed,
   zero-padded or not a number: 400 `bad_days`, after the passcode check.
-- **The read has its own timeout (amends 3.2).** Reading the statistics waits up to
-  10 s (no retry), so that a Neon compute that has to wake up does not fail the
-  operator's page. Recording keeps 2 s.
+- **The read has its own timeout (amends 3.2).** Reading the statistics uses a
+  client timeout of 10 s for each operation (connecting, sending, each read; no
+  retry), so that a Neon compute that has to wake up does not fail the operator's
+  page. It is not a deadline for the whole read. Recording keeps 2 s.
 - **`visitor_day` of a refused request.** A request refused for its credential is
   counted under the address it came from when that is an IP address, like an admitted
   one; anything else in an address header is not hashed.
