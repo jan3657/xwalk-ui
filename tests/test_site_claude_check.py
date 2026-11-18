@@ -128,6 +128,11 @@ class Stub:
             },
         }
         self.answer: Callable[[dict[str, Any]], Reply] = lambda body: ok_response()
+        # What the limiter counted: merged into ``visitor`` once a POST has arrived, so
+        # that the health read after a burst shows the balances the burst left.
+        self.spent: dict[str, Any] = {}
+        self.health_status = 200
+        self.reply_headers: dict[str, str] = {}
         self.requests: list[tuple[str, str, dict[str, str], dict[str, Any] | None]] = []
         self.lock = threading.Lock()
         self.url = ""
@@ -146,6 +151,8 @@ def stub() -> Iterator[Stub]:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            for name, value in state.reply_headers.items() if self.command == "POST" else ():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(raw)
 
@@ -157,7 +164,11 @@ def stub() -> Iterator[Stub]:
         def do_GET(self) -> None:
             self._record(None)
             if self.path == "/api/health":
-                self._reply(200, state.health)
+                health = dict(state.health)
+                posted = any(method == "POST" for method, _, _, _ in state.requests)
+                if posted and state.spent and isinstance(health.get("visitor"), dict):
+                    health["visitor"] = {**health["visitor"], **state.spent}
+                self._reply(state.health_status, health)
             else:
                 self._reply(404, {"ok": False, "error": {"code": "not_found", "message": "no"}})
 
@@ -475,6 +486,7 @@ def test_burst_counts_where_the_parallel_requests_started(
     stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     stub.health["visitor"].update(opus_left=2, sonnet_left=3)
+    stub.spent = {"opus_left": 0, "sonnet_left": 1, "opus_left_today": 15, "sonnet_left_today": 38}
     stub.answer = _scripted(
         [
             ok_response(),
@@ -509,6 +521,7 @@ def test_burst_counts_where_the_parallel_requests_started(
         "within the allowance health reported before the burst "
         "(opus_left 2, sonnet_left 3, opus_left_today 17, sonnet_left_today 40)"
     ) in out
+    assert "and counted: opus_left 2 -> 0, sonnet_left 3 -> 1" in out
     assert [body for _, body in posts(stub)] == [{"text": "first"}] * 7
 
 
@@ -529,6 +542,7 @@ def test_burst_counts_a_contended_lock_apart_and_does_not_fail_on_it(
     """The tail of a large burst waits too long for the visitor's lock and is refused
     with 429: the limiter doing its work, not the hour being used and not a failure."""
     stub.health["visitor"].update(opus_left=10, sonnet_left=20)
+    stub.spent = {"opus_left": 7}
     stub.answer = _scripted(
         [ok_response()] * 3
         + [error_response(429, "visitor_limit_reached", TOO_MANY)] * 4
@@ -611,7 +625,7 @@ def test_burst_fails_when_there_is_no_allowance_to_compare_with(
     assert code == 1
     # Nothing counted them, so they are starts on no tier.
     assert "started on Opus 0, on Sonnet 0" in out and "not counted 2, failed 0" in out
-    assert "NOTHING TO COMPARE WITH" in out and "within the allowance" not in out
+    assert "INCONCLUSIVE" in out and "within the allowance" not in out
     assert "the 2 requests that ran were not counted" in out
 
 
@@ -661,6 +675,7 @@ def test_burst_fails_when_more_started_on_opus_than_the_allowance_had_left(
     stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     stub.health["visitor"].update(opus_left=2, sonnet_left=20)
+    stub.spent = {"opus_left": 0}
     # Opus admitted three times; one of them stepped down later, which is not an
     # admission on Sonnet.
     mid_request = {"stage": "extract", "from": OPUS, "to": SONNET, "reason": "rate_limited"}
@@ -916,6 +931,7 @@ def test_an_own_key_burst_is_compared_with_the_own_key_balance(
     stub.health["visitor"].update(
         tier="blocked", opus_left=0, sonnet_left=0, own_left=3, own_left_today=3, window="day"
     )
+    stub.spent = {"own_left": 0, "own_left_today": 0}
     stub.answer = _scripted(
         [own_ok()] * 3 + [error_response(429, "visitor_limit_reached", OWN_USED)] * 2
     )
@@ -932,11 +948,13 @@ def test_an_own_key_burst_is_compared_with_the_own_key_balance(
     assert (
         "within the allowance health reported before the burst (own_left 3, own_left_today 3)"
     ) in out
+    assert "and counted: own_left 3 -> 0" in out
     assert all(h["authorization"] == f"Bearer {OWN_KEY}" for h, _ in posts(stub))
     assert [b for _, b in posts(stub)] == [{"text": "a", "provider": "anthropic"}] * 5
     assert OWN_KEY not in out
 
     # One more start than the balance had left.
+    stub.requests.clear()
     stub.answer = lambda body: own_ok()
     assert check.main([*own_argv(stub), "--burst", "4", file]) == 1
     out = capsys.readouterr().out
@@ -944,28 +962,137 @@ def test_an_own_key_burst_is_compared_with_the_own_key_balance(
     assert "within the allowance" not in out
 
 
-@pytest.mark.parametrize("visitor", [None, {"limits": "unavailable", "tier": "blocked"}])
-def test_an_own_key_burst_nothing_counts_has_nothing_to_compare_with(
+def test_an_own_key_burst_the_limiter_cannot_count_is_not_counted(
     stub: Stub,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
-    visitor: dict[str, Any] | None,
 ) -> None:
-    """An own-key request runs when the limiter cannot be asked, uncounted, and health
-    has no ``visitor`` block on a deployment without the Anthropic key."""
+    """An own-key request runs when the limiter cannot be asked, uncounted."""
     monkeypatch.setenv(KEY_ENV, OWN_KEY)
-    if visitor is None:
-        del stub.health["visitor"]
-    else:
-        stub.health["visitor"] = visitor
+    stub.health["visitor"] = {"limits": "unavailable", "tier": "blocked"}
     stub.answer = lambda body: own_ok()
     assert check.main([*own_argv(stub), "--burst", "2", write(tmp_path, "a.txt", "a")]) == 1
     out = capsys.readouterr().out
 
     assert "on the own key 0" in out and "not counted 2, failed 0" in out
-    assert "NOTHING TO COMPARE WITH" in out
-    assert ("only where Claude is offered on the site's keys" in out) == (visitor is None)
+    assert "INCONCLUSIVE" in out and "the 2 requests that ran were not counted" in out
+
+
+def test_an_own_key_burst_without_a_visitor_block_is_inconclusive_not_uncounted(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Health has a ``visitor`` block only where Claude is offered on the site's keys.
+    An OpenRouter-only deployment with a database counts own-key requests all the same:
+    the tool cannot see it, and must neither call the starts uncounted nor pass."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    del stub.health["visitor"]
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), "--burst", "2", write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+
+    assert "on the own key 2" in out and "not counted 0, failed 0" in out
+    assert "INCONCLUSIVE" in out and "no `visitor` block" in out
+    assert "only where Claude is offered on the site's keys" in out
+    assert "were not counted" not in out and "within the allowance" not in out
+
+
+@pytest.mark.parametrize("via", ["site", "own"])
+def test_a_burst_whose_balances_did_not_move_was_not_counted(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    via: str,
+) -> None:
+    """Every request ran and nothing is over the allowance health reported: exactly what
+    a limiter that counts nothing looks like. The balances after the burst decide."""
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.answer = lambda body: own_ok() if via == "own" else ok_response()
+    argv = own_argv(stub) if via == "own" else ["--url", stub.url]
+    assert check.main([*argv, "--burst", "2", write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+
+    tier, key = ("own", "own_left") if via == "own" else ("opus", "opus_left")
+    left = stub.health["visitor"][key]
+    assert (
+        f"NOT COUNTED: 2 requests started on {tier}, but {key} fell by 0 (from {left} to {left})"
+    ) in out
+    assert "within the allowance" not in out
+
+
+def test_one_own_key_run_with_unchanged_balances_does_not_pass_as_a_burst(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.answer = lambda body: own_ok()
+    assert check.main([*own_argv(stub), "--burst", "1", write(tmp_path, "a.txt", "a")]) != 0
+    assert "NOT COUNTED: 1 requests started on own" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("spent", "said"),
+    [
+        # More went than this burst started: it was not alone.
+        ({"opus_left": 2}, "opus_left fell by 5 for 2 starts"),
+        # The clock hour ended between the two health reads.
+        ({"opus_left": 5, "resets_in_s": 3590}, "the hour or the day ended during the burst"),
+        ({"opus_left": 5, "day_resets_in_s": 86390}, "the hour or the day ended during the burst"),
+        # The limiter was not there to be asked afterwards.
+        ({"limits": "unavailable", "tier": "blocked"}, "after the burst"),
+        ({"opus_left": None}, "after the burst"),
+        ({"opus_left": True}, "after the burst"),
+    ],
+)
+def test_a_burst_health_cannot_account_for_is_inconclusive(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    spent: dict[str, Any],
+    said: str,
+) -> None:
+    stub.spent = spent
+    assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE" in out and said in out
+    assert "within the allowance" not in out and "NOT COUNTED" not in out
+
+
+def test_a_burst_on_no_claude_model_has_no_balance_to_show_it(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub.answer = lambda body: ok_response(model=GEMINI, requested=GEMINI)
+    argv = ["--url", stub.url, "--model", GEMINI, "--selector", "retrieval", "--burst", "2"]
+    assert check.main([*argv, write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+    assert "on another model 2" in out and "INCONCLUSIVE" in out
+    assert "no balance for requests that use no Claude model" in out
+
+
+def test_a_claude_unavailable_step_down_does_not_change_the_tier_that_was_charged(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """While Claude is blocked a request starts on the OpenRouter fallback, but the
+    limiter had already counted it on the tier it asked for (``ner_site.http._admit``)."""
+    blocked = {"stage": "admit", "from": OPUS, "to": GEMINI, "reason": "claude_unavailable"}
+    after_used = {"stage": "admit", "from": SONNET, "to": GEMINI, "reason": "claude_unavailable"}
+    data = {"model": GEMINI, "requested_model": OPUS, "requested_selector": "retrieval"}
+    assert check.started_on({**data, "fallbacks": [blocked]}) == "opus"
+    assert check.started_on({**data, "fallbacks": [ADMIT_SONNET, after_used]}) == "sonnet"
+
+    stub.health["visitor"].update(opus_left=2, sonnet_left=20)
+    stub.spent = {"opus_left": 0}
+    stub.answer = lambda body: ok_response(model=GEMINI, fallbacks=(blocked,))
+    assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) == 0
+    out = capsys.readouterr().out
+    assert "started on Opus 2, on Sonnet 0, on another model 0" in out
+    assert "and counted: opus_left 2 -> 0" in out
 
 
 def test_an_own_key_burst_fails_when_the_limiter_stopped_answering_during_it(
@@ -986,7 +1113,8 @@ def test_an_own_key_burst_fails_when_the_limiter_stopped_answering_during_it(
     out = capsys.readouterr().out
 
     assert "on the own key 2" in out
-    assert "THE LIMITER STOPPED ANSWERING" in out and "within the allowance" not in out
+    assert "INCONCLUSIVE" in out and "within the allowance" not in out
+    assert "An own-key request runs uncounted when the limiter cannot be asked" in out
 
 
 def test_the_tool_follows_no_redirect(
@@ -1054,3 +1182,351 @@ def test_help_says_what_a_run_costs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--sequential-delay SECONDS" in out and "--burst N" in out
     assert "a run with an own key bills that key" in out
     assert "--provider {site,anthropic,openai,openrouter}" in out and "--key-env NAME" in out
+
+
+# --- the tool's own handling of the secrets (final review, B4) ---------------------------
+
+# What a secret may look like: a key with a quote and a backslash is 20 to 512 printable
+# ASCII characters; a passcode may also hold spaces.
+QUOTED_KEY = 'sk-own-"quoted"-\\back\\slash-0123456789'
+QUOTED_PASSCODE = 'pass "word" with \\ in it'
+
+
+def spellings(secret: str) -> list[str]:
+    """The secret as it is, as JSON writes it, as ``repr`` writes it, percent-encoded."""
+    from urllib.parse import quote
+
+    return [secret, json.dumps(secret)[1:-1], repr(secret)[1:-1], quote(secret, safe="")]
+
+
+def assert_unprinted(captured: Any, *secrets: str) -> None:
+    for secret in secrets:
+        for spelling in spellings(secret):
+            assert spelling not in captured.out + captured.err
+
+
+def test_a_loopback_url_is_asked_directly_whatever_proxy_is_configured(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``urllib`` sends an http request for 127.0.0.1 to the proxy the environment
+    names: the key and the passcode would go to another machine in clear text although
+    the URL says this one."""
+    seen: list[str] = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+        def _any(self) -> None:
+            seen.append(f"{self.command} {self.path} {dict(self.headers)}")
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            raw = json.dumps(stub.health).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        do_GET = do_POST = _any
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://127.0.0.1:{proxy.server_address[1]}"
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "https_proxy"):
+        monkeypatch.setenv(name, address)
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", "stub-passcode-value")
+    stub.answer = lambda body: own_ok()
+    try:
+        fresh = _load()  # the tool reads the environment's proxies when it is loaded
+        argv = [*own_argv(stub), "--passcode-env", "CHECK_TEST_PASSCODE"]
+        code = fresh.main([*argv, write(tmp_path, "a.txt", "a")])
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=5)
+        sys.modules[check.__name__] = check
+    capsys.readouterr()
+
+    assert seen == []  # nothing went to the proxy, with or without a secret
+    assert code == 0
+    assert [(m, p) for m, p, _, _ in stub.requests] == [
+        ("GET", "/api/health"),
+        ("POST", "/api/ner"),
+        ("GET", "/api/health"),
+    ]
+
+
+@pytest.mark.parametrize("url", ["http://example.invalid", "http://192.0.2.1:8765"])
+def test_a_passcode_is_not_sent_over_plain_http_to_another_machine(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", "stub-passcode-value")
+    opened: list[object] = []
+    for opener in (check._OPENER, check._DIRECT):
+        monkeypatch.setattr(opener, "open", lambda *a, **k: opened.append(a))
+    with pytest.raises(SystemExit) as raised:
+        check.main(
+            ["--url", url, "--passcode-env", "CHECK_TEST_PASSCODE", write(tmp_path, "a", "a")]
+        )
+    assert raised.value.code == 2
+    assert "--url must be https" in capsys.readouterr().err
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("status", "own_keys"),
+    [
+        # A 503 (a misconfigured site, an error page of a proxy) whose body lists it.
+        (503, {"enabled": True, "providers": [{"id": "anthropic"}]}),
+        (500, {"enabled": True, "providers": [{"id": "anthropic"}]}),
+        # Listed, but own keys are not on.
+        (200, {"enabled": False, "providers": [{"id": "anthropic"}]}),
+        (200, {"providers": [{"id": "anthropic"}]}),
+        (200, {"enabled": "yes", "providers": [{"id": "anthropic"}]}),
+    ],
+)
+def test_an_own_key_is_sent_only_after_a_good_health_that_says_own_keys_are_on(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    own_keys: dict[str, Any],
+) -> None:
+    monkeypatch.setenv(KEY_ENV, OWN_KEY)
+    stub.health_status = status
+    stub.health["own_keys"] = own_keys
+    file = write(tmp_path, "a.txt", "a")
+    assert check.main([*own_argv(stub), file]) == 1
+    assert check.main([*own_argv(stub), "--burst", "2", file]) == 1
+    captured = capsys.readouterr()
+
+    assert "nothing was sent" in captured.out
+    assert [(m, p) for m, p, _, _ in stub.requests] == [("GET", "/api/health")] * 2
+    assert_unprinted(captured, OWN_KEY)
+
+
+def test_secrets_with_quotes_and_backslashes_are_not_printed_in_any_spelling(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The health blocks are printed as JSON, which writes a quote as ``\\"``: a search
+    for the secret in the encoded text finds nothing to replace."""
+    assert check._KEY.fullmatch(QUOTED_KEY)
+    monkeypatch.setenv(KEY_ENV, QUOTED_KEY)
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", QUOTED_PASSCODE)
+    both = f"{QUOTED_KEY} and {QUOTED_PASSCODE}"
+    stub.health["claude"] = {"status": "unavailable", "reason": f"saw {both}", QUOTED_KEY: 1}
+    stub.health["visitor"]["note"] = [both, {"nested": QUOTED_PASSCODE}]
+    stub.health["own_keys"]["providers"][0]["name"] = QUOTED_KEY
+    echoing = own_ok(
+        model=f"model-{QUOTED_KEY}",
+        picks=({"selector": QUOTED_KEY, "status": "failed", "explanation": f"said {both}"},),
+        fallbacks=({"stage": "extract", "from": HAIKU, "to": QUOTED_KEY, "reason": both},),
+    )
+    echoing[1]["timing_ms"][QUOTED_PASSCODE] = 1
+    stub.answer = lambda body: (
+        error_response(401, "provider_key_refused", f"refused {both}")
+        if "bad" in body["text"]
+        else echoing
+    )
+    argv = [*own_argv(stub), "--passcode-env", "CHECK_TEST_PASSCODE"]
+    files = [write(tmp_path, "good.txt", "good"), write(tmp_path, "bad.txt", "bad")]
+    assert check.main([*argv, *files]) == 1
+    assert check.main([*argv, "--burst", "2", files[1]]) == 1
+    captured = capsys.readouterr()
+
+    assert_unprinted(captured, QUOTED_KEY, QUOTED_PASSCODE)
+    assert '"reason": "saw [redacted] and [redacted]"' in captured.out
+    assert "provider_key_refused: refused [redacted] and [redacted]" in captured.out
+    ((headers, _), *_) = posts(stub)
+    assert headers["authorization"] == f"Bearer {QUOTED_KEY}"
+    assert headers["x-passcode"] == QUOTED_PASSCODE
+
+
+@pytest.mark.parametrize(
+    "passcode",
+    [
+        "first line\nSECOND-LINE-of-the-passcode",
+        "carriage\rRETURN-in-the-passcode",
+        "tab\tin-the-passcode-VALUE",
+        "not-ascii-\u017e-in-the-passcode-VALUE",
+        " leading-space-in-the-passcode-VALUE",
+        "trailing-space-in-the-passcode-VALUE ",
+    ],
+)
+def test_a_passcode_that_cannot_be_a_header_is_a_usage_error_that_shows_no_part_of_it(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    passcode: str,
+) -> None:
+    """``http.client`` refuses such a value with an error that quotes it, which used to
+    end the run in a traceback with the passcode in it."""
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", passcode)
+    with pytest.raises(SystemExit) as raised:
+        check.main(
+            ["--url", stub.url, "--passcode-env", "CHECK_TEST_PASSCODE", write(tmp_path, "a", "a")]
+        )
+    captured = capsys.readouterr()
+
+    assert raised.value.code == 2
+    assert "CHECK_TEST_PASSCODE" in captured.err and "printable ASCII" in captured.err
+    assert stub.requests == []
+    for part in (passcode, "SECOND-LINE", "RETURN", "VALUE", "in-the-passcode"):
+        assert part not in captured.out + captured.err
+
+
+def test_a_request_that_cannot_be_built_fails_in_fixed_words(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Should a value that cannot be a header ever get as far as the request, the
+    library's error (which quotes it) is not what is printed."""
+    answer = check.post_text(
+        stub.url,
+        "a",
+        model=None,
+        selector=None,
+        passcode="first\nSECOND-LINE",
+        timeout=5,
+    )
+    assert answer.status == 0 and answer.error == "no request was sent (ValueError)"
+    assert "SECOND-LINE" not in check.line("a.txt", answer)
+    assert stub.requests == []
+
+
+ECHO_SAID = "CREDENTIAL ECHO"
+
+
+def echo_cases() -> list[tuple[str, Any]]:
+    """Where and how a site that mishandles a credential might send it back."""
+    from urllib.parse import quote
+
+    def body(text: str) -> Callable[[Stub], Reply]:
+        return lambda stub: error_response(401, "provider_key_refused", text)
+
+    def header(stub: Stub) -> Reply:
+        stub.reply_headers = {"X-Upstream-Detail": f"key={QUOTED_KEY}"}
+        return error_response(401, "provider_key_refused", "Anthropic refused this key.")
+
+    def in_a_run(stub: Stub) -> Reply:
+        reply = own_ok()
+        reply[1]["warnings"] = [f"upstream said {QUOTED_KEY}"]
+        return reply
+
+    def as_a_field_name(stub: Stub) -> Reply:
+        reply = own_ok()
+        reply[1]["timing_ms"][QUOTED_KEY] = 1
+        return reply
+
+    return [
+        ("in the message", body(f"Anthropic refused {QUOTED_KEY}")),
+        ("percent-encoded", body("refused " + quote(QUOTED_KEY, safe=""))),
+        ("escaped twice", body("refused " + json.dumps(QUOTED_KEY))),
+        ("in a response header", header),
+        ("in a field the tool does not print", in_a_run),
+        ("as a field name", as_a_field_name),
+    ]
+
+
+@pytest.mark.parametrize("case", echo_cases(), ids=lambda case: case[0])
+def test_a_response_that_echoes_the_key_fails_the_run_and_says_so(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, Any],
+) -> None:
+    """The wrong-key rollout check: what the operator reads is redacted, so a clean
+    report cannot show that the response was clean. The tool has to say."""
+    monkeypatch.setenv(KEY_ENV, QUOTED_KEY)
+    reply = case[1](stub)
+    stub.answer = lambda body: reply
+    file = write(tmp_path, "a.txt", "a")
+    assert check.main([*own_argv(stub), file]) == 1
+    captured = capsys.readouterr()
+    assert_unprinted(captured, QUOTED_KEY)
+    (line,) = [row for row in captured.out.splitlines() if row.startswith("a.txt")]
+    assert ECHO_SAID in line
+    assert "totals: 1 requests, 0 ok, 1 failed" in captured.out
+    assert "credential echo check: FAILED, 1 of 3 responses" in captured.out
+
+    assert check.main([*own_argv(stub), "--burst", "2", file]) == 1
+    captured = capsys.readouterr()
+    assert_unprinted(captured, QUOTED_KEY)
+    assert captured.out.count(ECHO_SAID) >= 2 and "failed 2" in captured.out
+
+
+def test_a_refused_key_that_is_not_echoed_is_reported_as_clean(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, QUOTED_KEY)
+    stub.answer = lambda body: error_response(
+        401, "provider_key_refused", "Anthropic refused this key."
+    )
+    assert check.main([*own_argv(stub), write(tmp_path, "a.txt", "a")]) == 1  # the POST failed
+    out = capsys.readouterr().out
+    assert ECHO_SAID not in out
+    assert "FAILED provider_key_refused: Anthropic refused this key." in out
+    assert "credential echo check: none of the 3 responses contained" in out
+
+
+def test_a_health_answer_that_echoes_the_passcode_fails_the_run(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", QUOTED_PASSCODE)
+    stub.health["claude"] = {"status": "ok", "reason": f"saw {QUOTED_PASSCODE}"}
+    argv = ["--url", stub.url, "--passcode-env", "CHECK_TEST_PASSCODE"]
+    assert check.main([*argv, write(tmp_path, "a.txt", "a")]) == 1
+    captured = capsys.readouterr()
+    assert_unprinted(captured, QUOTED_PASSCODE)
+    assert f"health: {ECHO_SAID}" in captured.out
+    assert "credential echo check: FAILED, 2 of 3 responses" in captured.out
+
+
+def test_a_run_without_a_secret_checks_for_no_echo(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert check.main(["--url", stub.url, write(tmp_path, "a.txt", "a")]) == 0
+    assert "credential echo check" not in capsys.readouterr().out
+
+
+def test_a_short_passcode_is_not_mistaken_for_an_echo(
+    stub: Stub,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every answer holds ``"ok"``; a passcode that short cannot be looked for."""
+    monkeypatch.setenv("CHECK_TEST_PASSCODE", "ok")
+    argv = ["--url", stub.url, "--passcode-env", "CHECK_TEST_PASSCODE"]
+    assert check.main([*argv, write(tmp_path, "a.txt", "a")]) == 0
+    out = capsys.readouterr().out
+    assert ECHO_SAID not in out and "credential echo check: not made" in out
+
+
+def test_a_balance_that_rose_during_a_burst_is_inconclusive(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub.spent = {"opus_left": 5, "sonnet_left": 25}
+    assert check.main(["--url", stub.url, "--burst", "2", write(tmp_path, "a.txt", "a")]) != 0
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE: sonnet_left rose from 20 to 25" in out and "NOT COUNTED" not in out

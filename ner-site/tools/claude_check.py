@@ -17,8 +17,10 @@ KEY IS BILLED for every model call of the run (the site still pays for the term 
 and the requests count against the own-key flood limit (by default 30 an hour and 60 a
 day) instead of the allowance. The key is sent to the URL you give, as ``Authorization:
 Bearer``, on the ``POST /api/ner`` requests only: use a URL you trust with it. The tool
-refuses to send it over plain http to anything but this machine, and sends nothing when
-``/api/health`` does not offer that provider.
+sends it only after ``/api/health`` answered 200 with own keys enabled and that provider
+listed. It sends neither the key nor the passcode over plain http to anything but this
+machine, and a URL on this machine is asked directly, never through a proxy the
+environment names.
 
 What it does, and nothing else: one ``GET <url>/api/health`` before and one after, and
 one ``POST <url>/api/ner`` per text, to the URL it is given. It follows no redirect,
@@ -26,7 +28,10 @@ writes no file, and reads only the text files named on the command line and, wit
 ``--passcode-env NAME`` and ``--key-env NAME``, the environment variables so named (the
 passcode is sent as ``X-Passcode``). Neither secret is ever taken from an argument and
 neither is ever printed: should the site echo one, it is replaced by ``[redacted]`` in
-everything this tool prints.
+everything this tool prints, and because a redacted report cannot show that a response
+was clean, the tool says so itself: a response that contains the key or the passcode, in
+its body or a header, is marked ``CREDENTIAL ECHO``, fails the run, and the last line
+of a run that sent a secret says whether any response did.
 
 Usage (standard library only; any Python 3.10 or later)::
 
@@ -44,8 +49,9 @@ it ran on, the model asked for and the model that extracted, the selector, the e
 count, the picks by status and by the model that made them (and why
 any failed), every step-down (``stage:from>to:reason``), the server's ``timing_ms`` and
 the token counts; then the totals, the slowest request and the one with the most
-entities. Exit code 1 if any POST failed, or if a response says it ran on another
-provider or credential than the one asked for; 2 for a usage error.
+entities. Exit code 1 if any POST failed, if a response says it ran on another provider
+or credential than the one asked for, or if a response echoed a secret; 2 for a usage
+error.
 
 ``--burst N`` instead sends N copies of the first text in parallel and reports how many
 started on Opus, on Sonnet, on another model or on the own key, how many were refused
@@ -53,14 +59,25 @@ with 429 (the hour used, the day used, the own-key limit, or too many at once: a
 that waited too long for its turn at the visitor's lock, which is what the tail of a
 large burst should get), how many with 503 ``limits_unavailable`` (the site could not
 count them and so did not run them on its own keys) and how many ran without being
-counted, against the balances ``/api/health`` reported just before (``opus_left``,
-``sonnet_left`` and ``own_left``, each already capped by what is left of the day). A
-start is put under a tier only when health reported the limiter ``on`` before the burst:
-otherwise nothing counted it, and it is reported as not counted. Exit code 1 when more
-started on a tier than its balance had left (the limiter does not serialise one
-visitor's requests), when any request got 503 ``limits_unavailable`` or ran uncounted
-(the limiter is failing), when health reported no balance to compare with, when the
-limiter stopped answering during an own-key burst, or when a request failed otherwise.
+counted. It then checks the limiter from both sides, with the balances ``/api/health``
+reported just before and just after (``opus_left``, ``sonnet_left`` and ``own_left``,
+each already capped by what is left of the day): no more may have started on a tier
+than its balance had left, and each balance must have fallen by the starts on its tier.
+A tier is the one the limiter charged: a request that then started on the OpenRouter
+fallback because Claude was unavailable still counts on the tier it asked for.
+
+Exit code 0 only when both hold. Exit code 1 when more started on a tier than its
+balance had left (the limiter does not serialise one visitor's requests), when a
+balance fell by less than the starts (``NOT COUNTED``), when any request got 503
+``limits_unavailable`` or ran uncounted (the limiter is failing), when a request failed
+otherwise, and also when the run is ``INCONCLUSIVE``: health could not establish the
+count. That is the case when health reported no limiter that was on, before or after;
+when the hour or the day ended during the burst; when a balance fell by more than the
+starts (something else used the same visitor's allowance: run the burst alone); for
+requests that use no Claude model, which no balance shows; and for an own-key burst on
+a deployment whose health has no ``visitor`` block (it has one only where Claude is
+offered on the site's keys), where the own-key limit may well be counting. A burst that
+proves nothing never exits 0.
 """
 
 from __future__ import annotations
@@ -73,6 +90,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -92,6 +110,7 @@ REQUEST_DEADLINE_S = 100  # ner_site.service.REQUEST_DEADLINE_S
 DEFAULT_TIMEOUT_S = 130.0  # Vercel cuts a function off at 120 s
 MAX_BURST = 100
 MAX_MESSAGE_CHARS = 200
+CLAUDE_UNAVAILABLE = "claude_unavailable"  # ner_site.http: a step-down after admission
 # How the messages of the 429s start (ner_site.http._admit); the code is
 # visitor_limit_reached for all of them, and anything else is the hour being used.
 TOO_MANY_AT_ONCE = "too many requests at once"  # the visitor's lock was contended
@@ -102,18 +121,75 @@ LIMITS_UNAVAILABLE = "limits_unavailable"
 SITE = "site"
 OWN_PROVIDERS = ("anthropic", "openai", "openrouter")
 _KEY = re.compile(r"[\x21-\x7e]{20,512}")
-# Where a key may be sent without TLS: this machine (a local server, the tests).
+# What a passcode must be to travel in a header: printable ASCII, as the site requires
+# (ner_site.service), with no space at either end (a server strips those).
+_PASSCODE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+# Where a secret may be sent without TLS: this machine (a local server, the tests).
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+ECHO = (
+    "CREDENTIAL ECHO: this response contained the API key or the passcode this run sent "
+    "(in its body or a header; every copy is printed as [redacted]). A site must never "
+    "send either back: the run has failed"
+)
 
 # What must never be printed (the passcode and the API key of this run), whoever sent
 # it back.
 _REDACTED: list[str] = []
+# A secret shorter than this is still redacted, but a response is not said to echo it:
+# a passcode like "ok" is part of every answer (ner_site.service.MIN_SCRUBBED_CHARS).
+MIN_ECHO_CHARS = 8
 
 
-def _redact(text: str) -> str:
+def _spellings(secret: str) -> list[str]:
+    """`secret` as it is and as an encoder may have written it: JSON (with and without
+    ``\\u`` escapes), Python's ``repr``, percent-encoding. Longest first."""
+    found = {
+        secret,
+        json.dumps(secret)[1:-1],
+        json.dumps(secret, ensure_ascii=False)[1:-1],
+        repr(secret)[1:-1],
+        urllib.parse.quote(secret, safe=""),
+        urllib.parse.quote_plus(secret, safe=""),
+    }
+    return sorted(found, key=len, reverse=True)
+
+
+def _redact(text: str, *, shortest: int = 1) -> str:
     for secret in _REDACTED:
-        text = text.replace(secret, "[redacted]")
+        if len(secret) >= shortest:
+            for spelling in _spellings(secret):
+                text = text.replace(spelling, "[redacted]")
     return text
+
+
+def _holds(text: str) -> bool:
+    """Whether `text` holds a secret of this run (one long enough to look for) in any
+    spelling."""
+    return any(
+        spelling in text
+        for secret in _REDACTED
+        if len(secret) >= MIN_ECHO_CHARS
+        for spelling in _spellings(secret)
+    )
+
+
+def _scrub(data: Any) -> tuple[Any, bool]:
+    """`data` (decoded JSON) with every secret removed from its strings, field names
+    included, and whether there was one. Done on the decoded values, before anything
+    is formatted: once a value is written as JSON a quote in it is ``\\"`` and a
+    search for the secret no longer finds it."""
+    if isinstance(data, str):
+        # A secret too short to look for is left to `say`: taking "ok" out of the
+        # decoded answer would take the answer apart.
+        return _redact(data, shortest=MIN_ECHO_CHARS), _holds(data)
+    if isinstance(data, dict):
+        pairs = [(_scrub(name), _scrub(value)) for name, value in data.items()]
+        clean_dict = {name: value for (name, _), (value, _) in pairs}
+        return clean_dict, any(a or b for (_, a), (_, b) in pairs)
+    if isinstance(data, list):
+        items = [_scrub(item) for item in data]
+        return [item for item, _ in items], any(found for _, found in items)
+    return data, False
 
 
 def say(text: str) -> None:
@@ -129,6 +205,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+# For a URL on this machine: no proxy, whatever the environment or the system settings
+# name. ``urllib`` would otherwise hand an http request for 127.0.0.1 to the proxy, and
+# with it the key and the passcode, in clear text, to another machine.
+_DIRECT = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+
+
+def _opener(url: str) -> urllib.request.OpenerDirector:
+    return _DIRECT if urlsplit(url).hostname in LOOPBACK else _OPENER
 
 
 @dataclass(frozen=True)
@@ -140,6 +224,9 @@ class Answer:
     data: dict[str, Any] | None
     seconds: float
     error: str | None = None
+    # The response held a secret of this run (``ECHO``): a failed request, whatever
+    # its status. ``data`` never holds one: it is scrubbed when it is decoded.
+    echoed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -163,18 +250,33 @@ class Answer:
 def _send(request: urllib.request.Request, timeout: float) -> Answer:
     started = time.monotonic()
     status, raw, error = 0, b"", None
+    headers: Any = None
     try:
-        with _OPENER.open(request, timeout=timeout) as response:
-            status, raw = response.status, response.read()
+        with _opener(request.full_url).open(request, timeout=timeout) as response:
+            status, raw, headers = response.status, response.read(), response.headers
     except urllib.error.HTTPError as exc:  # any status outside 2xx, redirects included
-        status, raw = exc.code, exc.read()
+        status, raw, headers = exc.code, exc.read(), exc.headers
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         # Refused, unresolved, timed out; or an answer that is not HTTP or was cut short
         # (http.client's own errors are not OSErrors).
         reason = getattr(exc, "reason", None) or exc
         detail = _redact(str(reason))[:MAX_MESSAGE_CHARS]
         error = f"no response ({type(reason).__name__}: {detail})"
+    except ValueError as exc:
+        # http.client refuses a header value it cannot send, quoting the value: only
+        # the class is repeated. (main refuses such a passcode or key before this.)
+        error = f"no request was sent ({type(exc).__name__})"
     seconds = time.monotonic() - started
+    # The body as it came (a secret may sit in text that is not JSON, or be escaped
+    # twice) and the headers; the decoded strings are looked at below.
+    echoed = any(
+        _holds(text)
+        for text in (
+            raw.decode("utf-8", "replace"),
+            raw.decode("latin-1"),
+            " ".join(f"{name}: {value}" for name, value in (headers.items() if headers else ())),
+        )
+    )
     data: dict[str, Any] | None = None
     if raw:
         try:
@@ -182,8 +284,10 @@ def _send(request: urllib.request.Request, timeout: float) -> Answer:
         except (UnicodeDecodeError, json.JSONDecodeError):
             error = f"HTTP {status} with a body that is not JSON"
         else:
+            parsed, found = _scrub(parsed)
+            echoed = echoed or found
             data = parsed if isinstance(parsed, dict) else None
-    return Answer(status, data, seconds, error)
+    return Answer(status, data, seconds, error, echoed)
 
 
 def get_health(base: str, *, timeout: float) -> Answer:
@@ -312,17 +416,20 @@ def wrong_credential(answer: Answer, provider: str) -> str | None:
 
 def line(name: str, answer: Answer, provider: str = SITE) -> str:
     head = f"{name}  {answer.status or '---'}  {answer.seconds:.1f}s"
+    echo = f"FAILED {ECHO}  " if answer.echoed else ""
     if answer.ok:
         assert answer.data is not None
         wrong = wrong_credential(answer, provider)
         flag = f"FAILED wrong credential: {wrong}  " if wrong else ""
-        return f"{head}  {flag}{describe(answer.data)}"
-    return f"{head}  FAILED {answer.failure()} (sent as provider {provider})"
+        return f"{head}  {echo}{flag}{describe(answer.data)}"
+    return f"{head}  {echo}FAILED {answer.failure()} (sent as provider {provider})"
 
 
 def print_health(label: str, health: Answer) -> None:
     """The ``claude``, ``visitor`` and ``own_keys`` blocks of ``/api/health`` (absent
     ones say so)."""
+    if health.echoed:
+        say(f"{label}: {ECHO}")
     if health.status != 200 or health.data is None:
         say(f"{label}: FAILED {health.failure()}")
         return
@@ -366,7 +473,7 @@ class Totals:
         self.requests += 1
         if self.slowest is None or answer.seconds > self.slowest[0]:
             self.slowest = (answer.seconds, name, answer)
-        if not answer.ok or wrong_credential(answer, provider):
+        if not answer.ok or answer.echoed or wrong_credential(answer, provider):
             self.failed += 1
             return
         data = answer.data or {}
@@ -425,25 +532,49 @@ class Totals:
 
 
 def started_on(data: dict[str, Any]) -> str:
-    """The tier a request was admitted on: ``opus``, ``sonnet`` or ``other``. It is the
+    """The tier a request was charged on: ``opus``, ``sonnet`` or ``other``. It is the
     model asked for, or the selector asked for when the model is not a Claude id (the
-    site admits by whichever of the two is Claude, the model first), unless an ``admit``
-    step-down moved the start."""
+    site admits by whichever of the two is Claude, the model first), unless the limiter
+    moved the start (an ``admit`` step-down from Opus to Sonnet). A ``claude_unavailable``
+    step-down comes after the limiter has counted the request and changes where it
+    runs, not what it was charged as."""
     model = data.get("requested_model") or data.get("model")
     if not (isinstance(model, str) and model.startswith("claude-")):
         model = data.get("requested_selector") or data.get("selector")
     for note in _fallbacks(data):
-        if note.get("stage") == "admit":
+        if note.get("stage") == "admit" and note.get("reason") != CLAUDE_UNAVAILABLE:
             model = note.get("to")
     return "opus" if model == OPUS else "sonnet" if model == SONNET else "other"
 
 
 def offers(health: Answer, provider: str) -> bool:
-    """Whether ``/api/health`` lists `provider` among the own-key providers."""
-    listed = _block(health.data or {}, "own_keys").get("providers")
-    return isinstance(listed, list) and any(
-        isinstance(p, dict) and p.get("id") == provider for p in listed
+    """Whether ``/api/health`` answered 200 with own keys enabled and `provider` among
+    them. Anything less (an error page with a body that happens to list it, a list
+    with ``enabled`` false or absent) is not a site that said it takes a key."""
+    if health.status != 200 or health.data is None:
+        return False
+    own = _block(health.data, "own_keys")
+    listed = own.get("providers")
+    return (
+        own.get("enabled") is True
+        and isinstance(listed, list)
+        and any(isinstance(p, dict) and p.get("id") == provider for p in listed)
     )
+
+
+def _balances(health: Answer, keys: Sequence[str]) -> dict[str, int] | None:
+    """The balances `keys` and the two resets of a health answer that can be compared
+    with: 200, the limiter on, every one a whole number. None otherwise."""
+    if health.status != 200 or health.data is None:
+        return None
+    visitor = _block(health.data, "visitor")
+    if visitor.get("limits") != "on":
+        return None
+    found = {key: visitor.get(key) for key in (*keys, "resets_in_s", "day_resets_in_s")}
+    if "day_resets_in_s" not in visitor:  # an API from before the daily cap
+        del found["day_resets_in_s"]
+    usable = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in found.values())
+    return {key: int(value) for key, value in found.items()} if usable else None
 
 
 def send_burst(count: int, post: Callable[[], Answer]) -> list[Answer]:
@@ -455,32 +586,40 @@ def send_burst(count: int, post: Callable[[], Answer]) -> list[Answer]:
 def report_burst(
     name: str, answers: Sequence[Answer], before: Answer, after: Answer, provider: str = SITE
 ) -> int:
-    """Say where the parallel requests `answers` started and compare that with the
-    balances `before` (the health answer read just before them) reported; `after` is the
-    health answer read just after. Returns the exit code."""
+    """Say where the parallel requests `answers` started and check that against the
+    balances health reported just before (`before`) and just after (`after`) them: no
+    more starts on a tier than it had left, and each balance down by the starts on its
+    tier. Returns the exit code: 0 only when both were established."""
     count = len(answers)
     own = provider != SITE
-    visitor = _block(before.data or {}, "visitor")
+    visitor = _block(before.data or {}, "visitor") if before.status == 200 else {}
     # Only a limiter that answered can have counted anything. Without this a request
     # that ran while nothing counted it was tallied under the tier it asked for.
     comparable = visitor.get("limits") == "on"
+    # Health has a visitor block only where Claude is offered on the site's keys. An
+    # own-key request is counted wherever there is a database, so without the block
+    # the tool does not know: neither "counted" nor "not counted".
+    unseen = own and before.status == 200 and before.data is not None and not visitor
 
     tiers: Counter[str] = Counter()
     refusals: Counter[str] = Counter()
     uncounted = legacy = unavailable = failed = 0
     unavailable_message = ""
     for answer in answers:
-        if answer.ok:
+        if answer.echoed:
+            failed += 1
+            say(line(name, answer, provider))
+        elif answer.ok:
             assert answer.data is not None
             if wrong_credential(answer, provider):
                 failed += 1
                 say(line(name, answer, provider))
             elif any(f.get("reason") == LIMITS_UNAVAILABLE for f in _fallbacks(answer.data)):
                 legacy += 1
-            elif not comparable:
-                uncounted += 1
-            else:
+            elif comparable or unseen:
                 tiers["own" if own else started_on(answer.data)] += 1
+            else:
+                uncounted += 1
         elif answer.status == 429 and answer.code == "visitor_limit_reached":
             message = str(_block(answer.data or {}, "error").get("message", ""))
             refusals[
@@ -509,8 +648,11 @@ def report_burst(
     )
 
     balances = (("own", "own_left"),) if own else (("opus", "opus_left"), ("sonnet", "sonnet_left"))
-    over = False
+    keys = [key for _, key in balances]
+    over = not_counted = inconclusive = False
+    counted = ""
     if comparable:
+        was, now = _balances(before, keys), _balances(after, keys)
         for tier, key in balances:
             left = visitor.get(key)
             if isinstance(left, int) and tiers[tier] > left:
@@ -519,16 +661,84 @@ def report_burst(
                     f"  OVER THE ALLOWANCE: {tiers[tier]} requests started on {tier}, "
                     f"but {key} was {left} before the burst"
                 )
-    else:
-        say(
-            "  NOTHING TO COMPARE WITH: health reported no visitor block with limits on "
-            "before the burst, so this run says nothing about the allowance"
-            + (f", and the {uncounted} requests that ran were not counted" if uncounted else "")
-            + (
-                " (health reports `visitor` only where Claude is offered on the site's keys)"
-                if own and not visitor
-                else ""
+        if was is None:
+            inconclusive = True
+            say(
+                "  INCONCLUSIVE: health reported the limiter on before the burst but not "
+                f"a usable balance ({', '.join(keys)} and the resets as whole numbers), so "
+                "the starts cannot be compared with anything"
             )
+        elif now is None:
+            inconclusive = True
+            say(
+                "  INCONCLUSIVE: health reported no visitor block with limits on and "
+                "usable balances after the burst, so this run cannot show that the starts "
+                "were counted"
+                + (
+                    ". An own-key request runs uncounted when the limiter cannot be "
+                    "asked, and its response does not say so"
+                    if own
+                    else ""
+                )
+            )
+        elif any(now[reset] > was[reset] for reset in was if reset.endswith("resets_in_s")):
+            inconclusive = True
+            say(
+                "  INCONCLUSIVE: the hour or the day ended during the burst (a reset is "
+                "further away after it than before), so the balances before and after "
+                "are of different windows; run it again"
+            )
+        else:
+            # Requests on no Claude model use the site's total, which can pull both
+            # balances down with it; they are the slack a balance may have fallen by.
+            slack = 0 if own else tiers["other"]
+            for tier, key in balances:
+                fell = was[key] - now[key]
+                if fell < 0:
+                    inconclusive = True
+                    say(
+                        f"  INCONCLUSIVE: {key} rose from {was[key]} to {now[key]} during "
+                        "the burst, which no start explains; run it again"
+                    )
+                elif fell < tiers[tier]:
+                    not_counted = True
+                    say(
+                        f"  NOT COUNTED: {tiers[tier]} requests started on {tier}, but {key} "
+                        f"fell by {fell} (from {was[key]} to {now[key]}): the limiter did "
+                        "not count every start"
+                    )
+                elif fell > tiers[tier] + slack and not failed:
+                    inconclusive = True
+                    say(
+                        f"  INCONCLUSIVE: {key} fell by {fell} for {tiers[tier]} starts "
+                        f"(from {was[key]} to {now[key]}): something else used this "
+                        "visitor's allowance during the burst (another client behind "
+                        "the same address); run the burst alone"
+                    )
+            counted = ", ".join(f"{key} {was[key]} -> {now[key]}" for key in keys)
+        if tiers["other"]:
+            inconclusive = True
+            say(
+                f"  INCONCLUSIVE: {tiers['other']} requests started on another model, and "
+                "health has no balance for requests that use no Claude model: this run "
+                "cannot show that they were counted. Burst with a Claude model or selector"
+            )
+    elif unseen:
+        inconclusive = True
+        say(
+            "  INCONCLUSIVE: health has no `visitor` block (it reports one only where "
+            "Claude is offered on the site's keys), so this run cannot show whether the "
+            f"own-key limit counted the {tiers['own']} requests that ran, or that it "
+            "would stop the next one. The limit itself applies wherever the deployment "
+            "has a database: count the visitor's `own` rows there, or send more requests "
+            "than NER_SITE_OWN_PER_HOUR and look for 429s"
+        )
+    else:
+        inconclusive = True
+        say(
+            "  INCONCLUSIVE: health reported no visitor block with limits on before the "
+            "burst, so this run says nothing about the allowance"
+            + (f", and the {uncounted} requests that ran were not counted" if uncounted else "")
         )
     if unavailable:
         say(
@@ -547,29 +757,20 @@ def report_burst(
             "18 November 2026 (the current code answers 503 instead); the reason is in "
             "the `limits` field of their log lines"
         )
-    stopped = False
-    if own and comparable and _block(after.data or {}, "visitor").get("limits") != "on":
-        stopped = True
-        say(
-            "  THE LIMITER STOPPED ANSWERING: health reported no visitor block with limits "
-            "on after the burst. An own-key request runs uncounted when the limiter cannot "
-            "be asked, and its response does not say so: the starts above may not have "
-            "been counted"
-        )
     if refusals["contended"]:
         say(
             f"  {refusals['contended']} requests were refused because too many arrived at "
             "once: expected for the tail of a large burst, and not counted against the "
             "allowance"
         )
-    bad = bool(failed or over or unavailable or legacy or stopped or not comparable)
-    if comparable and not (over or unavailable or legacy or stopped):
+    bad = bool(failed or over or not_counted or inconclusive or unavailable or legacy)
+    if not bad:
         # The hourly balances are what the starts are compared with; the day's are shown
         # because they cap them (an API from before the daily cap reports none).
-        keys = [key for _, key in balances]
         keys += [f"{key}_today" for key in keys if f"{key}_today" in visitor]
         shown = ", ".join(f"{key} {visitor.get(key)}" for key in keys)
         say(f"  within the allowance health reported before the burst ({shown})")
+        say(f"  and counted: {counted} after it, each down by the starts on its tier")
     return 1 if bad else 0
 
 
@@ -587,7 +788,9 @@ def _parser() -> argparse.ArgumentParser:
             "the others). With --provider and --key-env the model calls are billed to "
             "the API key in that environment variable instead (a run with an own key "
             "bills that key), and the requests count against the own-key flood limit. The "
-            "key is sent to the given URL as Authorization: Bearer; it is never printed."
+            "key is sent to the given URL as Authorization: Bearer; it is never printed. "
+            "A key or a passcode is sent only over https, or to this machine, and a "
+            "response that echoes one fails the run."
         ),
     )
     parser.add_argument("--url", required=True, help="the site, e.g. http://127.0.0.1:8765")
@@ -662,6 +865,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         passcode = os.environ.get(args.passcode_env) or None
         if passcode is None:
             parser.error(f"the environment variable {args.passcode_env} is not set")
+        if _PASSCODE.fullmatch(passcode) is None:  # it must fit a header; never shown
+            parser.error(
+                f"the environment variable {args.passcode_env} does not hold a passcode "
+                "the site could have: printable ASCII on one line, no space at either end"
+            )
     key: str | None = None
     if args.provider == SITE:
         if args.key_env:
@@ -677,8 +885,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"the environment variable {args.key_env} does not hold an API key of 20 to "
                 "512 printable ASCII characters without spaces"
             )
-        if parts.scheme != "https" and parts.hostname not in LOOPBACK:
-            parser.error("--key-env sends an API key: --url must be https (or this machine)")
+    if (passcode or key) and parts.scheme != "https" and parts.hostname not in LOOPBACK:
+        sent = " and ".join(
+            flag for flag, secret in (("--passcode-env", passcode), ("--key-env", key)) if secret
+        )
+        parser.error(f"{sent} sends a secret: --url must be https (or this machine)")
     # Longest first, so that one secret inside the other leaves no remainder behind.
     _REDACTED[:] = sorted((s for s in (passcode, key) if s), key=len, reverse=True)
     texts: list[tuple[str, str]] = []
@@ -704,7 +915,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The key goes nowhere that has not said it takes one.
         say(
             f"FAILED: /api/health at this URL does not offer own keys for {provider} "
-            "(see own_keys above), so nothing was sent and the key did not leave this machine"
+            "(it must answer 200 with own_keys.enabled true and the provider listed; see "
+            "above), so nothing was sent and the key did not leave this machine"
         )
         return 1
 
@@ -727,10 +939,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = report_burst(name, answers, before, after, provider)
     else:
         totals = Totals()
+        answers = []
         for index, (name, text) in enumerate(texts):
             if index and args.sequential_delay:
                 time.sleep(args.sequential_delay)
             answer = post(text)
+            answers.append(answer)
             totals.add(name, answer, provider)
             say(line(name, answer, provider))
             sys.stdout.flush()
@@ -739,6 +953,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         after = get_health(base, timeout=args.timeout)
 
     print_health("health after", after)
+    watched = [secret for secret in _REDACTED if len(secret) >= MIN_ECHO_CHARS]
+    if _REDACTED and not watched:
+        say(
+            f"credential echo check: not made (a passcode of fewer than {MIN_ECHO_CHARS} "
+            "characters is too short to look for in a response)"
+        )
+    elif watched:
+        # The report above is redacted, so it cannot itself show that nothing came back.
+        responses = [before, *answers, after]
+        echoes = sum(1 for answer in responses if answer.echoed)
+        if echoes:
+            code = 1
+            say(
+                f"credential echo check: FAILED, {echoes} of {len(responses)} responses "
+                "contained the API key or the passcode this run sent"
+            )
+        else:
+            say(
+                f"credential echo check: none of the {len(responses)} responses contained "
+                "the API key or the passcode this run sent, in any spelling this tool knows "
+                "(as it is, JSON-escaped, percent-encoded), in a body or a header"
+            )
     return code
 
 
