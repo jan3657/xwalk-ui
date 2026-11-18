@@ -885,7 +885,7 @@ async def _ner(
         dense=response.retrieval["dense"].status if "dense" in response.retrieval else None,
         timing_ms=response.timing_ms,
     )
-    if recorded is not None:  # for the run's row only; the log line is as it was
+    if recorded:  # a run that is being recorded: for its row only, never the log line
         recorded["selector_tokens"] = (
             response.usage.selector_prompt_tokens,
             response.usage.selector_completion_tokens,
@@ -962,7 +962,7 @@ def handle(
         )
     log["status"] = result[0]
     log.setdefault("timing_ms", {})["handle"] = round((time.monotonic() - started) * 1000)
-    if recorded:  # after the response is built; whatever happens, `result` is returned
+    if "address" in recorded:  # after the response is built; `result` is returned as it is
         _record(settings, log, recorded, lowered.get(COUNTRY_HEADER))
     _log(log, settings, extra_secrets)
     return result
@@ -1041,7 +1041,7 @@ def _dispatch(
             for name in limits.ADDRESS_HEADERS
             if name in headers and key not in headers[name]
         }
-    if recorded:
+    if recorded:  # only ever filled above, with the stats passcode set
         recorded["address"] = headers
     if credential is None and not settings.configured:
         raise ServiceError(
