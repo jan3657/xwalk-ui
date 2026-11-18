@@ -56,6 +56,10 @@
     topK: $("top-k"),
     passField: $("passcode-field"),
     passcode: $("passcode"),
+    payer: $("payer"),
+    payerMsg: $("payer-message"),
+    payerRetry: $("payer-retry"),
+    payerSite: $("payer-site"),
     run: $("run"),
     banner: $("banner"),
     error: $("error"),
@@ -81,6 +85,11 @@
     ontologyNames: {},
     providers: [], // own-key providers the API offers; empty when it offers none
     running: false,
+    // Set while it is not settled who pays for the next run: a key kept from earlier
+    // in this tab has not been restored yet ("pending"), could not be because health
+    // did not load ("unknown"), or is for a provider the site no longer offers
+    // ("lost"). Nothing is submitted while it is set; see holdRuns().
+    payer: null,
   };
 
   // ---------- small helpers ----------
@@ -386,22 +395,105 @@
     storageSet(OWN_KEY_ENTRY, "");
   }
 
-  // The "Run with" choice. A key kept from earlier in this tab (a reload) brings its
-  // provider back with it; a kept key for a provider no longer offered is dropped.
-  function fillProviders(health) {
-    state.providers = ownProviders(health);
+  // ---------- who pays ----------
+
+  // A run goes to the site's models unless an own-key provider is chosen, so a choice
+  // that silently falls back to "site" moves the bill from the visitor to the site
+  // (and the visitor's text to a model they did not pick). While a saved own-key
+  // choice is unsettled nothing is submitted, by the button or by the keyboard, and
+  // the visitor is told why. Only an explicit choice lifts it: the saved choice coming
+  // back, "Use the site's models", or another pick under "Run with".
+  function holdRuns(kind, providerId) {
+    // Only a name this page knows is shown; session storage is not trusted further.
+    const known = Object.prototype.hasOwnProperty.call(PROVIDER_NAMES, providerId);
+    const key = known ? `${PROVIDER_NAMES[providerId]} key` : "API key";
+    state.payer = { kind, provider: providerId };
+    if (kind === "pending") {
+      el.payerMsg.textContent = `Checking whether your saved ${key} can still be used on this site. Runs wait for that.`;
+    } else if (kind === "unknown") {
+      el.payerMsg.textContent =
+        `The service status could not be loaded, so this page cannot tell whether your saved ${key} can still be used. ` +
+        'Nothing has run. Try again, or choose "Use the site\'s models" to forget the key and run on the site\'s models (free, limited).';
+    } else {
+      el.payerMsg.textContent =
+        `This site no longer accepts your own ${key}, so the saved key has been forgotten. Nothing has run on the site's models. ` +
+        'Choose "Use the site\'s models" to run on them (free, limited)' +
+        (state.providers.length ? ', or pick another key under "Run with".' : ".");
+    }
+    el.payerRetry.hidden = kind !== "unknown";
+    el.payer.hidden = false;
+    syncRun();
+  }
+
+  function releaseRuns() {
+    state.payer = null;
+    el.payer.hidden = true;
+    el.payerMsg.textContent = "";
+    syncRun();
+  }
+
+  function syncRun() {
+    el.run.disabled = state.running || Boolean(state.payer);
+  }
+
+  function fillProviderOptions() {
     clear(el.provider);
     el.provider.append(h("option", { value: "site", text: "The site's models (free, limited)" }));
     for (const p of state.providers) el.provider.append(h("option", { value: p.id, text: `My ${p.name} key` }));
     el.runWith.hidden = state.providers.length === 0;
+  }
+
+  // The "Run with" choice. A key kept from earlier in this tab (a reload) brings its
+  // provider back with it. A kept key for a provider no longer offered is dropped, and
+  // the visitor is asked before anything runs on the site's models in its place.
+  function fillProviders(health) {
+    state.providers = ownProviders(health);
+    fillProviderOptions();
     const kept = storedKey();
     if (kept && state.providers.some((p) => p.id === kept.provider)) {
       el.provider.value = kept.provider;
       el.ownKey.value = kept.key;
+      releaseRuns();
     } else {
       el.provider.value = "site";
       forgetKey();
+      if (kept) holdRuns("lost", kept.provider);
+      else releaseRuns();
     }
+  }
+
+  function sameProviders(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  // After a later health read: the own-key providers may have changed while the tab
+  // was open. The visitor's choices are kept where they still exist. A provider that
+  // was turned off stops being offered, its key is forgotten (field and session
+  // storage), and nothing runs on the site's models until the visitor chooses that.
+  function reconcileProviders(health) {
+    const next = ownProviders(health);
+    if (sameProviders(next, state.providers)) return;
+    const chosen = currentProvider();
+    const model = el.model.value;
+    const selector = el.selector.value;
+    state.providers = next;
+    fillProviderOptions();
+    if (!chosen) {
+      el.provider.value = "site";
+      return;
+    }
+    if (next.some((p) => p.id === chosen.id)) {
+      el.provider.value = chosen.id;
+      applyProvider();
+      if ([...el.model.options].some((o) => o.value === model)) el.model.value = model;
+      if ([...el.selector.options].some((o) => o.value === selector)) el.selector.value = selector;
+      renderAllowance();
+      return;
+    }
+    forgetKey();
+    el.provider.value = "site";
+    applyProvider();
+    holdRuns("lost", chosen.id);
   }
 
   // Models, selectors and the key field for the current "Run with" choice.
@@ -478,7 +570,7 @@
       if (visitor.window === "day") {
         return { blocked: true, text: "You have used today's requests. They reset at midnight UTC" + (ownOffered ? ", or you can use your own API key." : ".") };
       }
-      return { blocked: true, text: `You have used this hour's requests; ${tryAgain(visitor.resets_in_s)}.` };
+      return { blocked: true, text: `You have used this hour's requests; ${tryAgain(visitor.resets_in_s)}` + (ownOffered ? ", or use your own API key." : ".") };
     }
     // The Sonnet sentence is only true when the allowance is counted, Claude can be
     // reached and the request would use Claude at all.
@@ -503,9 +595,10 @@
     el.modelField.hidden = count === 0 || (count === 1 && !message && !currentProvider());
   }
 
-  // Health is read again after each request so the allowance line stays current. Only
-  // the parts that change between requests are taken: the form keeps the visitor's
-  // choices. A failed read keeps what was shown.
+  // Health is read again after each request so the allowance line stays current, and
+  // so that an open tab learns when a provider was turned off. Only the parts that
+  // change between requests are taken: the form keeps the visitor's choices where they
+  // still exist (reconcileProviders). A failed read keeps what was shown.
   async function refreshHealth() {
     let health;
     try {
@@ -517,7 +610,8 @@
       applyHealth(health);
       return;
     }
-    state.health = { ...state.health, visitor: health.visitor, claude: health.claude };
+    state.health = { ...state.health, visitor: health.visitor, claude: health.claude, own_keys: health.own_keys };
+    reconcileProviders(health);
     renderAllowance();
   }
 
@@ -554,7 +648,11 @@
     }
   }
 
+  // Until health has answered, a key kept from earlier in this tab has no "Run with"
+  // choice to go with it, and a run would go to the site's models: runs are held.
   async function loadHealth() {
+    const kept = storedKey();
+    if (kept) holdRuns("pending", kept.provider);
     try {
       applyHealth(await api("GET", "/api/health"));
     } catch (err) {
@@ -563,6 +661,10 @@
       el.modelField.hidden = true;
       renderLegend();
       updateCounter();
+      // Still kept (the visitor may have chosen the site's models while waiting).
+      const still = storedKey();
+      if (still) holdRuns("unknown", still.provider);
+      else releaseRuns();
     }
   }
 
@@ -866,7 +968,7 @@
 
   function setRunning(on) {
     state.running = on;
-    el.run.disabled = on;
+    syncRun();
     el.run.setAttribute("aria-busy", on ? "true" : "false");
     el.results.setAttribute("aria-busy", on ? "true" : "false");
     el.run.querySelector(".run-label").textContent = on ? "Running…" : "Run";
@@ -874,6 +976,11 @@
 
   async function run() {
     if (state.running) return;
+    // Both ways to submit end here (the button and Ctrl/Cmd+Enter).
+    if (state.payer) {
+      (el.payerRetry.hidden ? el.payerSite : el.payerRetry).focus();
+      return;
+    }
     hideError();
     const text = el.text.value;
     const n = codePointLength(text);
@@ -974,6 +1081,18 @@
   el.provider.addEventListener("change", () => {
     forgetKey();
     applyProvider();
+    releaseRuns(); // the visitor has chosen who pays
+  });
+  el.payerSite.addEventListener("click", () => {
+    forgetKey();
+    el.provider.value = "site";
+    if (state.health) applyProvider();
+    releaseRuns();
+    el.run.focus();
+  });
+  el.payerRetry.addEventListener("click", () => {
+    hideError();
+    loadHealth();
   });
   el.ownKey.addEventListener("input", rememberKey);
   el.forgetKey.addEventListener("click", () => {
