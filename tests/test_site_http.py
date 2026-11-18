@@ -47,8 +47,10 @@ Handled = tuple[int, dict[str, str], bytes]
 
 @pytest.fixture(autouse=True)
 def _no_key_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Health asks OpenRouter about the key; offline tests never reach the network."""
+    """Health asks OpenRouter and Anthropic about their keys; offline tests never reach
+    the network (and never build an SDK client)."""
     monkeypatch.setattr(http_mod, "check_key", lambda settings: None)
+    monkeypatch.setattr(http_mod, "check_claude_key", lambda settings: None)
 
 
 def test_health_reports_what_the_key_check_found(
@@ -1626,3 +1628,125 @@ def test_only_the_anthropic_key_is_a_configured_site(cache_dir: Path, tmp_path: 
     bare = _settings(cache_dir, tmp_path)
     message = _json(_ask(bare, claude=_no_claude))["error"]["message"]
     assert "ANTHROPIC_API_KEY" in message and "OPENROUTER_API_KEY" in message
+
+
+# --- health: claude and visitor (spec section 6) -----------------------------------
+
+
+def _health_of(settings: Settings, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    result = http_mod.handle(
+        "GET",
+        "/api/health",
+        dict(VISITOR_HEADERS if headers is None else headers),
+        b"",
+        settings=settings,
+    )
+    assert result[0] == 200, result[2]
+    assert RAW_IP.encode() not in result[2]
+    return _json(result)
+
+
+def test_health_reports_claude_and_the_calling_visitors_allowance(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    s = _open_site(cache_dir, tmp_path)
+    health = _health_of(s)
+    assert health["default_model"] == OPUS and health["default_selector"] == OPUS
+    assert health["models"][:2] == [OPUS, SONNET] and health["passcode_required"] is False
+    assert health["claude"] == {"status": "ok"} and health["llm"] == {"status": "ok"}
+    visitor = health["visitor"]
+    assert set(visitor) == {"limits", "tier", "opus_left", "sonnet_left", "resets_in_s"}
+    assert (visitor["limits"], visitor["tier"]) == ("on", "opus")
+    assert (visitor["opus_left"], visitor["sonnet_left"]) == (10, 20)
+    assert 1 <= visitor["resets_in_s"] <= 3600
+    assert visits.rows == {}  # looking records nothing
+
+    for _ in range(3):
+        _ask(s)
+    assert _health_of(s)["visitor"]["opus_left"] == 7
+    for _ in range(7):
+        _ask(s)
+    used = _health_of(s)["visitor"]
+    assert (used["tier"], used["opus_left"], used["sonnet_left"]) == ("sonnet", 0, 20)
+    for _ in range(20):
+        _ask(s)
+    blocked = _health_of(s)["visitor"]
+    assert (blocked["limits"], blocked["tier"]) == ("on", "blocked")
+    assert (blocked["opus_left"], blocked["sonnet_left"]) == (0, 0)
+    assert _tiers(visits) == {"opus": 10, "sonnet": 20}
+    # The allowance is the caller's own.
+    other = _health_of(s, {"x-real-ip": "198.51.100.9"})["visitor"]
+    assert (other["tier"], other["opus_left"]) == ("opus", 10)
+
+
+def test_health_says_why_claude_is_unavailable(
+    cache_dir: Path, tmp_path: Path, visits: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ner_site import fallback
+    from ner_site.schema import RetrieverStatus
+
+    s = _open_site(cache_dir, tmp_path)
+    refused = RetrieverStatus(status="unavailable", reason="key refused")
+    monkeypatch.setattr(http_mod, "check_claude_key", lambda settings: refused)
+    assert _health_of(s)["claude"] == {"status": "unavailable", "reason": "key refused"}
+
+    # What a request met is known without asking again, and wins while it is remembered.
+    def never(settings: Settings) -> Any:
+        pytest.fail("the key was checked while Claude is known to be unusable")
+
+    monkeypatch.setattr(http_mod, "check_claude_key", never)
+    fallback.block_claude("balance_exhausted")
+    assert _health_of(s)["claude"] == {"status": "unavailable", "reason": "balance exhausted"}
+    fallback.block_claude("key_refused")
+    assert _health_of(s)["claude"] == {"status": "unavailable", "reason": "key refused"}
+
+
+def test_health_without_the_anthropic_key_offers_no_claude_and_no_allowance(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def never(settings: Settings) -> Any:
+        pytest.fail("no Anthropic key, nothing to check")
+
+    monkeypatch.setattr(http_mod, "check_claude_key", never)
+    s = _settings(
+        cache_dir,
+        tmp_path,
+        OPENROUTER_API_KEY=SENTINEL_KEY,
+        NER_SITE_PASSCODE=PASSCODE,
+        DATABASE_URL=DB_URL,
+        NER_SITE_SELECTOR="",
+    )
+    health = _health_of(s)
+    assert health["claude"] == {"status": "unavailable", "reason": "key not set"}
+    assert "visitor" not in health and health["llm"] == {"status": "ok"}
+    assert health["models"] == [GEMINI, "openai/gpt-6-luna"] and health["default_model"] == GEMINI
+    assert health["selectors"] == ["retrieval", "jev", GEMINI, "openai/gpt-6-luna"]
+    assert health["default_selector"] == "jev" and health["passcode_required"] is True
+    offline = _health_of(_open_site(cache_dir, tmp_path, NER_SITE_OFFLINE="1"))
+    assert "claude" not in offline and "visitor" not in offline
+
+
+def test_health_with_the_limiter_unreachable_or_off(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    from xwalk.retrieval.postgres import PostgresError
+
+    visits.fail = PostgresError("could not reach Neon at ep-x-pooler", code="08006")
+    down = _health_of(_open_site(cache_dir, tmp_path))["visitor"]
+    assert (down["limits"], down["tier"]) == ("unavailable", "sonnet")
+    assert (down["opus_left"], down["sonnet_left"]) == (0, 20) and down["resets_in_s"] >= 1
+    off = _health_of(_open_site(cache_dir, tmp_path, DATABASE_URL=""))["visitor"]
+    assert (off["limits"], off["tier"], off["opus_left"]) == ("off", "sonnet", 0)
+    private = _open_site(cache_dir, tmp_path, DATABASE_URL="", NER_SITE_PASSCODE=PASSCODE)
+    unmetered = _health_of(private)["visitor"]
+    assert (unmetered["limits"], unmetered["tier"]) == ("off", "opus")
+    assert (unmetered["opus_left"], unmetered["sonnet_left"]) == (10, 20)
+
+
+def test_health_with_only_the_anthropic_key(cache_dir: Path, tmp_path: Path) -> None:
+    health = _health_of(_open_site(cache_dir, tmp_path, OPENROUTER_API_KEY="", DATABASE_URL=""))
+    assert health["models"] == [OPUS, SONNET] and health["selectors"] == ["retrieval", OPUS, SONNET]
+    assert health["claude"] == {"status": "ok"}
+    assert health["llm"]["status"] == "unavailable"
+    assert "OPENROUTER_API_KEY is not set" in health["llm"]["reason"]
+    assert "503" not in health["llm"]["reason"]  # the site runs, on Claude alone

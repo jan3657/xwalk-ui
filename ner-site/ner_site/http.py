@@ -58,6 +58,7 @@ from ner_site.schema import (
 )
 from ner_site.select import JEV, RETRIEVAL_ONLY
 from ner_site.service import (
+    BLOCK_TEXT,
     ENV_NAMES,
     EXTRACT,
     SELECT,
@@ -65,6 +66,7 @@ from ner_site.service import (
     Settings,
     SettingsError,
     chain_models,
+    check_claude_key,
     check_key,
     make_chain,
     make_decider,
@@ -353,7 +355,50 @@ def _catalog(settings: Settings, indexes: Mapping[str, Any]) -> list[dict[str, A
     )
 
 
-def _health(settings: Settings) -> dict[str, Any]:
+def _claude_health(settings: Settings) -> RetrieverStatus:
+    """Whether a request can run on Claude now: the key is set, no request of this warm
+    instance has met an exhausted balance or a refused key in the last minutes, and
+    Anthropic accepts the key (one free call, remembered)."""
+    if settings.anthropic_api_key is None:
+        return RetrieverStatus(status="unavailable", reason="key not set")
+    blocked = fallback.claude_block()
+    if blocked is not None:
+        return RetrieverStatus(status="unavailable", reason=BLOCK_TEXT.get(blocked, blocked))
+    return check_claude_key(settings) or RetrieverStatus(status="ok")
+
+
+def _visitor_health(settings: Settings, headers: Mapping[str, str]) -> dict[str, Any]:
+    """The calling visitor's allowance as ``limits.peek`` reads it (nothing is
+    recorded): ``tier`` is where a request for Opus would start now. With the limiter
+    unreachable or off there are no counts: the numbers then say what `_admit` would
+    do, Sonnet uncounted, or the whole allowance on a private (passcode) deployment."""
+    allowance = settings.allowance
+    state = "off"
+    try:
+        limiter = _visitor_limits(settings)
+        if limiter is not None:
+            seen = limiter.peek(_visitor(settings, headers))
+            return {
+                "limits": "on",
+                "tier": seen.tier,
+                "opus_left": seen.opus_left,
+                "sonnet_left": seen.sonnet_left,
+                "resets_in_s": seen.resets_in_s,
+            }
+    except limits.LimitsUnavailable:
+        state = "unavailable"
+    unmetered = state == "off" and settings.passcode is not None
+    now = _now()
+    return {
+        "limits": state,
+        "tier": "opus" if unmetered else "sonnet",
+        "opus_left": allowance.opus_per_hour if unmetered else 0,
+        "sonnet_left": allowance.sonnet_per_hour,
+        "resets_in_s": max(1, math.ceil(limits.HOUR_S - now % limits.HOUR_S)),
+    }
+
+
+def _health(settings: Settings, headers: Mapping[str, str]) -> dict[str, Any]:
     indexes = get_indexes(settings.index_settings())
     health = HealthResponse(
         mode=settings.mode,
@@ -374,11 +419,23 @@ def _health(settings: Settings) -> dict[str, Any]:
     elif settings.api_key is None:
         llm = RetrieverStatus(
             status="unavailable",
-            reason="OPENROUTER_API_KEY is not set; POST /api/ner answers 503 not_configured",
+            reason="OPENROUTER_API_KEY is not set; "
+            + (
+                "only the Claude models are offered"
+                if settings.configured
+                else "POST /api/ner answers 503 not_configured"
+            ),
         )
     else:
         llm = check_key(settings) or RetrieverStatus(status="ok")
     data["llm"] = llm.model_dump(mode="json")
+    # Not in HealthResponse either (spec 2026-11-18 section 6): the Anthropic key's
+    # status, and where Claude is offered the calling visitor's allowance. Offline mode
+    # spends no key and counts no visitor, so it reports neither.
+    if not settings.offline:
+        data["claude"] = _claude_health(settings).model_dump(mode="json")
+    if settings.claude_offered:
+        data["visitor"] = _visitor_health(settings, headers)
     # Not in HealthResponse either: where the terms and indexes come from.
     data["backend"] = settings.backend
     if settings.backend == "neon":
@@ -542,7 +599,7 @@ def _dispatch(
             status=405,
         )
     if path == HEALTH_PATH:
-        return 200, _headers(), _json_body(_health(settings), settings)
+        return 200, _headers(), _json_body(_health(settings, headers), settings)
 
     if len(body) > settings.limits.max_body_bytes:
         raise ServiceError(
