@@ -49,7 +49,8 @@ tokens at the selector that was asked for when it is a model, and a cost the pro
 itself reported (Jev) is added where the selector has no price of its own, on a row of
 ``by_model`` named after that selector (``jev``), so that the rows' dollars add up to
 the total. A run that failed after a model had answered keeps the tokens its failure
-carried and the model that was asked, and is priced like any other. A run on the
+carried, under the model the request asked for (which can only overstate it: a chain
+steps down to cheaper models), and is priced like any other. A run on the
 site's keys counts once in ``unpriced_runs`` when either of its stages has no price:
 the model that extracted, or a model selector whose provider reported no cost. It is
 an estimate; the provider's console is the bill.
@@ -175,6 +176,7 @@ REASONS = frozenset(
 _IDENT = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SQLSTATE = re.compile(r"[0-9A-Z]{5}")
 _COUNTRY = re.compile(r"[A-Z]{2}")
+_UNDEFINED_TABLE = "42P01"  # the SQLSTATE of a statement on a table that is not there
 # What may follow a known model id and its hyphen: a date or a version.
 _SUFFIX = re.compile(r"[0-9][0-9-]{0,15}")
 
@@ -437,10 +439,13 @@ def run_of(
     (``other`` is one of the four).
 
     ``model`` is the model that produced the extraction (as in the response), so it is
-    null for a run that did not get that far. ``failed`` (``model``, ``llm_calls``,
+    null for a run that did not get that far. ``failed`` (``llm_calls``,
     ``prompt_tokens``, ``completion_tokens``) is read for a run that did not end in a
     200: its calls are counted, and when any of them reported tokens those are kept
-    with the model that was asked, so that a failure that was paid for is priced."""
+    under the model the request asked for, so that a failure that was paid for is
+    priced. The tokens are the sum over every model the chain tried, and nothing says
+    which model used which; the chain only steps down to cheaper models, so the
+    requested model's price can overstate such a run and never understate it."""
     known = _MODELS | frozenset(models)
     status = _whole(log.get("status")) or 0
     requested = _model_of(log.get("model"), known)
@@ -464,7 +469,7 @@ def run_of(
         prompt_tokens = _whole(failed.get("prompt_tokens"))
         completion_tokens = _whole(failed.get("completion_tokens"))
         if prompt_tokens is not None or completion_tokens is not None:
-            ran = _model_of(failed.get("model"), known)
+            ran = requested
     return Run(
         at=datetime.fromtimestamp(at, tz=timezone.utc).isoformat(),
         visitor_day=visitor_day,
@@ -508,15 +513,23 @@ def _usd(model: str | None, prompt: int, completion: int) -> float:
     return 0.0 if price is None else (prompt * price[0] + completion * price[1]) / 1_000_000
 
 
-def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
+def shape(
+    raw: Any, *, days: int, generated_at: float, models: Collection[str] = ()
+) -> dict[str, Any]:
     """The answer of ``GET /api/stats`` (design section 4) from the document the
     statistics statement returns (a JSON string, or the object an executor parsed it
     into). Raises ``KeyError``, ``TypeError`` or ``ValueError`` on a document that is
-    not that statement's."""
+    not that statement's.
+
+    Every string of the answer goes through the mapping a row's strings go through
+    when it is written (``run_of``; ``models`` as there): a row may be older than that
+    rule or written by hand, and what it holds must not reach the answer either.
+    Groups that become the same word are added up."""
     if isinstance(raw, str):
         raw = json.loads(raw)
     if not isinstance(raw, Mapping):
         raise TypeError("the statistics document is not an object")
+    known = _MODELS | frozenset(models)
 
     day_usd: dict[str, float] = {}
     models: dict[tuple[str, str], dict[str, Any]] = {}
@@ -536,8 +549,10 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         )
 
     for group in raw["spend"]:
-        day, credential = str(group["day"]), str(group["credential"])
-        model, selector = group["model"], group["selector"]
+        day = str(group["day"])
+        credential = _one_of(group["credential"], _CREDENTIALS) or OTHER
+        model = _model_of(group["model"], known)
+        selector = _model_of(group["selector"], known)
         runs = _count(group["runs"])
         prompt, completion = _count(group["prompt_tokens"]), _count(group["completion_tokens"])
         picked_prompt = _count(group["selector_prompt_tokens"])
@@ -552,7 +567,7 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         is_model = selector is not None and selector not in _NOT_MODELS
         # A run that reached no model (refused, or failed first) is in the row whose
         # model is null, so that the rows' runs add up to every run.
-        row = row_of(None if model is None else str(model), credential)
+        row = row_of(model, credential)
         row["runs"] += runs
         row["prompt_tokens"] += prompt
         row["completion_tokens"] += completion
@@ -575,7 +590,7 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         # that the rows' dollars add up to the total.
         named = selector is not None and selector != RETRIEVAL_ONLY
         if named and (picked_prompt or picked_completion or extra):
-            row = row_of(str(selector), credential)
+            row = row_of(selector, credential)
             row["prompt_tokens"] += picked_prompt
             row["completion_tokens"] += picked_completion
             if site:
@@ -614,14 +629,14 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
     for row in by_model:
         row["estimated_usd"] = round(row["estimated_usd"], USD_DIGITS)
 
-    def counted(name: str, key: str) -> list[dict[str, Any]]:
-        return [
-            {
-                key: None if found[key] is None else str(found[key]),
-                "runs": _count(found["runs"]),
-            }
-            for found in raw[name]
-        ]
+    def counted(name: str, key: str, word: Callable[[Any], str | None]) -> list[dict[str, Any]]:
+        found: dict[str | None, int] = {}
+        for item in raw[name]:
+            value = word(item[key])
+            found[value] = found.get(value, 0) + _count(item["runs"])
+        # As the statement orders them: most runs first, then by name, null last.
+        ordered = sorted(found.items(), key=lambda kv: (-kv[1], kv[0] is None, kv[0] or ""))
+        return [{key: value, "runs": runs} for value, runs in ordered]
 
     stamp = datetime.fromtimestamp(generated_at, tz=timezone.utc)
     return {
@@ -641,9 +656,9 @@ def shape(raw: Any, *, days: int, generated_at: float) -> dict[str, Any]:
         },
         "by_day": by_day,
         "by_model": by_model,
-        "by_code": counted("by_code", "code"),
-        "by_fallback": counted("by_fallback", "reason"),
-        "by_country": counted("by_country", "country"),
+        "by_code": counted("by_code", "code", lambda v: _one_of(v, CODES) or OTHER),
+        "by_fallback": counted("by_fallback", "reason", lambda v: _one_of(v, REASONS) or OTHER),
+        "by_country": counted("by_country", "country", country_of),
     }
 
 
@@ -687,10 +702,12 @@ class SiteRuns:
         document = json.dumps(asdict(run), ensure_ascii=False, allow_nan=False)
         self._send((self._insert, (document,)))
 
-    def stats(self, days: int = DEFAULT_DAYS) -> dict[str, Any]:
+    def stats(self, days: int = DEFAULT_DAYS, *, models: Collection[str] = ()) -> dict[str, Any]:
         """The statistics of the last ``days`` UTC days, today included (1 to
-        ``MAX_DAYS``, else ``ValueError``): one round trip. Raises ``UsageUnavailable``
-        when the database cannot be asked or its answer cannot be read."""
+        ``MAX_DAYS``, else ``ValueError``): one round trip. ``models`` are the ids the
+        deployment lists (``run_of``): a model the table names that is none of them
+        is ``other`` in the answer. Raises ``UsageUnavailable`` when the database
+        cannot be asked or its answer cannot be read."""
         if type(days) is not int or not 1 <= days <= MAX_DAYS:
             raise ValueError(f"days must be a whole number from 1 to {MAX_DAYS}")
         now = self._clock()
@@ -698,7 +715,7 @@ class SiteRuns:
         first = last - timedelta(days=days - 1)
         rows = self._send((self._stats, (first.isoformat(), last.isoformat())))
         try:
-            answer = shape(rows[0]["stats"], days=days, generated_at=now)
+            answer = shape(rows[0]["stats"], days=days, generated_at=now, models=models)
             if len(answer["by_day"]) != days:
                 raise ValueError("the statistics do not cover the days asked for")
         except (LookupError, TypeError, ValueError):
@@ -715,6 +732,11 @@ class SiteRuns:
                 lead: list[Statement] = [(self._create, ()), (self._index, ())]
                 rows = self._executor.transaction([*lead, statement])[-1]
         except Exception as exc:
-            raise _unavailable(exc) from None
+            failure = _unavailable(exc)
+            if failure.code == _UNDEFINED_TABLE:
+                # The table this instance created is gone (dropped to delete the data).
+                # This statement is lost; the next one creates the table again.
+                self._created = False
+            raise failure from None
         self._created = True
         return rows

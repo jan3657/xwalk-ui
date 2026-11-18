@@ -3813,25 +3813,29 @@ def test_a_stats_answer_that_echoed_a_secret_would_still_be_scrubbed(
     store = next(iter(http_mod._USAGE.values()))
     leaky = {"ok": True, "note": f"{STATS_PASSCODE} {ANTHROPIC_KEY} {DB_URL}"}
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(store, "stats", lambda days: leaky)
+        patch.setattr(store, "stats", lambda days, **options: leaky)
         result = _stats(s)
     assert _json(result) == {"ok": True, "note": "[redacted] [redacted] [redacted]"}
     assert STATS_PASSCODE not in capsys.readouterr().err
 
 
-def test_the_usage_executor_is_the_limiters_kind_with_its_own_timeouts(
+def test_the_usage_executor_never_retries_and_has_a_deadline_of_its_own(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recording a run is not idempotent either, and it runs while the visitor waits."""
+    """Recording a run is not idempotent, and it runs while the visitor waits: the
+    executor is the one whose timeout is a wall-clock deadline for the whole call
+    (tests/test_site_deadline.py), not the limiter's, which is as it was."""
+    from ner_site.deadline import DeadlineExecutor
+
     built: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(http_mod, "NeonHTTPExecutor", lambda url, **kw: built.append((url, kw)))
-    monkeypatch.setattr(http_mod, "make_limits_executor", REAL_LIMITS_EXECUTOR)
-    REAL_USAGE_EXECUTOR(DB_URL, http_mod.USAGE_TIMEOUT_S)
-    REAL_USAGE_EXECUTOR(DB_URL, http_mod.STATS_TIMEOUT_S)
-    assert built == [
-        (DB_URL, {"timeout": 2.0, "max_retries": 0}),
-        (DB_URL, {"timeout": http_mod.STATS_TIMEOUT_S, "max_retries": 0}),
-    ]
+    REAL_LIMITS_EXECUTOR(DB_URL)
+    assert built == [(DB_URL, {"timeout": http_mod.LIMITS_TIMEOUT_S, "max_retries": 0})]
+    for timeout in (http_mod.USAGE_TIMEOUT_S, http_mod.STATS_TIMEOUT_S):
+        executor = REAL_USAGE_EXECUTOR(DB_URL, timeout)
+        assert isinstance(executor, DeadlineExecutor)
+        assert repr(executor) == f"DeadlineExecutor(timeout={timeout:g})"
+    assert len(built) == 1
     assert http_mod.USAGE_TIMEOUT_S == 2.0 < http_mod.STATS_TIMEOUT_S <= 15
     assert "make_usage_executor" in http_mod.__all__
 
@@ -4093,56 +4097,6 @@ def test_setting_up_the_store_is_under_the_same_deadline_as_the_write(
     # Once the lock is free the abandoned write goes through and the slot is given back.
     assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0)
     assert len(runs.rows) == 1
-
-
-def test_the_executors_own_timeout_ends_an_abandoned_write(
-    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The real executor against a server that accepts the connection and never
-    answers: nothing releases the write but its own timeout, and the slot comes back."""
-    import socket
-
-    from xwalk.retrieval.postgres import NeonHTTPExecutor
-
-    server = socket.socket()
-    server.bind(("127.0.0.1", 0))
-    server.listen(8)
-    port = server.getsockname()[1]
-    held: list[socket.socket] = []
-
-    def accept() -> None:
-        try:
-            while True:
-                held.append(server.accept()[0])
-        except OSError:
-            return
-
-    threading.Thread(target=accept, daemon=True).start()
-    built: list[float] = []
-
-    def executor(database_url: str, timeout: float) -> Any:
-        built.append(timeout)
-        return NeonHTTPExecutor(
-            database_url,
-            timeout=timeout,
-            max_retries=0,
-            endpoint=f"http://127.0.0.1:{port}/sql",
-            trust_env=False,
-        )
-
-    monkeypatch.setattr(http_mod, "make_usage_executor", executor)
-    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.3)
-    try:
-        s = _plain_stats_site(cache_dir, tmp_path)
-        for _ in range(2):
-            assert _plain_run(s)[0] == 200
-        assert built == [0.3]  # the write's timeout is the wait's
-        assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0)
-        assert len(held) == 2
-    finally:
-        server.close()
-        for connection in held:
-            connection.close()
 
 
 @pytest.mark.parametrize(
@@ -4525,3 +4479,93 @@ def test_the_local_server_hands_the_query_string_to_the_real_handler(
         server.shutdown()
         server.server_close()
     assert seen == ["/api/stats?days=7", "/api/stats", "/api/stats?days=0", "/api/nope?x=1"]
+
+
+# --- analytics fix round 2 ---------------------------------------------------------------
+
+
+def test_a_paid_opus_refusal_then_an_unreported_sonnet_failure_is_priced_as_opus(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    """The re-review's case: the failed run's tokens went to the last model tried, so a
+    million Opus input tokens were booked at the Sonnet price ($2 instead of $4)."""
+    from xwalk.records import Usage
+
+    refused = LLMFatalError("declined", usage=Usage(prompt_tokens=1_000_000, calls=1))
+    refused.reason = "refused"  # type: ignore[attr-defined]
+    s = _stats_site(cache_dir, tmp_path, OPENROUTER_API_KEY="")
+    failed = _ask(
+        s,
+        {"text": HALO_TEXT},
+        claude=_Claude(opus_extract=[refused], sonnet_extract=[LLMFatalError("no answer")]),
+    )
+    assert _error(failed) == (502, "provider_error")
+    (row,) = _recorded(runs)
+    assert (row["requested_model"], row["model"], row["fallback_reasons"]) == (
+        OPUS,
+        OPUS,
+        "refused",
+    )
+    assert (row["llm_calls"], row["prompt_tokens"], row["completion_tokens"]) == (2, 1_000_000, 0)
+    data = _json(_stats(s))
+    assert data["totals"]["estimated_usd"] == 4.0 and data["totals"]["unpriced_runs"] == 0
+    assert [(m["model"], m["runs"], m["estimated_usd"]) for m in data["by_model"]] == [
+        (OPUS, 1, 4.0)
+    ]
+
+
+def test_an_analytics_database_url_with_a_port_that_is_no_number_is_not_kept(
+    cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The re-review's case. The URL passed for usable, so its password was a secret to
+    scrub: with ``retrieval`` as the password, health and the answer showed
+    ``[redacted]`` for the selector, and every run tried to record. No ``runs``
+    fixture: building a usage executor here fails the test (conftest)."""
+    base = {
+        "NER_SITE_CACHE_DIR": str(cache_dir),
+        "NER_SITE_DENSE_DIR": str(tmp_path / "no-dense"),
+        "NER_SITE_SELECTOR": "retrieval",
+        "OPENROUTER_API_KEY": SENTINEL_KEY,
+        "DATABASE_URL": "postgresql://owner:retrieval@ep-x.neon.tech:abc/neondb",
+    }
+    off = http_mod.env_settings(base)
+    on = http_mod.env_settings({**base, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert isinstance(off, Settings) and isinstance(on, Settings)
+    assert on.database_url is None and "retrieval" not in on.secrets()
+    health = _health_of(on)
+    assert health == _health_of(off)
+    assert health["default_selector"] == "retrieval" and health["selectors"][0] == "retrieval"
+    result = _post(on, {"text": "x"}, llm_factory=_fake('{"entities": []}'))
+    assert result[0] == 200 and _json(result)["selector"] == "retrieval"
+    assert b"[redacted]" not in result[2]
+    record = _last_log(capsys)
+    assert record["selector"] == "retrieval" and "usage" not in record
+    assert _error(_stats(on)) == (503, "stats_unavailable")
+
+
+def test_stats_name_only_what_this_deployment_knows_whatever_the_table_holds(
+    cache_dir: Path, tmp_path: Path, visits: Any, runs: Any
+) -> None:
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_MODELS=f"{OPUS},{SONNET},vendor/site-model")
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))[0] == 200
+    (written,) = _recorded(runs)
+    # Rows from before the rule, or put there by hand.
+    runs.rows.append({**written, "model": "vendor/site-model"})
+    runs.rows.append(
+        {
+            **written,
+            "status": 502,
+            "model": "claude-STRAYSENTINEL",
+            "requested_selector": "STRAYSENTINEL",
+            "code": "STRAYSENTINEL code",
+            "fallback_reasons": "STRAYSENTINEL",
+            "country": "STRAYSENTINEL",
+        }
+    )
+    result = _stats(s)
+    assert result[0] == 200 and b"STRAYSENTINEL" not in result[2]
+    data = _json(result)
+    assert {row["model"] for row in data["by_model"]} == {OPUS, "vendor/site-model", "other"}
+    assert data["by_code"] == [{"code": "other", "runs": 1}]
+    assert data["by_fallback"] == [{"reason": "other", "runs": 1}]
+    assert data["by_country"] == [{"country": None, "runs": 3}]

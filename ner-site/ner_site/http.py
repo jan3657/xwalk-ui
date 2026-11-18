@@ -53,6 +53,7 @@ from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
 from ner_site import fake, fallback, limits, providers, usage
 from ner_site.claude import OPUS, SONNET, is_claude
+from ner_site.deadline import DeadlineExecutor
 from ner_site.indexes import OntologyIndex, get_indexes
 from ner_site.ontologies import catalog, full_catalog
 from ner_site.schema import (
@@ -212,18 +213,22 @@ _LIMITS_LOCK = threading.Lock()
 _LIMITS: dict[tuple[str, str, limits.Allowance], limits.VisitorLimits] = {}
 
 
-def make_limits_executor(database_url: str, timeout: float = LIMITS_TIMEOUT_S) -> SQLExecutor:
+def make_limits_executor(database_url: str) -> SQLExecutor:
     """The executor the visitor limiter queries with. Not the indexes' one
     (``indexes.make_executor``): that one retries, and the limiter's statement counts a
     visit, so a retried request could count one visit twice. Tests replace it."""
-    return NeonHTTPExecutor(database_url, timeout=timeout, max_retries=0)
+    return NeonHTTPExecutor(database_url, timeout=LIMITS_TIMEOUT_S, max_retries=0)
 
 
 def make_usage_executor(database_url: str, timeout: float) -> SQLExecutor:
-    """The executor the record of runs is written and read with: the limiter's kind
-    (an insert is no more idempotent than a counted visit) with a timeout of its own.
-    Tests replace it."""
-    return make_limits_executor(database_url, timeout)
+    """The executor the record of runs is written and read with. Like the limiter's it
+    never retries (an insert is no more idempotent than a counted visit). Unlike it,
+    `timeout` is a wall-clock deadline for the whole call, name lookup and full
+    response included, at which the call is cancelled and its connection closed
+    (``deadline.DeadlineExecutor``): the engine's executor limits each read, so a
+    database that answers a byte at a time could hold a recording worker, and its
+    place, without end. Tests replace it."""
+    return DeadlineExecutor(database_url, timeout=timeout)
 
 
 def _now() -> float:
@@ -338,17 +343,17 @@ def _known_models(settings: Settings) -> frozenset[str]:
     )
 
 
-def _failed_calls(recorded: dict[str, Any] | None, exc: BaseException, asked: str) -> None:
+def _failed_calls(recorded: dict[str, Any] | None, exc: BaseException) -> None:
     """Keep, for the row of a run that is being recorded, what the model calls of a
-    failed request are known to have used (``ServiceError.usage``) and the model that
-    was asked. Tokens only when a call reported them: a failure that reported none
-    used an unknown amount, not zero."""
+    failed request are known to have used (``ServiceError.usage``): the sum over every
+    model its chain tried, which the row books under the model the request asked for
+    (``usage.run_of``). Tokens only when a call reported them: a failure that
+    reported none used an unknown amount, not zero."""
     carried = getattr(exc, "usage", None)
     if not recorded or not isinstance(carried, Usage) or carried.calls <= 0:
         return
     reported = carried.calls > carried.unknown_calls
     recorded["failed"] = {
-        "model": asked,
         "llm_calls": carried.calls,
         "prompt_tokens": carried.prompt_tokens if reported else None,
         "completion_tokens": carried.completion_tokens if reported else None,
@@ -375,12 +380,13 @@ def _record(
 
     Everything that can wait happens in a thread of its own, and this waits for that
     thread no longer than ``USAGE_TIMEOUT_S``: finding or building the store (behind a
-    lock the instance's requests share) and the insert alike. A write that is abandoned
-    ends in the background of a warm instance when the executor's own timeout (the same
-    number of seconds) is up. Until then it holds one of ``USAGE_MAX_IN_FLIGHT``
-    places; with all of them taken a run is not recorded and does not wait
-    (``usage: "saturated"``), so a database that hangs costs an instance four threads
-    and connections, not one per request."""
+    lock the instance's requests share) and the insert alike. The executor ends the
+    insert itself when the same number of seconds is up, on the clock, whatever the
+    database does (``make_usage_executor``), so the thread is over, and its place free,
+    when the wait is. A place is one of ``USAGE_MAX_IN_FLIGHT``; with all of them
+    taken a run is not recorded and does not wait (``usage: "saturated"``). That cap
+    is what bounds an executor that does not keep a deadline (a test's, or a future
+    one): it costs an instance four threads, not one per request."""
     try:
         if settings.stats_passcode is None or settings.database_url is None:
             return
@@ -465,7 +471,7 @@ def _stats(
         store = _usage_store(settings, STATS_TIMEOUT_S)
         if store is None:
             raise usage.UsageUnavailable("site runs have no database")
-        data = store.stats(days)
+        data = store.stats(days, models=_known_models(settings))
     except (usage.UsageUnavailable, ValueError) as exc:
         # The store exposes only the class and SQLSTATE; a ValueError may quote the URL.
         log["stats"] = str(exc) if isinstance(exc, usage.UsageUnavailable) else type(exc).__name__
@@ -920,7 +926,7 @@ async def _ner(
         try:
             response = await _run_own(credential, valid, settings, indexes, started, log)
         except ServiceError as exc:
-            _failed_calls(recorded, exc, model)
+            _failed_calls(recorded, exc)
             raise
         finally:
             _OWN_RUN.reset(token)
@@ -965,8 +971,7 @@ async def _ner(
                 allowance_window="hour" if admitted is None else admitted.window,
             )
         except BaseException as exc:
-            # The model the chain was on when it gave up, else the one asked for.
-            _failed_calls(recorded, exc, getattr(llm, "model", None) or model)
+            _failed_calls(recorded, exc)
             if admitted is not None:  # a failed request still says how far down it went
                 log["fallbacks"] = [note.model_dump(mode="json") for note in admitted.notes] + [
                     {"stage": f.stage, "from": f.from_model, "to": f.to_model, "reason": f.reason}

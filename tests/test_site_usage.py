@@ -496,11 +496,6 @@ def test_a_known_id_with_a_date_or_version_suffix_is_recorded_as_the_known_id(
     log = {**OK_LOG, "model": echoed, "ran": echoed, "selector": echoed}
     row = run_of(log, at=NOW, visitor_day="f" * 32, models=(GEMINI,))
     assert (row.requested_model, row.model, row.requested_selector) == (base,) * 3
-    failed = {"model": echoed, "llm_calls": 1, "prompt_tokens": 5, "completion_tokens": 1}
-    assert (
-        run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, models=(GEMINI,), failed=failed).model
-        == base
-    )
 
 
 def test_of_two_known_ids_that_could_match_the_longer_one_is_taken() -> None:
@@ -601,14 +596,19 @@ FAILED_LOG: dict[str, Any] = {
 }
 
 
-def test_a_failed_run_keeps_the_tokens_its_failure_carried_and_the_model_asked() -> None:
-    carried = {"model": SONNET, "llm_calls": 2, "prompt_tokens": 900, "completion_tokens": 90}
-    row = run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, failed=carried)
+def test_a_failed_run_keeps_the_tokens_its_failure_carried_under_the_model_asked_for() -> None:
+    """The tokens of a failed run are the sum over every model its chain tried, and
+    the chain only steps down to cheaper models: priced at the model the request asked
+    for, such a run can be overstated and never understated. (They used to go to the
+    last model tried: a paid Opus refusal was priced as Sonnet.)"""
+    carried = {"llm_calls": 2, "prompt_tokens": 900, "completion_tokens": 90}
+    log = {**FAILED_LOG, "fallbacks": [{"stage": "extract", "reason": "refused"}]}
+    row = run_of(log, at=NOW, visitor_day="f" * 32, failed={**carried, "model": SONNET})
     assert (row.status, row.code, row.requested_model, row.model) == (
         422,
         "extraction_unparseable",
         OPUS,
-        SONNET,
+        OPUS,
     )
     assert (row.llm_calls, row.prompt_tokens, row.completion_tokens) == (2, 900, 90)
     assert row.entities is None and row.total_ms is None
@@ -631,11 +631,12 @@ def test_what_a_failure_carried_is_typed_and_named_like_the_rest_of_the_row() ->
     carried = {"model": SENTINEL, "llm_calls": "2", "prompt_tokens": 9.5, "completion_tokens": 9}
     row = run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, failed=carried)
     assert (row.model, row.llm_calls, row.prompt_tokens, row.completion_tokens) == (
-        "other",
+        OPUS,
         None,
         None,
         9,
     )
+    assert SENTINEL not in json.dumps(asdict(row))
     # A successful run is read from its log record alone.
     ok = run_of(OK_LOG, at=NOW, visitor_day="f" * 32, models=(GEMINI,), failed=carried)
     assert (ok.model, ok.llm_calls, ok.prompt_tokens) == (GEMINI, 2, 412)
@@ -712,6 +713,34 @@ def test_any_exception_from_the_executor_is_usage_unavailable() -> None:
         runs.record(a_run())
     assert str(caught.value) == "site runs could not be queried (TimeoutError)"
     assert caught.value.kind == "TimeoutError" and caught.value.code is None
+
+
+def test_a_table_that_was_dropped_is_created_again_by_the_run_after_the_one_that_found_out() -> (
+    None
+):
+    """A warm instance remembers that it created the table. After a ``DROP TABLE`` its
+    next insert fails (that row is lost, and said so), and the one after creates."""
+    runs, fake = make()
+    runs.record(a_run())
+    fake.created, fake.rows = False, []  # DROP TABLE, behind the instance's back
+    with pytest.raises(UsageUnavailable) as caught:
+        runs.record(a_run())
+    assert caught.value.code == "42P01" and fake.tags()[3:] == ["site_run"]
+    runs.record(a_run(status=429))
+    assert fake.tags()[4:] == ["site_runs_table", "site_runs_index", "site_run"]
+    assert [row["status"] for row in fake.rows] == [429]
+    # Any other failure leaves the instance's memory of the table alone.
+    fake.fail = PostgresError("down", code="08006")
+    with pytest.raises(UsageUnavailable):
+        runs.record(a_run())
+    fake.fail = None
+    runs.record(a_run())
+    assert fake.tags()[7:] == ["site_run", "site_run"]
+    # The statistics notice it too.
+    fake.created, fake.rows = False, []
+    with pytest.raises(UsageUnavailable):
+        runs.stats(1)
+    assert runs.stats(1)["totals"]["runs"] == 0
 
 
 def test_a_failed_first_call_creates_the_table_on_the_next() -> None:
@@ -866,7 +895,7 @@ def _group(**over: Any) -> dict[str, Any]:
 
 
 def _priced(*groups: dict[str, Any]) -> dict[str, Any]:
-    return shape(_raw(list(groups)), days=1, generated_at=NOW)
+    return shape(_raw(list(groups)), days=1, generated_at=NOW, models=(GEMINI,))
 
 
 def test_prices_are_per_million_tokens_input_and_output() -> None:
@@ -1429,18 +1458,18 @@ def stored(request: pytest.FixtureRequest) -> Iterator[SiteRuns]:
 
 
 def test_the_statistics_of_a_fixed_set_of_rows(stored: SiteRuns) -> None:
-    answer = stored.stats(3)
+    answer = stored.stats(3, models=(GEMINI,))
     assert answer == EXPECTED
     # The dollars per model and per day both add up to the total.
     for part in ("by_model", "by_day"):
         assert round(sum(row["estimated_usd"] for row in answer[part]), 6) == 2.3485
     # The page draws "refused, no tier" as the runs that are in none of the four tiers.
-    for day in stored.stats(30)["by_day"]:
+    for day in stored.stats(30, models=(GEMINI,))["by_day"]:
         assert sum(day[tier] for tier in ("opus", "sonnet", "other", "own")) <= day["runs"]
 
 
 def test_a_shorter_window_leaves_out_the_earlier_day(stored: SiteRuns) -> None:
-    answer = stored.stats(1)
+    answer = stored.stats(1, models=(GEMINI,))
     assert answer["by_day"] == [EXPECTED["by_day"][2]]
     assert answer["totals"]["runs"] == 5 and answer["totals"]["visitors"] == 2
     assert answer["by_code"] == [
@@ -1453,7 +1482,7 @@ def test_a_shorter_window_leaves_out_the_earlier_day(stored: SiteRuns) -> None:
 
 
 def test_a_longer_window_is_zero_filled_and_takes_in_the_older_run(stored: SiteRuns) -> None:
-    answer = stored.stats(30)
+    answer = stored.stats(30, models=(GEMINI,))
     assert len(answer["by_day"]) == 30 and answer["by_day"][0]["day"] == "2026-10-20"
     assert [day["runs"] for day in answer["by_day"][-4:]] == [1, 0, 3, 5]
     assert all(day == {"day": day["day"], **EMPTY_DAY} for day in answer["by_day"][:-4])
@@ -1463,6 +1492,123 @@ def test_a_longer_window_is_zero_filled_and_takes_in_the_older_run(stored: SiteR
     assert sum(row["runs"] for row in answer["by_model"]) == 9
     # One million more Opus input tokens on the site's key: four dollars.
     assert answer["totals"]["estimated_usd"] == 6.3485
+
+
+# --- what is read back is normalised like what is written (fix round 2) ---------------
+
+STRAY = "STRAY-SENTINEL-text"
+# Rows as older code or a hand could have left them: `record` stores a Run as it is.
+STRAY_ROWS: tuple[Run, ...] = (
+    a_run(
+        at=at(18, 9),
+        tier="opus",
+        model=f"claude-{STRAY}",
+        requested_selector=STRAY,
+        country=STRAY,
+        prompt_tokens=1000,
+        selector_calls=1,
+        selector_prompt_tokens=10,
+    ),
+    a_run(
+        at=at(18, 10),
+        status=502,
+        code=f"provider said {STRAY}",
+        model=STRAY,
+        requested_selector="retrieval",
+        fallback_reasons=f"rate_limited,{STRAY},another {STRAY}",
+        country="xx",
+        prompt_tokens=500,
+    ),
+    a_run(at=at(18, 11), status=429, code="visitor_limit_reached", credential=STRAY, country="SI"),
+    a_run(at=at(18, 12), model="claude-opus-5-5-20261101", prompt_tokens=1_000_000, country="SI"),
+    a_run(at=at(18, 13), model="vendor/listed", prompt_tokens=7, tier=STRAY),
+)
+STRAY_EXPECTED: dict[str, Any] = {
+    "by_model": [
+        {
+            "model": "other",
+            "credential": "site",
+            "runs": 2,
+            "prompt_tokens": 1510,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
+        {
+            "model": OPUS,
+            "credential": "site",
+            "runs": 1,
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "estimated_usd": 4.0,
+        },
+        {
+            "model": "vendor/listed",
+            "credential": "site",
+            "runs": 1,
+            "prompt_tokens": 7,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
+        {
+            "model": None,
+            "credential": "other",
+            "runs": 1,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_usd": 0.0,
+        },
+    ],
+    "by_code": [{"code": "other", "runs": 1}, {"code": "visitor_limit_reached", "runs": 1}],
+    "by_fallback": [{"reason": "other", "runs": 2}, {"reason": "rate_limited", "runs": 1}],
+    "by_country": [{"country": None, "runs": 3}, {"country": "SI", "runs": 2}],
+}
+
+
+def _stray_answer(runs: SiteRuns) -> dict[str, Any]:
+    for row in STRAY_ROWS:
+        runs.record(row)
+    return runs.stats(1, models=("vendor/listed",))
+
+
+def _assert_no_stray(answer: dict[str, Any]) -> None:
+    assert STRAY not in json.dumps(answer) and "20261101" not in json.dumps(answer)
+    for name, expected in STRAY_EXPECTED.items():
+        assert answer[name] == expected, name
+    assert answer["totals"]["runs"] == 5 and answer["totals"]["estimated_usd"] == 4.0
+    # The two `other` runs and the one on a listed model without a price.
+    assert answer["totals"]["unpriced_runs"] == 3
+    assert answer["by_day"][0]["opus"] == 1 and answer["by_day"][0]["other"] == 0
+
+
+def test_strings_already_in_the_table_are_normalised_on_the_way_out() -> None:
+    """New rows hold only the site's own words, but a row may be older than that rule,
+    or written by hand: the answer must not carry what such a row holds either."""
+    runs, fake = make()
+    answer = _stray_answer(runs)
+    assert STRAY in json.dumps([str(row) for row in fake.rows])  # it is in the table
+    _assert_no_stray(answer)
+    # Without the deployment's list, a model only it knows is `other` as well.
+    unlisted = runs.stats(1)
+    assert {row["model"] for row in unlisted["by_model"]} == {"other", OPUS, None}
+
+
+@pytest.mark.integration
+def test_postgres_strings_already_in_the_table_are_normalised_on_the_way_out(
+    database: Database,
+) -> None:
+    _assert_no_stray(_stray_answer(database.runs()))
+
+
+@pytest.mark.integration
+def test_postgres_a_dropped_table_is_created_again_after_one_lost_row(database: Database) -> None:
+    runs = database.runs()
+    runs.record(FIXED[0])
+    database.executor.execute(f"DROP TABLE {database.schema}.{TABLE}")
+    with pytest.raises(UsageUnavailable) as caught:
+        runs.record(FIXED[0])
+    assert caught.value.code == "42P01"
+    runs.record(FIXED[0])
+    assert database.value("SELECT count(*) FROM {table}") == "1"
 
 
 # --- against Postgres only -----------------------------------------------------------
