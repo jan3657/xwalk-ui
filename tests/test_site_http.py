@@ -1364,6 +1364,97 @@ def test_an_unreachable_limiter_means_sonnet_uncounted_with_a_notice(
     assert plain[0] == 200 and _json(plain)["fallbacks"] == [] and visits.rows == {}
 
 
+def test_a_contended_visitor_lock_is_a_429_and_no_chain_is_built(
+    cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One visitor's parallel requests queue on the visitor's lock; one that waited past
+    the lock timeout (SQLSTATE 55P03) is refused, not let through uncounted on Sonnet."""
+    from xwalk.retrieval.postgres import PostgresError
+
+    visits.fail = PostgresError(f"canceling statement due to lock timeout ({DB_URL})", code="55P03")
+    s = _open_site(cache_dir, tmp_path)
+    for payload in ({}, {"model": SONNET}, {"model": GEMINI}):
+        claude = _Claude()
+        refused = _ask(s, payload, claude=claude)
+        assert _error(refused) == (429, "visitor_limit_reached")
+        assert _json(refused)["error"]["message"] == (
+            "too many requests at once; try again in a few seconds"
+        )
+        assert refused[1]["Retry-After"] == "5"
+        _assert_common_headers(refused[1])
+        assert claude.made == {} and visits.rows == {}
+    err = capsys.readouterr().err
+    record = json.loads(err.strip().splitlines()[-1])
+    assert record["status"] == 429 and record["code"] == "visitor_limit_reached"
+    assert "55P03" in record["limits"] and "tier" not in record
+    assert "ep-x-pooler" not in err and "SENTINELpw" not in err
+    # Any other database failure keeps its meaning: Sonnet, uncounted, with the notice.
+    visits.fail = PostgresError("could not serialize access", code="40001")
+    out = _json(_ask(s))
+    assert out["model"] == SONNET and out["fallbacks"][0]["reason"] == "limits_unavailable"
+    assert "40001" in _last_log(capsys)["limits"]
+
+
+def test_the_block_reason_in_a_notice_is_the_one_read_at_admission(
+    cache_dir: Path, tmp_path: Path, visits: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The block is process-wide and can change or expire while a request runs. The
+    request's notice says what was true when its start was decided, and the block is
+    read once."""
+    from ner_site import fallback
+
+    reads: list[str | None] = []
+    answers = iter(["balance_exhausted", "key_refused", None])
+
+    def block(**kw: Any) -> str | None:
+        reads.append(next(answers))
+        return reads[-1]
+
+    monkeypatch.setattr(fallback, "claude_block", block)
+    s = _open_site(cache_dir, tmp_path)
+    out = _json(_ask(s, claude=_no_claude_calls(), llm_factory=_fake('{"entities": []}')))
+    assert reads == ["balance_exhausted"]
+    assert out["fallbacks"] == [
+        {"stage": "admit", "from": OPUS, "to": GEMINI, "reason": "claude_unavailable"}
+    ]
+    assert out["notices"] == [
+        "Claude is unavailable (balance exhausted); this ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter."
+    ]
+
+
+def test_an_index_failure_is_not_a_counted_visit(
+    cache_dir: Path,
+    tmp_path: Path,
+    visits: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The indexes are opened before admission: a request that cannot run for that
+    reason has cost the visitor nothing."""
+    s = _open_site(cache_dir, tmp_path)
+    opened: list[int] = []
+    real = http_mod.get_indexes
+
+    def broken(view: Any) -> Any:
+        raise RuntimeError("the index store cannot be opened")
+
+    monkeypatch.setattr(http_mod, "get_indexes", broken)
+    failed = _ask(s, claude=_no_claude)
+    assert _error(failed) == (500, "internal")
+    assert visits.sent == [] and visits.rows == {}
+    assert _last_log(capsys)["exception"] == "RuntimeError"
+
+    def counting(view: Any) -> Any:
+        opened.append(1)
+        assert visits.rows == {}, "the indexes are opened before the visit is counted"
+        return real(view)
+
+    monkeypatch.setattr(http_mod, "get_indexes", counting)
+    assert _ask(s)[0] == 200
+    assert opened == [1] and _tiers(visits) == {"opus": 1}  # opened once, then passed on
+
+
 def test_without_a_database_an_open_site_starts_on_sonnet_and_a_private_one_on_opus(
     cache_dir: Path, tmp_path: Path
 ) -> None:

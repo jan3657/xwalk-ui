@@ -5,10 +5,11 @@ Two layers, because the grant rule lives in SQL.
 Offline (the default run): ``FakeVisits`` is an in-memory stand-in for the ``site_visits``
 table. It was chosen over ``sqlite3`` because the limiter's statements are Postgres only
 (a data-modifying CTE, ``FILTER``, ``$n`` placeholders, ``timestamptz``, advisory locks).
-It tells the limiter's five statements apart by their ``/* xwalk:<tag> */`` and answers
+It tells the limiter's six statements apart by their ``/* xwalk:<tag> */`` and answers
 each with the meaning of its SQL: it keeps the counts, makes the same grant decision the
 ``site_visit`` statement makes from the parameters it was sent, and refuses a statement
-that arrives before the table exists or a visit that does not follow its lock. It also
+that arrives before the table exists, a visit that does not follow its lock, or a lock
+taken before its wait was bounded. It also
 records every statement and counts round trips. These tests prove the Python around the
 SQL and what is sent; they cannot prove the SQL.
 
@@ -35,6 +36,7 @@ import secrets
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -80,6 +82,7 @@ class FakeVisits:
         self.round_trips = 0
         self.fail: Exception | None = None
         self.locked: set[str] = set()  # visitors locked by the transaction now running
+        self.bounded = False  # whether that transaction has set its lock timeout
 
     # --- the executor protocol
     def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -98,6 +101,7 @@ class FakeVisits:
             raise
         finally:
             self.locked.clear()  # a transaction lock ends with its transaction
+            self.bounded = False  # and so does SET LOCAL
 
     def _run(self, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
         p = list(params)
@@ -107,7 +111,8 @@ class FakeVisits:
         placeholders = {int(n) for n in re.findall(r"\$(\d+)", sql)}
         assert placeholders == set(range(1, len(p) + 1)), "placeholders and parameters differ"
         tag = tag_of(sql)
-        if tag not in ("site_visits_table", "site_visit_lock") and not self.created:
+        free = ("site_visits_table", "site_visit_lock_timeout", "site_visit_lock")
+        if tag not in free and not self.created:
             raise PostgresError('relation "site_visits" does not exist', code="42P01")
         return getattr(self, f"_{tag}")(sql, p)
 
@@ -126,8 +131,14 @@ class FakeVisits:
                     found[tier] += count
         return found
 
+    def _site_visit_lock_timeout(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
+        assert "SET LOCAL lock_timeout = '1500ms'" in sql
+        self.bounded = True
+        return []
+
     def _site_visit_lock(self, sql: str, p: list[Any]) -> list[dict[str, Any]]:
         assert "pg_advisory_xact_lock" in sql
+        assert self.bounded, "the lock wait must be bounded before the lock is asked for"
         self.locked.add(p[0])
         return [{"pg_advisory_xact_lock": ""}]
 
@@ -363,12 +374,17 @@ def test_one_round_trip_per_call_and_the_table_is_created_once() -> None:
     lim, fake, _ = make()
     lim.admit(VISITOR, "opus")
     assert fake.round_trips == 1
-    assert fake.tags() == ["site_visits_table", "site_visit_lock", "site_visit"]
+    assert fake.tags() == [
+        "site_visits_table", "site_visit_lock_timeout", "site_visit_lock", "site_visit",
+    ]  # fmt: skip
     lim.admit(VISITOR, "opus")
     lim.peek(VISITOR)
     assert fake.round_trips == 3
-    assert fake.tags()[3:] == ["site_visit_lock", "site_visit", "site_visits_read"]
-    assert all(f"xwalk.{TABLE}" in sql for sql, _ in fake.sent if tag_of(sql) != "site_visit_lock")
+    assert fake.tags()[4:] == [
+        "site_visit_lock_timeout", "site_visit_lock", "site_visit", "site_visits_read",
+    ]  # fmt: skip
+    no_table = ("site_visit_lock_timeout", "site_visit_lock")
+    assert all(f"xwalk.{TABLE}" in sql for sql, _ in fake.sent if tag_of(sql) not in no_table)
 
 
 def test_every_visit_locks_its_visitor_first_in_a_statement_of_its_own() -> None:
@@ -378,8 +394,9 @@ def test_every_visit_locks_its_visitor_first_in_a_statement_of_its_own() -> None
     lim.admit(OTHER_VISITOR, "sonnet")
     assert fake.round_trips == 2
     assert fake.tags() == [
-        "site_visits_table", "site_visit_lock", "site_visit", "site_visits_prune",
-        "site_visit_lock", "site_visit", "site_visits_prune",
+        "site_visits_table",
+        "site_visit_lock_timeout", "site_visit_lock", "site_visit", "site_visits_prune",
+        "site_visit_lock_timeout", "site_visit_lock", "site_visit", "site_visits_prune",
     ]  # fmt: skip
     locks = [(sql, params) for sql, params in fake.sent if tag_of(sql) == "site_visit_lock"]
     assert [params for _, params in locks] == [[VISITOR], [OTHER_VISITOR]]
@@ -388,11 +405,31 @@ def test_every_visit_locks_its_visitor_first_in_a_statement_of_its_own() -> None
     assert "pg_advisory" not in visit
 
 
+def test_the_lock_wait_is_bounded_below_the_executors_timeout() -> None:
+    """The fake refuses a lock whose transaction has not set ``lock_timeout`` first. The
+    bound is a constant in the statement (``SET`` takes no parameter) and well under the
+    3 s the limiter's executor waits for the whole round trip (``http.LIMITS_TIMEOUT_S``),
+    so a queue behind one visitor's lock ends as SQLSTATE 55P03, not as a timed-out call."""
+    from ner_site import http as site_http
+
+    lim, fake, _ = make()
+    lim.admit(VISITOR, "opus")
+    (bound,) = [(sql, params) for sql, params in fake.sent if "lock_timeout" in sql]
+    assert bound == (
+        "/* xwalk:site_visit_lock_timeout */\nSET LOCAL lock_timeout = '1500ms'",
+        [],
+    )
+    assert limits.LOCK_TIMEOUT_MS == 1500
+    assert limits.LOCK_TIMEOUT_MS / 1000 < site_http.LIMITS_TIMEOUT_S
+    assert limits.LOCK_NOT_AVAILABLE == "55P03"
+
+
 def test_peek_takes_no_lock() -> None:
     lim, fake, _ = make()
     lim.peek(VISITOR)
     lim.peek(VISITOR)
     assert "site_visit_lock" not in fake.tags()
+    assert "site_visit_lock_timeout" not in fake.tags()
 
 
 def test_peek_on_a_new_instance_creates_the_table_in_the_same_round_trip() -> None:
@@ -481,6 +518,27 @@ def test_any_exception_from_the_executor_is_limits_unavailable() -> None:
     with pytest.raises(LimitsUnavailable) as caught:
         lim.admit(VISITOR, "opus")
     assert "SENTINEL" not in str(caught.value)
+    assert caught.value.code is None
+
+
+@pytest.mark.parametrize(
+    ("given", "code"),
+    [("55P03", "55P03"), ("40001", "40001"), (None, None), ("not a state", None), (55, None)],
+)
+def test_limits_unavailable_carries_the_sqlstate(given: Any, code: str | None) -> None:
+    """The caller tells a contended lock (55P03) from a database that cannot be asked."""
+    lim, fake, _ = make()
+    fake.fail = PostgresError("canceling statement due to lock timeout", code="none")
+    fake.fail.code = given
+    with pytest.raises(LimitsUnavailable) as caught:
+        lim.admit(VISITOR, "opus")
+    assert caught.value.code == code
+    assert (code or "PostgresError") in str(caught.value)
+    with pytest.raises(LimitsUnavailable) as unreadable:
+        make(fake=type("Empty", (FakeVisits,), {"_site_visit": lambda *a: []})())[0].admit(
+            VISITOR, "opus"
+        )
+    assert unreadable.value.code is None
 
 
 def test_an_unreadable_answer_is_limits_unavailable() -> None:
@@ -526,7 +584,8 @@ def test_a_plain_schema_is_accepted() -> None:
     lim = VisitorLimits(fake, "ner_site_2", Allowance(), clock=Clock(), rng=lambda: 0.5)
     lim.admit(VISITOR, "opus")
     lim.peek(VISITOR)
-    tables = [sql for sql, _ in fake.sent if tag_of(sql) != "site_visit_lock"]
+    no_table = ("site_visit_lock_timeout", "site_visit_lock")
+    tables = [sql for sql, _ in fake.sent if tag_of(sql) not in no_table]
     assert len(tables) == 3 and all(f"ner_site_2.{TABLE}" in sql for sql in tables)
 
 
@@ -622,8 +681,9 @@ class PsqlExecutor:
     transaction is one ``psql`` session at READ COMMITTED, the level Neon's endpoint uses
     when none is asked for. At most one row per statement is read back, and every value
     comes back as a string (NULL as None), which is also the least a real executor may
-    give. The URL goes to ``psql`` through ``PG*`` environment variables, never on the
-    command line, and appears in no message.
+    give. A failed statement is a ``PostgresError`` with its SQLSTATE, as from the real
+    executor. The URL goes to ``psql`` through ``PG*`` environment variables, never on
+    the command line, and appears in no message.
     """
 
     def __init__(self, url: str) -> None:
@@ -647,7 +707,7 @@ class PsqlExecutor:
 
     def spawn(self) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            ["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+            ["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -659,7 +719,9 @@ class PsqlExecutor:
         process = self.spawn()
         out, err = process.communicate(script, timeout=60)
         if process.returncode:
-            raise RuntimeError(f"psql failed: {(err.strip().splitlines() or ['?'])[-1]}")
+            # VERBOSITY=verbose: "ERROR:  55P03: canceling statement due to lock timeout".
+            state = re.search(r"^[A-Z]+:\s+([0-9A-Z]{5}):", err, re.MULTILINE)
+            raise PostgresError("psql failed", code=state.group(1) if state else None)
         return out
 
     @staticmethod
@@ -810,28 +872,26 @@ def test_postgres_pruning_deletes_only_rows_older_than_a_day(database: Database)
     assert database.counts(VISITOR) == {"opus": 3}
 
 
-@pytest.mark.integration
-def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Database) -> None:
-    """Forty requests of one visitor that reach the visit statement at the same instant.
+def _burst(database: Database, lim: VisitorLimits, size: int, hold_s: float) -> dict[str, Any]:
+    """`size` requests of one visitor that reach the visit statement at the same instant.
 
-    A gate session holds the table locked while every request starts, so that all of them
-    are released together: without the per-visitor lock they would all take the same
-    snapshot and all be granted Opus.
-    """
-    lim = database.limits()
+    A gate session holds the table locked for `hold_s` seconds while every request
+    starts, so that all of them are released together: without the per-visitor lock they
+    would all take the same snapshot and all be granted Opus. Returns the tiers granted,
+    how many were refused for the hour, and the SQLSTATE of every other failure."""
     lim.peek(VISITOR)  # the table exists and this instance knows it
     gate = database.executor.spawn()
     assert gate.stdin is not None and gate.stdout is not None
     gate.stdin.write(
         f"BEGIN;\nLOCK TABLE {database.schema}.{TABLE} IN ACCESS EXCLUSIVE MODE;\n"
-        "\\echo held\nSELECT pg_sleep(3);\nCOMMIT;\n"
+        f"\\echo held\nSELECT pg_sleep({hold_s});\nCOMMIT;\n"
     )
     gate.stdin.close()
     assert gate.stdout.readline().strip() == "held"
 
-    burst = 40
     granted: list[str] = []
     refused: list[int] = []
+    contended: list[str | None] = []
     errors: list[BaseException] = []
 
     def visit() -> None:
@@ -839,10 +899,12 @@ def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Da
             granted.append(lim.admit(VISITOR, "opus").tier)
         except VisitorLimitReached as reached:
             refused.append(reached.resets_in_s)
+        except LimitsUnavailable as unavailable:
+            contended.append(unavailable.code)
         except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
             errors.append(exc)
 
-    threads = [threading.Thread(target=visit) for _ in range(burst)]
+    threads = [threading.Thread(target=visit) for _ in range(size)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -851,10 +913,58 @@ def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Da
     gate.stdout.close()
     assert gate.stderr is not None
     gate.stderr.close()
-
     assert errors == []
-    assert granted.count("opus") == 10
-    assert granted.count("sonnet") == 20
-    assert len(granted) == 30 and len(refused) == burst - 30
+    return {"granted": granted, "refused": len(refused), "contended": contended}
+
+
+@pytest.mark.integration
+def test_postgres_an_overlapping_burst_cannot_exceed_the_allowances(database: Database) -> None:
+    """Forty at once, released after half a second: the visits run one after another.
+    A visit that waited longer than the lock timeout for its turn fails with 55P03 and
+    takes nothing; however many do, the rest are granted in order and counted once."""
+    burst = 40
+    seen = _burst(database, database.limits(), burst, 0.5)
+    granted = seen["granted"]
+    assert set(seen["contended"]) <= {limits.LOCK_NOT_AVAILABLE}
+    assert len(granted) + seen["refused"] + len(seen["contended"]) == burst
+    assert granted, "no visit got through the queue"
+    opus, sonnet = granted.count("opus"), granted.count("sonnet")
+    assert opus == min(10, len(granted)) and sonnet == len(granted) - opus <= 20
+    assert seen["refused"] == 0 or (opus, sonnet) == (10, 20)
     # Every granted visit is in the table once, and nothing else is.
-    assert database.counts(VISITOR) == {"opus": 10, "sonnet": 20}
+    expected = {tier: n for tier, n in (("opus", opus), ("sonnet", sonnet)) if n}
+    assert database.counts(VISITOR) == expected
+
+
+@pytest.mark.integration
+def test_postgres_a_held_visitor_lock_makes_admit_raise_55p03(database: Database) -> None:
+    """Another session holds this visitor's advisory lock: ``admit`` gives up after the
+    lock timeout with ``code == "55P03"``, another visitor is not held up, and the
+    visitor is admitted again once the lock is gone."""
+    lim = database.limits()
+    lim.peek(VISITOR)
+    holder = database.executor.spawn()
+    assert holder.stdin is not None and holder.stdout is not None
+    holder.stdin.write(
+        f"BEGIN;\nSELECT pg_advisory_xact_lock(hashtextextended('{VISITOR}', 0));\n"
+        "\\echo held\nSELECT pg_sleep(4);\nCOMMIT;\n"
+    )
+    holder.stdin.close()
+    while holder.stdout.readline().strip() != "held":
+        pass
+
+    assert lim.admit(OTHER_VISITOR, "opus").tier == "opus"
+    began = time.monotonic()
+    with pytest.raises(LimitsUnavailable) as caught:
+        lim.admit(VISITOR, "opus")
+    waited = time.monotonic() - began
+    assert caught.value.code == limits.LOCK_NOT_AVAILABLE == "55P03"
+    assert "55P03" in str(caught.value)
+    assert 1.0 < waited < 3.0  # the 1500 ms bound, not the holder's 4 s
+    assert database.counts(VISITOR) == {}
+
+    assert holder.wait(timeout=30) == 0
+    holder.stdout.close()
+    assert holder.stderr is not None
+    holder.stderr.close()
+    assert lim.admit(VISITOR, "opus") == Admission("opus", 9, 20, 40 * 60, None)

@@ -37,7 +37,6 @@ from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
-from ner_site import fallback
 from ner_site.claude import (
     CLAUDE_MODELS,
     DISPLAY_NAMES,
@@ -730,12 +729,15 @@ _WHY = {
 }
 
 
-def notice(note: FallbackNote, *, last: bool = True) -> str:
+def notice(note: FallbackNote, *, last: bool = True, claude_blocked: str | None = None) -> str:
     """The sentence a visitor reads about one departure from the model they asked for.
 
     ``last`` is whether the request went no further in that part of it. Only then does
     the sentence say what ran on the model the departure led to; an earlier one says
-    "moved on to", because nothing may have run there."""
+    "moved on to", because nothing may have run there. ``claude_blocked`` is why Claude
+    was known to be unusable when the request was admitted (``fallback.claude_block`` as
+    the caller read it then), for a ``claude_unavailable`` departure; this function
+    does not read the process's block itself, which may have changed since."""
     target = display_name(note.to)
     if not last:
         then = f"moved on to {target}"
@@ -749,7 +751,7 @@ def notice(note: FallbackNote, *, last: bool = True) -> str:
         return f"Selection uses the model that extracted; {then}."
     blocked = note.reason if note.reason in BLOCK_TEXT else None
     if note.reason == "claude_unavailable":
-        blocked = fallback.claude_block()
+        blocked = claude_blocked
         if blocked is None:
             return f"Claude is unavailable; {then}."
     if blocked is not None:
@@ -760,7 +762,12 @@ def notice(note: FallbackNote, *, last: bool = True) -> str:
     return f"{why.format(model=display_name(note.from_))}; {then}."
 
 
-def _notices(departures: Sequence[FallbackNote], *, extracted_on_chain: bool) -> list[str]:
+def _notices(
+    departures: Sequence[FallbackNote],
+    *,
+    extracted_on_chain: bool,
+    claude_blocked: str | None = None,
+) -> list[str]:
     """A sentence per departure, in order. The departures fall into two parts, those
     that decided where the extraction ran and those that decided where the picks ran,
     and in each only the last one says what ran where it led (:func:`notice`). A
@@ -772,7 +779,8 @@ def _notices(departures: Sequence[FallbackNote], *, extracted_on_chain: bool) ->
 
     final = {part(note): position for position, note in enumerate(departures)}
     return [
-        notice(note, last=final[part(note)] == position) for position, note in enumerate(departures)
+        notice(note, last=final[part(note)] == position, claude_blocked=claude_blocked)
+        for position, note in enumerate(departures)
     ]
 
 
@@ -1039,6 +1047,7 @@ async def run(
     decider: DecisionClient | None = None,
     select_llm: LLMClient | None = None,
     admitted: Sequence[FallbackNote] = (),
+    claude_blocked: str | None = None,
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
 
@@ -1049,7 +1058,9 @@ async def run(
     When ``llm`` or ``select_llm`` is a fallback chain (:func:`make_chain`; one chain may
     be both), the response says what it did: ``model`` is the model whose answer the
     extraction used, ``fallbacks`` lists ``admitted`` (the step-downs decided before any
-    call) and then the chain's own, and ``notices`` has a sentence for each. An answer
+    call) and then the chain's own, and ``notices`` has a sentence for each
+    (``claude_blocked`` is the block reason the caller read when it admitted the
+    request, which a ``claude_unavailable`` sentence names). An answer
     that Anthropic served from a model outside the chain (its server-side refusal
     fallback) is listed too, once per stage and model, with the reason ``refused``.
 
@@ -1206,7 +1217,9 @@ async def run(
         notices=list(
             dict.fromkeys(
                 scrub(sentence, settings)
-                for sentence in _notices(departures, extracted_on_chain=chain is not None)
+                for sentence in _notices(
+                    departures, extracted_on_chain=chain is not None, claude_blocked=claude_blocked
+                )
             )
         ),
     )

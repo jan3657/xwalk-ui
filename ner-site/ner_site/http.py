@@ -8,17 +8,18 @@ JSON body, ``Cache-Control: no-store`` and no ``Access-Control-*`` header.
 Order of checks for ``POST /api/ner``: path (404), method (405; ``OPTIONS`` too, on
 purpose, so no preflight ever succeeds), body size (413), ``X-Requested-With:
 xwalk-ner`` (400 ``bad_header``), passcode (401), configuration (503), JSON (400), field
-limits (400), the visitor's allowance (429 ``visitor_limit_reached``), then the run
-(422/429/502). An unexpected exception is a 500 ``internal`` whose log line names only
-the exception type and where it was raised: its message could carry the visitor's text.
+limits (400), the indexes (opened once per warm instance), the visitor's allowance (429
+``visitor_limit_reached``), then the run (422/429/502). An unexpected exception is a 500
+``internal`` whose log line names only the exception type and where it was raised: its
+message could carry the visitor's text.
 
 Admission (docs/superpowers/specs/2026-11-18-claude-provider-open-access-design.md
-sections 3.3 and 5) comes after every check that can refuse a request, so a refused
-request is never counted. It applies where Claude is offered (an Anthropic key, not
-offline): the visitor's hourly allowance decides whether a request for Opus starts on
-Opus or on Sonnet, and a Claude that is known to be unusable moves the start to the
-OpenRouter step. The visitor is a keyed hash of the client address; neither it nor the
-address is ever logged or returned.
+sections 3.3 and 5) comes after every check that can refuse a request and after the
+indexes are open, so a request that is refused or cannot run is never counted. It
+applies where Claude is offered (an Anthropic key, not offline): the visitor's hourly
+allowance decides whether a request for Opus starts on Opus or on Sonnet, and a Claude
+that is known to be unusable moves the start to the OpenRouter step. The visitor is a
+keyed hash of the client address; neither it nor the address is ever logged or returned.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
 from ner_site import fake, fallback, limits
 from ner_site.claude import OPUS, SONNET, is_claude
-from ner_site.indexes import get_indexes
+from ner_site.indexes import OntologyIndex, get_indexes
 from ner_site.ontologies import catalog, full_catalog
 from ner_site.schema import (
     FallbackNote,
@@ -89,8 +90,11 @@ MAX_LOGGED_PATH = 80
 MAX_LENGTH_DIGITS = 18
 REQUEST_WORKERS = 16  # threads per request for retriever searches (BM25 and embeddings)
 # One round trip to Neon before the request may run: short, so a slow database becomes
-# "limits unavailable" (Sonnet, uncounted) and not a slow request.
+# "limits unavailable" (Sonnet, uncounted) and not a slow request. It is twice the
+# limiter's own bound on waiting for a visitor's lock (limits.LOCK_TIMEOUT_MS), so a
+# queue of one visitor's requests ends as a contended lock (429), not as this timeout.
 LIMITS_TIMEOUT_S = 3.0
+CONTENDED_RETRY_AFTER_S = 5
 LIMITS_UNAVAILABLE = "limits_unavailable"
 CLAUDE_UNAVAILABLE = "claude_unavailable"
 
@@ -183,12 +187,14 @@ def _visitor(settings: Settings, headers: Mapping[str, str]) -> str:
 @dataclass(frozen=True)
 class _Admitted:
     """Where an admitted request starts: its tier (``opus``, ``sonnet`` or ``other``),
-    the step of ``chain_models`` its chain starts on, and the step-downs that decided
-    it (stage ``admit``)."""
+    the step of ``chain_models`` its chain starts on, the step-downs that decided it
+    (stage ``admit``), and why Claude was known to be unusable at that moment
+    (``fallback.claude_block``, read once; None when it was usable)."""
 
     tier: str
     start: int = 0
     notes: tuple[FallbackNote, ...] = ()
+    blocked: str | None = None
 
 
 def _admit(
@@ -202,13 +208,17 @@ def _admit(
 
     - limiter on: ``limits.admit`` grants Opus or Sonnet and records the visit, or the
       hour is used (429 ``visitor_limit_reached`` with ``Retry-After``);
-    - limiter unreachable: the request is not counted and a request for Opus starts on
-      Sonnet;
+    - the visitor's lock contended (too many of the visitor's requests at once, SQLSTATE
+      55P03): 429 ``visitor_limit_reached`` too, with a short ``Retry-After``; nothing
+      was recorded;
+    - limiter unreachable for any other reason: the request is not counted and a
+      request for Opus starts on Sonnet;
     - limiter off (no ``DATABASE_URL``): with a passcode Claude is unmetered, without
       one a request for Opus starts on Sonnet, as for unreachable.
 
-    Then a Claude that is known to be unusable (``fallback.claude_block``) moves the
-    start to the OpenRouter step, when the chain has one."""
+    Then a Claude that is known to be unusable (``fallback.claude_block``, read once
+    here and carried with the result) moves the start to the OpenRouter step, when the
+    chain has one."""
     if not settings.claude_offered:
         return None
     assert request.model is not None
@@ -235,6 +245,15 @@ def _admit(
         ) from None
     except limits.LimitsUnavailable as exc:
         log["limits"] = str(exc)  # the error's class and SQLSTATE, nothing else
+        if exc.code == limits.LOCK_NOT_AVAILABLE:
+            # The visitor's own parallel requests held the lock: letting this one run
+            # uncounted would hand a scripted burst unmetered Sonnet.
+            raise ServiceError(
+                "visitor_limit_reached",
+                "too many requests at once; try again in a few seconds",
+                status=429,
+                headers={"Retry-After": str(CONTENDED_RETRY_AFTER_S)},
+            ) from None
         unmetered = True
     if unmetered and wanted == "opus":
         tier, reason = "sonnet", LIMITS_UNAVAILABLE
@@ -251,14 +270,15 @@ def _admit(
             FallbackNote(stage="admit", from_=OPUS, to=SONNET, reason=reason or limits.OPUS_USED)
         )
     last = len(models) - 1
-    if fallback.claude_block() is not None and not is_claude(models[last]) and start < last:
+    blocked = fallback.claude_block()
+    if blocked is not None and not is_claude(models[last]) and start < last:
         notes.append(
             FallbackNote(
                 stage="admit", from_=models[start], to=models[last], reason=CLAUDE_UNAVAILABLE
             )
         )
         start = last
-    return _Admitted(tier, start, tuple(notes))
+    return _Admitted(tier, start, tuple(notes), blocked)
 
 
 def _passcode_error(settings: Settings, headers: Mapping[str, str]) -> ServiceError | None:
@@ -450,17 +470,17 @@ async def _ner(
     log: dict[str, Any],
     *,
     started: float,
+    indexes: Mapping[str, OntologyIndex],
     admitted: _Admitted | None = None,
     claude_factory: ClaudeFactory | None = None,
 ) -> dict[str, Any]:
-    """Build the clients for a validated, admitted request and run it.
+    """Build the clients for a validated, admitted request and run it on `indexes`.
 
     A request for a Claude model runs on one fallback chain, started where `admitted`
     says; a Claude selector uses that chain, or one of its own (for selection only) when
     the extraction model is an OpenRouter model. Everything else is built as before."""
     assert valid.model is not None
     model, selector = valid.model, valid.selector or RETRIEVAL_ONLY
-    indexes = get_indexes(settings.index_settings())
     start = 0 if admitted is None else admitted.start
     chain: LLMClient | None = None
     if admitted is not None and is_claude(model):
@@ -497,6 +517,7 @@ async def _ner(
             decider=decider,
             select_llm=select_llm,
             admitted=() if admitted is None else admitted.notes,
+            claude_blocked=None if admitted is None else admitted.blocked,
         )
     except BaseException:
         if admitted is not None:  # a failed request still says how far down it went
@@ -629,6 +650,9 @@ def _dispatch(
     log["model"] = valid.model
     log["top_k"] = valid.top_k
     log["selector"] = valid.selector
+    # Opened (once per warm instance) before admission: a request that cannot run
+    # because the indexes cannot be opened must not have been counted as a visit.
+    indexes = get_indexes(settings.index_settings())
     admitted = _admit(settings, valid, headers, log)  # last: a refused request is not counted
     data = run_request(
         _ner(
@@ -637,6 +661,7 @@ def _dispatch(
             llm_factory or default_llm_factory,
             log,
             started=started,
+            indexes=indexes,
             admitted=admitted,
             claude_factory=claude_factory,
         )

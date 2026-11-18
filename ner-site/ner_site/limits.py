@@ -17,10 +17,11 @@ through the same ``SQLExecutor``: ``site_visits(visitor, hour, tier, count)`` wi
 per visitor, UTC clock hour and tier. A serverless instance has no memory worth trusting,
 and every ``execute`` is an HTTPS round trip, so each call here is exactly one round trip:
 
-- ``admit`` sends one transaction of two statements: a lock on the visitor, then one
-  statement that reads the visitor's counts for the hour, decides the tier and records
-  the visit (an upsert that increments ``count``). Deciding in SQL is what keeps that to
-  one round trip; ``_grant`` is the same rule in Python, used by ``peek``.
+- ``admit`` sends one transaction of three statements: a bound on how long it may wait
+  for a lock, a lock on the visitor, then one statement that reads the visitor's counts
+  for the hour, decides the tier and records the visit (an upsert that increments
+  ``count``). Deciding in SQL is what keeps that to one round trip; ``_grant`` is the
+  same rule in Python, used by ``peek``.
 - ``peek`` sends one read and decides in Python. It records nothing and takes no lock.
 - The first call of an instance puts ``CREATE TABLE IF NOT EXISTS`` in front, and about
   one ``admit`` in fifty puts a ``DELETE`` of rows older than a day behind, in the same
@@ -39,14 +40,23 @@ therefore exact under any interleaving: no visit is lost, none is counted twice,
 is granted beyond an allowance. Different visitors take different locks and do not wait
 for each other (two ids whose 64-bit hashes collide would merely take turns).
 
+The wait for that lock is bounded. One visitor's parallel requests queue on it, and a
+request whose turn does not come within ``LOCK_TIMEOUT_MS`` gives up: Postgres cancels
+its statement with SQLSTATE 55P03 (``LOCK_NOT_AVAILABLE``), nothing is recorded, and
+``admit`` raises ``LimitsUnavailable`` with that ``code``. The bound is well under the
+caller's timeout for the whole round trip, so a long queue ends as that distinct answer,
+which the caller refuses with a 429, and never as a call that timed out and was let
+through uncounted.
+
 One thing the statements cannot make safe is a retry. ``NeonHTTPExecutor`` sends a
 request again after a transport error or a 5xx, and the increment is not idempotent, so a
 visit whose first attempt was applied but whose answer was lost would be counted twice:
 the caller should give the limiter an executor that does not retry.
 
 When the database cannot be asked, every failure becomes ``LimitsUnavailable`` with a
-message made here from the error's class and SQLSTATE only. The executor's own text is
-dropped (it may name the host), and the caller decides what an unmetered request may do.
+message made here from the error's class and SQLSTATE only, and the SQLSTATE again as
+its ``code``. The executor's own text is dropped (it may name the host), and the caller
+decides what an unmetered request may do.
 """
 
 from __future__ import annotations
@@ -66,6 +76,8 @@ from xwalk.retrieval.postgres import SQLExecutor, Statement
 
 __all__ = [
     "ADDRESS_HEADERS",
+    "LOCK_NOT_AVAILABLE",
+    "LOCK_TIMEOUT_MS",
     "PRUNE_AFTER_S",
     "PRUNE_CHANCE",
     "TABLE",
@@ -87,6 +99,10 @@ HOUR_S = 3600
 # Where the client address is looked for, in this order (header names in lower case).
 ADDRESS_HEADERS = ("x-real-ip", "x-vercel-forwarded-for", "x-forwarded-for")
 OPUS_USED = "opus_allowance_used"
+# How long one visit waits for its visitor's lock (and for any other lock) before it
+# gives up, and the SQLSTATE Postgres then answers with (lock_not_available).
+LOCK_TIMEOUT_MS = 1500
+LOCK_NOT_AVAILABLE = "55P03"
 
 _TIERS: tuple[str, ...] = get_args(Tier)
 _IDENT = re.compile(r"[a-z_][a-z0-9_]{0,62}")
@@ -103,6 +119,11 @@ CREATE TABLE IF NOT EXISTS {table} (
     count integer NOT NULL,
     PRIMARY KEY (visitor, hour, tier)
 )"""
+
+# No parameter: SET takes none, so the bound is written into the statement. LOCAL keeps
+# it to this transaction. It goes ahead of `_LOCK`, whose wait it is there to bound.
+_LOCK_TIMEOUT = f"""/* xwalk:site_visit_lock_timeout */
+SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"""
 
 # $1 visitor. Serialises the visits of one visitor to the end of the transaction. It must
 # stay a statement of its own, ahead of `_VISIT`: a lock taken inside the visit statement
@@ -178,7 +199,12 @@ class Admission:
 
 class LimitsUnavailable(Exception):
     """The database could not be queried. The message names the error's class and its
-    SQLSTATE, nothing the executor wrote."""
+    SQLSTATE, nothing the executor wrote. ``code`` is that SQLSTATE, None when the
+    failure had none; ``LOCK_NOT_AVAILABLE`` means the visitor's lock was contended."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class VisitorLimitReached(Exception):
@@ -273,13 +299,15 @@ class VisitorLimits:
     def admit(self, visitor: str, wanted: Tier) -> Admission:
         """Count one visit and say where it starts. Raises ``VisitorLimitReached`` (and
         records nothing) when the hour is used, ``LimitsUnavailable`` when the database
-        cannot be asked."""
+        cannot be asked; with ``code == LOCK_NOT_AVAILABLE`` when the visitor's other
+        requests held the lock for longer than ``LOCK_TIMEOUT_MS`` (nothing recorded)."""
         if wanted not in _TIERS:
             raise ValueError(f"wanted must be one of {_TIERS}, got {wanted!r}")
         allowance = self._allowance
         now = self._clock()
         hour, resets_in_s = self._hour(now)
         statements: list[Statement] = [
+            (_LOCK_TIMEOUT, ()),
             (_LOCK, (visitor,)),
             (
                 self._visit,
@@ -288,7 +316,7 @@ class VisitorLimits:
         ]
         if self._rng() < PRUNE_CHANCE:
             statements.append((self._prune, (_stamp(int(now) - PRUNE_AFTER_S),)))
-        row = self._send(statements, answer=1)
+        row = self._send(statements, answer=2)
         try:
             opus, sonnet, total = int(row["opus"]), int(row["sonnet"]), int(row["total"])
             tier = row["tier"]
@@ -351,9 +379,11 @@ class VisitorLimits:
             row = rows[0]
         except Exception as exc:
             code = getattr(exc, "code", None)
-            state = f" {code}" if isinstance(code, str) and _SQLSTATE.fullmatch(code) else ""
+            state = code if isinstance(code, str) and _SQLSTATE.fullmatch(code) else None
             raise LimitsUnavailable(
-                f"visitor limits could not be queried ({type(exc).__name__}{state})"
+                "visitor limits could not be queried "
+                f"({type(exc).__name__}{'' if state is None else ' ' + state})",
+                code=state,
             ) from None
         self._created = True
         return row

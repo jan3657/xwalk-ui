@@ -1429,9 +1429,9 @@ def test_admission_step_downs_lead_the_fallbacks_and_have_their_sentences(
     from ner_site import fallback
     from ner_site.schema import FallbackNote
 
-    def admit(reason: str, to: str = SONNET, start: int = 1) -> NerResponse:
+    def admit(reason: str, to: str = SONNET, start: int = 1, **kw: Any) -> NerResponse:
         note = FallbackNote(stage="admit", from_=OPUS, to=to, reason=reason)
-        return _run_chain(tmp_path, bm25_only, _Fakes(), start=start, admitted=[note])
+        return _run_chain(tmp_path, bm25_only, _Fakes(), start=start, admitted=[note], **kw)
 
     used = admit("opus_allowance_used")
     assert used.model == SONNET and used.requested_model == OPUS
@@ -1447,11 +1447,16 @@ def test_admission_step_downs_lead_the_fallbacks_and_have_their_sentences(
     assert admit("limits_unavailable").notices == [
         "Visitor limits are unavailable; this ran on Claude Sonnet 5.5."
     ]
-    fallback.block_claude("balance_exhausted")
-    blocked = admit("claude_unavailable", to=GEMINI, start=2)
+    # The reason is the one the caller read at admission, not the process's block now.
+    fallback.block_claude("key_refused")
+    blocked = admit("claude_unavailable", to=GEMINI, start=2, claude_blocked="balance_exhausted")
     assert blocked.model == GEMINI and blocked.notices == [
         "Claude is unavailable (balance exhausted); this ran on Gemini 3.1 Flash Lite "
         "through OpenRouter."
+    ]
+    unnamed = admit("claude_unavailable", to=GEMINI, start=2)
+    assert unnamed.notices == [
+        "Claude is unavailable; this ran on Gemini 3.1 Flash Lite through OpenRouter."
     ]
     for notice in [*used.notices, *blocked.notices]:
         assert "—" not in notice and notice.endswith(".")
