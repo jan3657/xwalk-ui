@@ -1052,9 +1052,14 @@ the known id (`claude-opus-5-5`), so a dated snapshot is priced like the model t
 was asked for. Any other spelling is a row with `model: other`, which has no price.
 
 A run that failed after a model had answered (an answer that could not be parsed, a
-refusal that reported its tokens) records the calls and tokens its failure carried and
-the model that was asked, so that it is priced. A failure that reported no tokens
-records its calls and no model.
+refusal that reported its tokens) records the calls and tokens its failure carried,
+under the model the request asked for, so that it is priced. A failure that reported
+no tokens records its calls and no model.
+
+What `/api/stats` returns goes through the same mapping again on the way out, with the
+deployment's lists as they are when it is asked: a row written before these rules, or
+by hand, cannot put a string of its own into the answer, and a model that has since
+left the lists is shown as `other`.
 
 **Turning usage on.**
 
@@ -1094,6 +1099,10 @@ the token sums, for runs on the site's keys only, at list prices per million tok
 (input / output): `claude-opus-5-5` 4 / 20, `claude-sonnet-5-5` 2 / 10
 (`usage.PRICES`). Extraction tokens are priced at the model that answered, selection
 tokens at the selector that was asked for, and what Jev reported is added as it is.
+The tokens of a failed run are priced at the model the request asked for. They are a
+sum over every model the chain tried and nothing says which model used which; the
+chain only steps down to cheaper models, so this can overstate such a run (a request
+for Opus that failed on Sonnet is priced as Opus) and never understate it.
 The per-model and per-day dollars both add up to the total. Not in the estimate:
 
 - Models without a list price: every OpenRouter model, and `other`. Their runs are
@@ -1114,21 +1123,28 @@ The Anthropic Console is the bill.
 **What recording costs a request.** One HTTPS round trip to Neon (a single `INSERT`),
 made after the response is built and before it is sent. The request waits for it at
 most 2 s, and that wait covers everything recording does, including finding or
-building the database client behind a lock the instance's requests share. A write that
-is not done by then is abandoned: the answer goes out, and the write ends on its own
-when the database client's timeout is up (also 2 s, for each of connecting, sending
-and waiting for the answer). At most four writes are under way on a warm instance at
-once; a run that finds all four taken is not recorded and does not wait. So a database
-that hangs costs a request at most 2 s, nothing while four writes are stuck, and never
-an answer. `timing_ms.handle` in the log does not include recording. The log line of a request gains one field, and only when its run
-was not recorded:
+building the database client behind a lock the instance's requests share. The write
+has the same 2 s as a deadline of its own, on the clock, for the whole exchange (the
+name lookup, the connection, the request and the complete answer): when it is up the
+write is cancelled and its connection closed, whatever the database is doing, also
+one that keeps sending a byte at a time (`ner_site/deadline.py`; the engine's own
+client limits each read, not the exchange). So the place a write holds is free again
+when its deadline passes; the tests allow it one second more. At most four writes are
+under way on a warm instance at once; a run that finds all four taken is not recorded
+and does not wait. A name lookup is the one thing that cannot be cancelled: the write
+stops waiting for it at the deadline, and the lookup keeps a small thread until the
+system's resolver gives up; there are at most four such threads, and while all four
+are stuck a write fails at once. A database that hangs therefore costs a request at
+most 2 s and never an answer. `timing_ms.handle` in the log does not include
+recording. The log line of a request gains one field, and only when its run was not
+recorded:
 
 | `usage` in the log line | Meaning |
 |---|---|
 | absent | The row was written, or recording is off. |
-| `"TimeoutError"` | No answer within 2 s; the write was abandoned and may still complete. |
+| `"TimeoutError"` | No answer within 2 s; the write was cancelled. If the request had already reached the database, the row may still have been written. |
 | `"saturated"` | Four writes were already under way; this run was skipped at once. |
-| `"PostgresError"` | The database refused the statement or could not be reached. |
+| `"PostgresError"` | The database refused the statement or could not be reached (also: four name lookups are still waiting for the resolver). |
 | another class name | What else failed (`ValueError`: a connection string the client cannot use). |
 
 **Deleting the data.** In the Neon SQL editor or with `psql`, on the schema of the
@@ -1139,8 +1155,13 @@ DELETE FROM xwalk.site_runs WHERE at < '2026-12-01';   -- everything before a da
 DROP TABLE xwalk.site_runs;                              -- everything
 ```
 
-Nothing prunes the table. After a `DROP TABLE` a deployment that still has
-`NER_SITE_STATS_PASSCODE` set creates the table again on its next run.
+Nothing prunes the table. After a `DROP TABLE`, a deployment that still has
+`NER_SITE_STATS_PASSCODE` set creates the table again, but not always on its next
+run: a warm instance remembers that it created the table, so its next run fails to
+record (`usage: "PostgresError"`, that row is lost) and the run after it creates the
+table. To lose nothing, run `tools/setup_usage.py` right after the drop; a redeploy
+also starts every instance afresh. To stop recording instead, unset the passcode
+first.
 
 **Turning it off.** Unset `NER_SITE_STATS_PASSCODE` and redeploy: nothing is recorded,
 `/api/stats` answers 404, no database client is built for it, and the rows stay until
@@ -1760,7 +1781,7 @@ after the fixes.
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1572 passed, 32
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1630 passed, 34
   deselected (1431 before the fixes). The fixes were written test first. Reproduced
   before the code changed: four requests in a row against a database that never
   answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
@@ -1772,9 +1793,23 @@ What was run (Python 3.13.3, the repository venv, no key in the environment):
   sequential and concurrent requests left every answer as it is without analytics,
   held at most four writes, skipped the rest at once, and recorded again once it
   answered; the store's shared lock held by another thread cost a request no more
-  than the same wait; and the real Neon client against a local socket that accepts
-  and never answers gave its place back by its own timeout.
-- `python -m pytest -q -m integration tests/test_site_usage.py`: 9 passed, against a
+  than the same wait.
+- The write's deadline, after a second review found that the engine's client has
+  none (`tests/test_site_deadline.py`; shown there first against that client, which
+  was still waiting six timeouts later). Against a socket on 127.0.0.1 that answers
+  one byte at a time in the body, one byte at a time in the headers, or not at all,
+  and against a resolver that never returns: every call ended at its deadline with
+  `TimeoutError`, the server saw the connection closed, and through the site every
+  place was free again within one second after the deadline, for requests in a row
+  and for twelve at once, with nothing releasing the server. With the resolver
+  stalled, four lookups each kept a daemon thread and the following writes failed at
+  once. The protocol of the new client was compared with the engine's, request for
+  request and answer for answer, over mock transports.
+- A failed run that had stepped down (a paid Opus refusal, then a Sonnet failure) is
+  priced as Opus; a row with strings of its own in it adds none to `/api/stats`;
+  a dropped table is created again after one lost row; a `DATABASE_URL` with a port
+  that is no number is not kept where only analytics reads it.
+- `python -m pytest -q -m integration tests/test_site_usage.py`: 11 passed, against a
   local PostgreSQL 16.15 on 127.0.0.1 through `psql`, in throwaway schemas that were
   dropped (none left), also with `PGTZ=Europe/Ljubljana` and
   `PGTZ=America/Los_Angeles`. These run the real statements, including the changed
@@ -1796,7 +1831,9 @@ Not run or not verified:
 - Vercel Web Analytics itself: the real `/_vercel/insights/script.js`, the request to
   `/_vercel/insights/view`, the dashboard. The `/stats` rewrite on Vercel.
 - Neon's HTTPS endpoint with these statements: that it takes the one text parameter
-  of the insert for `$1::jsonb` and returns the statistics column as text.
+  of the insert for `$1::jsonb` and returns the statistics column as text. The
+  client that now sends them (`ner_site/deadline.py`) has never spoken to Neon: it
+  follows the engine's client, which has, and was checked against it offline only.
   `tools/setup_usage.py` was run against a fake executor and, through
   `SiteRuns.create`, on the local Postgres; never against Neon.
 - What Anthropic's responses put in `model` for `claude-opus-5-5` and

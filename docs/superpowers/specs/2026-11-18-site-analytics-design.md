@@ -190,8 +190,16 @@ The sections above are the design. Where the code differs, this section holds.
 - **Recording is capped (amends 3.4).** Finding or building the store and the insert
   run in one worker thread, and the request waits for it at most 2 s in all. At most
   four writes are under way per warm instance; a run that finds them all taken is not
-  recorded and does not wait, and its log line says `usage: "saturated"`. An abandoned
-  write ends with the executor's own 2 s timeout and gives its place back.
+  recorded and does not wait, and its log line says `usage: "saturated"`. The write
+  goes through an executor of the site's own (`ner_site/deadline.py`) whose timeout
+  is a wall-clock deadline for the whole exchange, name lookup and complete answer
+  included: at 2 s the write is cancelled and its connection closed, so its place is
+  free again when the deadline passes (tested to within one second, against an
+  answer that trickles in the body or the headers, a silent server, and a resolver
+  that never answers). The engine's executor limits each read, and a database that
+  sent a byte now and then held a place without end. A name lookup cannot be
+  cancelled: it keeps one of at most four daemon threads until the system's resolver
+  gives up, and while all four are stuck a write fails at once.
 - **The table can be provisioned (amends 3.2).** The lazy `CREATE TABLE IF NOT EXISTS`
   stays; two cold instances racing on a database without the table may lose one row.
   `tools/setup_usage.py` creates the schema, the table and the index once from
@@ -211,12 +219,27 @@ The sections above are the design. Where the code differs, this section holds.
   stored as the known id, the longest one that fits, so that a dated echo of a Claude
   id is priced. Nothing of the suffix is stored.
 - **Spend (amends 3.3 and 4).** A run that failed after a model answered records the
-  calls and tokens its failure carried and the model that was asked. `unpriced_runs`
+  calls and tokens its failure carried under the model the request asked for (the
+  tokens are a sum over the models the chain tried; it only steps down to cheaper
+  ones, so this can overstate and never understate). `unpriced_runs`
   counts a site-key run once when either stage has no list price: the extraction
   model, or a model selector whose provider reported no cost. Jev's reported cost is
   a `by_model` row of its own (`model: "jev"`, `credential: "site"`, `runs: 0`), so
   the rows' dollars add up to the total. Still not counted: a successful run in which
   any call did not report its tokens (its token columns are null).
+- **The answer is normalised too (amends 4).** The strings of `/api/stats` (models,
+  selectors, credentials, codes, reasons, countries) go through the same mapping when
+  they are read as when a row is written, so a row from before the rule or written
+  by hand adds nothing free-form to the answer; groups that become the same word are
+  added up.
+- **A dropped table.** An instance remembers that it created the table. After a
+  `DROP TABLE` its next statement fails (SQLSTATE 42P01, that row is lost) and the
+  one after creates the table again; `tools/setup_usage.py` after the drop avoids
+  the loss.
+- **A port in an analytics-only `DATABASE_URL`.** "Unusable" includes what the URL
+  parser only checks when asked: a port that is not a number in range, a host that
+  is not a plain name or bracketed address, any space or control character. Nothing
+  of an unusable URL is kept, so nothing of it is scrubbed from answers.
 - **Null rows (amends 4).** `by_model` has a row with `"model": null` per credential
   for runs no model answered, and `by_country` a row with `"country": null` for runs
   without a country, so that each list's runs add up to every run.

@@ -339,7 +339,10 @@ points marked "final review" were changed after two reviews of the whole branch.
   an empty answer) and a body the decoder gives up on with a plain `ValueError`
   (it used to be a 500); on the site's key the same answers are `transient`, so the
   chain retries and steps down. A `ValueError` from anywhere but the JSON decoder
-  still propagates. The log line names the class of what failed
+  and its scanner (the JSON encoder included) is not read as an unreadable answer:
+  it is a fault of the site's code like any other, so 500 `internal` during
+  extraction and a failed pick with the word `error` during selection. The log line
+  names the class of what failed
   in either stage (`own_error`, with `WireRefused` taking precedence, and
   `own_errors`, every class with no cap, when picks failed for different reasons);
   a client that fails to
