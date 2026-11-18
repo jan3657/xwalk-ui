@@ -53,7 +53,6 @@ from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
 from ner_site import fake, fallback, limits, providers, usage
 from ner_site.claude import OPUS, SONNET, is_claude
-from ner_site.deadline import DeadlineExecutor
 from ner_site.indexes import OntologyIndex, get_indexes
 from ner_site.ontologies import catalog, full_catalog
 from ner_site.schema import (
@@ -132,10 +131,39 @@ CLAUDE_UNAVAILABLE = "claude_unavailable"
 # when a provider echoes credentials there. Filters on the emitting loggers run
 # before any handler can format an exception. The context carries only a boolean.
 _OWN_RUN = ContextVar("ner_site_own_run", default=False)
+# The same for an exchange with the database of the visitor limiter or of the record of
+# runs (``_Unlogged``): the connection string is the credential there, and a server, or
+# something in front of it, that echoes it in a reason phrase would put it in the log.
+_DATABASE_CALL = ContextVar("ner_site_database_call", default=False)
 
 
 def _outside_own_run(record: logging.LogRecord) -> bool:
-    return not _OWN_RUN.get()
+    return not _OWN_RUN.get() and not _DATABASE_CALL.get()
+
+
+class _Unlogged:
+    """An ``SQLExecutor`` whose exchanges the HTTP libraries' loggers say nothing
+    about (``_outside_own_run``). The mark is set for the length of a call, in the
+    thread that makes it, and nowhere else."""
+
+    def __init__(self, inner: SQLExecutor) -> None:
+        self._inner = inner
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        token = _DATABASE_CALL.set(True)
+        try:
+            return self._inner.execute(sql, params)
+        finally:
+            _DATABASE_CALL.reset(token)
+
+    def transaction(
+        self, statements: Sequence[tuple[str, Sequence[Any]]], *, read_only: bool = False
+    ) -> list[list[dict[str, Any]]]:
+        token = _DATABASE_CALL.set(True)
+        try:
+            return self._inner.transaction(statements, read_only=read_only)
+        finally:
+            _DATABASE_CALL.reset(token)
 
 
 for _logger in (
@@ -221,14 +249,13 @@ def make_limits_executor(database_url: str) -> SQLExecutor:
 
 
 def make_usage_executor(database_url: str, timeout: float) -> SQLExecutor:
-    """The executor the record of runs is written and read with. Like the limiter's it
-    never retries (an insert is no more idempotent than a counted visit). Unlike it,
-    `timeout` is a wall-clock deadline for the whole call, name lookup and full
-    response included, at which the call is cancelled and its connection closed
-    (``deadline.DeadlineExecutor``): the engine's executor limits each read, so a
-    database that answers a byte at a time could hold a recording worker, and its
-    place, without end. Tests replace it."""
-    return DeadlineExecutor(database_url, timeout=timeout)
+    """The executor the record of runs is written and read with: the limiter's kind,
+    built the same way (an insert is no more idempotent than a counted visit, so no
+    retries), with a timeout of its own. It is the engine's client, the one the site
+    already runs against Neon. Its timeout is the HTTP library's, for each step of an
+    exchange and not for the exchange: see ``_record`` for what that leaves. Tests
+    replace it."""
+    return NeonHTTPExecutor(database_url, timeout=timeout, max_retries=0)
 
 
 def _now() -> float:
@@ -246,7 +273,7 @@ def _visitor_limits(settings: Settings) -> limits.VisitorLimits | None:
         found = _LIMITS.get(key)
         if found is None:
             try:
-                executor = make_limits_executor(settings.database_url)
+                executor = _Unlogged(make_limits_executor(settings.database_url))
                 found = limits.VisitorLimits(
                     executor, settings.neon_schema, settings.allowance, clock=_now
                 )
@@ -308,7 +335,7 @@ def _usage_store(settings: Settings, timeout: float, deadline: float) -> usage.S
     try:
         found = _USAGE.get(key)
         if found is None:
-            executor = make_usage_executor(settings.database_url, timeout)
+            executor = _Unlogged(make_usage_executor(settings.database_url, timeout))
             found = _USAGE[key] = usage.SiteRuns(executor, settings.neon_schema, clock=_now)
         return found
     finally:
@@ -393,17 +420,21 @@ def _record(
     nothing here can change it: every failure ends as ``log["usage"]``, the name of
     what went wrong.
 
-    One deadline covers the whole attempt: ``USAGE_TIMEOUT_S`` from the moment this is
-    called, on the monotonic clock. Everything that can wait happens in a thread of
-    its own, against that deadline: the lock the store is found behind is waited for
-    no longer than to it, a write that gets the lock after it does not start, and the
-    insert is given the time that is left and no more (``SiteRuns.record``), which the
-    executor keeps on the clock whatever the database does (``make_usage_executor``).
-    So the thread is over, and its place free, when the deadline is, and this waits
-    for it no longer. A place is one of ``USAGE_MAX_IN_FLIGHT``; with all of them
-    taken a run is not recorded and does not wait (``usage: "saturated"``). That cap
-    is what bounds an executor that does not keep a deadline (a test's, or a future
-    one): it costs an instance four threads, not one per request."""
+    What the request waits for has one deadline: ``USAGE_TIMEOUT_S`` from the moment
+    this is called, on the monotonic clock. Everything that can wait happens in a
+    daemon thread of its own, and this waits for that thread no longer than to the
+    deadline. In the thread, the lock the store is found behind is waited for no longer
+    than to it either, and a write whose turn comes after it does not start.
+
+    A write that has started cannot be stopped. When the request stops waiting the
+    write is left to the executor's own timeouts (``make_usage_executor``): they end
+    it promptly against a database that is down or says nothing, and they do not end
+    it against one that keeps sending an answer very slowly, because they limit each
+    read and not the whole. Until it ends it holds one of ``USAGE_MAX_IN_FLIGHT``
+    places; with all of them taken a run is not recorded and does not wait
+    (``usage: "saturated"``). So the worst a database can do is keep four daemon
+    threads of an instance busy and pause its recording until the connections end or
+    the instance is recycled. No answer is changed or delayed beyond the one wait."""
     deadline = time.monotonic() + USAGE_TIMEOUT_S
     try:
         if settings.stats_passcode is None or settings.database_url is None:
@@ -430,7 +461,8 @@ def _record(
             try:
                 store = _usage_store(settings, USAGE_TIMEOUT_S, deadline)
                 if store is not None:
-                    store.record(row, timeout=_time_left(deadline))
+                    _time_left(deadline)  # too late: the write does not start
+                    store.record(row)
                 ended.append(None)
             except Exception as exc:  # noqa: BLE001 - named in the log, never raised
                 ended.append(getattr(exc, "kind", None) or type(exc).__name__)
@@ -485,12 +517,12 @@ def _stats(
                 status=400,
             )
     log["days"] = days
-    deadline = time.monotonic() + STATS_TIMEOUT_S  # for the store's lock and the read
+    deadline = time.monotonic() + STATS_TIMEOUT_S  # for the wait for the store's lock
     try:
         store = _usage_store(settings, STATS_TIMEOUT_S, deadline)
         if store is None:
             raise usage.UsageUnavailable("site runs have no database")
-        data = store.stats(days, models=_known_models(settings), timeout=_time_left(deadline))
+        data = store.stats(days, models=_known_models(settings))
     except (usage.UsageUnavailable, ValueError, TimeoutError) as exc:
         # The store exposes only the class and SQLSTATE; a ValueError may quote the URL.
         log["stats"] = str(exc) if isinstance(exc, usage.UsageUnavailable) else type(exc).__name__

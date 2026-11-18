@@ -701,7 +701,7 @@ def test_an_executor_failure_is_usage_unavailable_without_secrets(call: str) -> 
     message = str(caught.value)
     assert message == "site runs could not be queried (PostgresError 08006)"
     assert caught.value.kind == "PostgresError" and caught.value.code == "08006"
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     for secret in (SENTINEL_URL, "npg_SENTINELpw0123", "ep-x-pooler"):
         assert secret not in message
 
@@ -780,28 +780,6 @@ def test_a_late_answer_to_an_insert_sent_before_the_drop_does_not_bring_the_flag
     assert fake.tags()[-1] == "site_run" and fake.tags().count("site_runs_table") == 2
 
 
-def test_a_call_may_be_given_less_time_than_the_executor_has() -> None:
-    """``record(run, timeout=...)`` and ``stats`` hand the time that is left to an
-    executor that can be told (``within``); any other executor is used as it is."""
-    given: list[float] = []
-
-    class Timed(FakeRuns):
-        def within(self, seconds: float) -> Any:
-            given.append(seconds)
-            return self
-
-    fake = Timed()
-    runs = SiteRuns(fake, "xwalk", clock=lambda: NOW)
-    runs.record(a_run(), timeout=0.75)
-    runs.record(a_run())
-    runs.stats(1, timeout=3.5)
-    runs.create()
-    assert given == [0.75, 3.5] and len(fake.rows) == 2
-    plain, other = make()
-    plain.record(a_run(), timeout=0.75)
-    assert len(other.rows) == 1
-
-
 def test_a_failed_first_call_creates_the_table_on_the_next() -> None:
     runs, fake = make()
     fake.fail = PostgresError("down")
@@ -831,7 +809,7 @@ def test_a_failed_create_is_usage_unavailable_without_secrets() -> None:
     with pytest.raises(UsageUnavailable) as caught:
         runs.create()
     assert str(caught.value) == "site runs could not be queried (PostgresError 42501)"
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 @pytest.mark.parametrize("schema", ["Xwalk", "xwalk; DROP TABLE x", "x.y", "", "1abc", 'x"y'])

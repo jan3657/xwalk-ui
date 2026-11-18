@@ -3819,25 +3819,25 @@ def test_a_stats_answer_that_echoed_a_secret_would_still_be_scrubbed(
     assert STATS_PASSCODE not in capsys.readouterr().err
 
 
-def test_the_usage_executor_never_retries_and_has_a_deadline_of_its_own(
+def test_the_usage_executor_is_the_limiters_kind_with_its_own_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recording a run is not idempotent, and it runs while the visitor waits: the
-    executor is the one whose timeout is a wall-clock deadline for the whole call
-    (tests/test_site_deadline.py), not the limiter's, which is as it was."""
-    from ner_site.deadline import DeadlineExecutor
-
+    """Recording a run is not idempotent either, and it runs while the visitor waits:
+    the engine's Neon executor, the client the limiter uses, built the same way (no
+    retries) with a timeout of its own for the write and for the statistics read."""
     built: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(http_mod, "NeonHTTPExecutor", lambda url, **kw: built.append((url, kw)))
     REAL_LIMITS_EXECUTOR(DB_URL)
-    assert built == [(DB_URL, {"timeout": http_mod.LIMITS_TIMEOUT_S, "max_retries": 0})]
-    for timeout in (http_mod.USAGE_TIMEOUT_S, http_mod.STATS_TIMEOUT_S):
-        executor = REAL_USAGE_EXECUTOR(DB_URL, timeout)
-        assert isinstance(executor, DeadlineExecutor)
-        assert repr(executor) == f"DeadlineExecutor(timeout={timeout:g})"
-    assert len(built) == 1
+    REAL_USAGE_EXECUTOR(DB_URL, http_mod.USAGE_TIMEOUT_S)
+    REAL_USAGE_EXECUTOR(DB_URL, http_mod.STATS_TIMEOUT_S)
+    assert built == [
+        (DB_URL, {"timeout": http_mod.LIMITS_TIMEOUT_S, "max_retries": 0}),
+        (DB_URL, {"timeout": 2.0, "max_retries": 0}),
+        (DB_URL, {"timeout": http_mod.STATS_TIMEOUT_S, "max_retries": 0}),
+    ]
     assert http_mod.USAGE_TIMEOUT_S == 2.0 < http_mod.STATS_TIMEOUT_S <= 15
     assert "make_usage_executor" in http_mod.__all__
+    assert not (PROJECT / "ner_site" / "deadline.py").exists()
 
 
 def test_the_stats_shim_serves_api_stats(
@@ -4083,13 +4083,22 @@ def test_a_held_store_lock_costs_no_place_past_the_deadline_and_no_late_write(
     """The store is found behind a lock every request of the instance shares. With the
     lock held for longer than the deadline, four waiting writes kept their places past
     it, and went ahead, long expired, once the lock was free. One deadline, taken
-    before anything else, now covers the wait for the lock too."""
+    before anything else, covers the wait for the lock too. The places are watched
+    while the requests run, and timed from the last attempt's own deadline."""
     import time
 
     timeout, bound = 0.3, 1.0
     monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", timeout)
     cap = http_mod.USAGE_MAX_IN_FLIGHT
     s = _plain_stats_site(cache_dir, tmp_path)
+    deadlines: list[float] = []
+    real_record = http_mod._record
+
+    def timed(*args: Any, **kwargs: Any) -> None:
+        deadlines.append(time.monotonic() + timeout)  # when this attempt's time is up
+        real_record(*args, **kwargs)
+
+    monkeypatch.setattr(http_mod, "_record", timed)
     capsys.readouterr()
     answers: list[int] = []
     threads = [
@@ -4098,12 +4107,19 @@ def test_a_held_store_lock_costs_no_place_past_the_deadline_and_no_late_write(
     with http_mod._USAGE_LOCK:
         for thread in threads:
             thread.start()
+        # Every attempt has begun and taken its place ...
+        assert _wait_for(lambda: len(deadlines) == cap and http_mod._USAGE_FLIGHTS.count == cap, 20)
+        last = max(deadlines)
+        # ... and every place and worker is gone within the bound of the last deadline,
+        # with the lock still held.
+        assert _wait_for(
+            lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0,
+            max(0.0, last - time.monotonic()) + bound,
+        )
+        freed = time.monotonic()
+        assert last - 0.05 <= freed <= last + bound
         for thread in threads:
             thread.join(20)
-        # Still held: every place and every worker is gone within the bound.
-        assert _wait_for(
-            lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0, bound
-        )
         assert answers == [200] * cap
         assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"] * cap
         # So the next run is not turned away: it waits its own deadline for the lock.
@@ -4117,46 +4133,36 @@ def test_a_held_store_lock_costs_no_place_past_the_deadline_and_no_late_write(
     assert _usage_notes(capsys.readouterr().err) == [None] and len(runs.rows) == 1
 
 
-def test_a_write_is_given_only_the_time_that_is_left(
+def test_a_write_whose_turn_comes_after_its_deadline_does_not_start(
     cache_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Setting up the store takes time out of the same deadline: the SQL call gets the
-    rest, not a fresh two seconds."""
+    """Setting up the store takes time out of the same deadline. When it has used it
+    all, the insert is not sent, however long ago the request stopped waiting."""
     import time
 
     from tests.test_site_usage import FakeRuns
 
-    given: list[float] = []
-
-    class Timed(FakeRuns):
-        def within(self, seconds: float) -> Any:
-            given.append(seconds)
-            return self
-
-    fake = Timed()
+    fake = FakeRuns()
 
     def slow_setup(database_url: str, timeout: float) -> Any:
-        time.sleep(0.2)
+        time.sleep(0.3)
         return fake
 
     monkeypatch.setattr(http_mod, "make_usage_executor", slow_setup)
-    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 1.0)
-    s = _plain_stats_site(cache_dir, tmp_path)
-    assert _plain_run(s)[0] == 200 and _plain_run(s)[0] == 200
-    assert len(fake.rows) == 2 and len(given) == 2
-    assert 0 < given[0] <= 0.8 < given[1] <= 1.0
-    # A setup that uses up the whole deadline: the write does not start at all.
-    http_mod.reset()
     monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.1)
+    s = _plain_stats_site(cache_dir, tmp_path)
     capsys.readouterr()
     assert _plain_run(s)[0] == 200
     assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"]
     assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0, 1.0)
     time.sleep(0.2)
-    assert len(fake.rows) == 2 and len(given) == 2
+    assert fake.rows == [] and fake.round_trips == 0
+    # The store is there now: the next run has its whole deadline for the write.
+    assert _plain_run(s)[0] == 200
+    assert _usage_notes(capsys.readouterr().err) == [None] and len(fake.rows) == 1
 
 
 def test_the_statistics_read_waits_for_the_store_lock_no_longer_than_its_own_deadline(
@@ -4644,3 +4650,272 @@ def test_stats_name_only_what_this_deployment_knows_whatever_the_table_holds(
     assert data["by_code"] == [{"code": "other", "runs": 1}]
     assert data["by_fallback"] == [{"reason": "other", "runs": 1}]
     assert data["by_country"] == [{"country": None, "runs": 3}]
+
+
+# --- analytics fix round 4: the engine's client again, and what it leaves ---------------
+
+URL_SENTINEL = "postgresql://owner:npg_URLSENTINELpw9@ep-sentinel-host.neon.tech/neondb"
+URL_SECRETS = (URL_SENTINEL, "npg_URLSENTINELpw9", "URLSENTINEL", "ep-sentinel-host")
+
+
+def _neon(handler: Callable[[httpx.Request], httpx.Response]) -> Callable[..., Any]:
+    """``make_usage_executor`` (or the limiter's) as the site builds it, with the
+    network replaced by `handler`."""
+    from xwalk.retrieval.postgres import NeonHTTPExecutor
+
+    def build(database_url: str, timeout: float = http_mod.LIMITS_TIMEOUT_S) -> Any:
+        return NeonHTTPExecutor(
+            database_url,
+            timeout=timeout,
+            max_retries=0,
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        )
+
+    return build
+
+
+ECHOING_NEON: dict[str, Callable[[httpx.Request], httpx.Response]] = {
+    "a code that echoes the URL": lambda request: httpx.Response(
+        400, json={"message": f"bad {URL_SENTINEL}", "code": f"failed for {URL_SENTINEL}"}
+    ),
+    "a 200 that is not JSON": lambda request: httpx.Response(
+        200, text=f'{{"rows": [ oops {URL_SENTINEL}'
+    ),
+    "an error page": lambda request: httpx.Response(
+        502, text=f"<html>upstream {URL_SENTINEL}</html>"
+    ),
+    "a reason phrase": lambda request: httpx.Response(
+        500, text="x", extensions={"reason_phrase": f"No {URL_SENTINEL}".encode()}
+    ),
+    "a SQLSTATE and words": lambda request: httpx.Response(
+        400, json={"message": f"no relation at {URL_SENTINEL}", "code": "42P01"}
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(ECHOING_NEON), ids=list(ECHOING_NEON))
+def test_a_database_failure_reaches_the_log_as_a_class_and_a_sqlstate_only(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    """The engine's client quotes the server in its errors. Of a failed write or read
+    the site keeps the error's class and a code that has the form of a SQLSTATE, as the
+    limiter does, and with the HTTP library's own logging turned up nothing of the
+    exchange is logged either (the library logs the reason phrase)."""
+    import logging
+
+    monkeypatch.setattr(http_mod, "make_usage_executor", _neon(ECHOING_NEON[case]))
+    s = _settings(
+        cache_dir,
+        tmp_path,
+        OPENROUTER_API_KEY=SENTINEL_KEY,
+        NER_SITE_STATS_PASSCODE=STATS_PASSCODE,
+        DATABASE_URL=URL_SENTINEL,
+        NER_SITE_VISITOR_SALT="a-salt-of-its-own",
+    )
+    capsys.readouterr()
+    with caplog.at_level(logging.DEBUG):
+        result = _post(s, {"text": "x"}, llm_factory=_fake('{"entities": []}'))
+        stats = _stats(s)
+    err = capsys.readouterr().err
+    run_line, stats_line = (json.loads(line) for line in err.strip().splitlines())
+    state = " 42P01" if case == "a SQLSTATE and words" else ""
+    assert result[0] == 200 and run_line["usage"] == "PostgresError"
+    assert _error(stats) == (503, "stats_unavailable")
+    assert stats_line["stats"] == f"site runs could not be queried (PostgresError{state})"
+    logged = err + caplog.text + " ".join(repr(record.__dict__) for record in caplog.records)
+    for secret in (*URL_SECRETS, "oops", "upstream", "no relation"):
+        assert secret not in logged, (case, secret)
+        assert secret.encode() not in result[2] + stats[2]
+
+
+def test_a_connection_string_the_client_cannot_send_is_named_by_class_only(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    visits: Any,
+) -> None:
+    """A password that is not ASCII, on a deployment where the limiter makes the URL
+    kept as it is: the HTTP library refuses the header and quotes it."""
+    from ner_site import usage
+
+    url = "postgresql://owner:päss-URLSENTINEL@ep-sentinel-host.neon.tech/db"
+    monkeypatch.setattr(http_mod, "make_usage_executor", _neon(lambda r: httpx.Response(200)))
+    s = _stats_site(cache_dir, tmp_path, DATABASE_URL=url)
+    assert s.database_url == url
+    capsys.readouterr()
+    assert _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))[0] == 200
+    assert _error(_stats(s)) == (503, "stats_unavailable")
+    err = capsys.readouterr().err
+    run_line, stats_line = (json.loads(line) for line in err.strip().splitlines())
+    assert run_line["usage"] == "UnicodeEncodeError"
+    assert stats_line["stats"] == "site runs could not be queried (UnicodeEncodeError)"
+    assert "URLSENTINEL" not in err and "ep-sentinel-host" not in err
+    # The error the store raises holds nothing of the original, in itself or behind it.
+    store = next(iter(http_mod._USAGE.values()))
+    with pytest.raises(usage.UsageUnavailable) as caught:
+        store.stats(1)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "URLSENTINEL" not in repr(caught.value) + repr(vars(caught.value))
+
+
+def test_the_http_librarys_own_log_says_nothing_of_a_database_exchange(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Found by a review, older than analytics: httpx logs each request at INFO with
+    the response's reason phrase, and a server (or something in front of it) that
+    echoes the connection string there got it into the log. The filter that keeps
+    own-key exchanges out of those loggers covers the limiter's and the record of
+    runs' exchanges too, and nothing else."""
+    import logging
+
+    echo = ECHOING_NEON["a reason phrase"]
+    monkeypatch.setattr(http_mod, "make_limits_executor", _neon(echo))
+    monkeypatch.setattr(http_mod, "make_usage_executor", _neon(echo))
+    s = _stats_site(cache_dir, tmp_path, DATABASE_URL=URL_SENTINEL)
+    with caplog.at_level(logging.DEBUG):
+        # The limiter's exchange (503: it could not count), the record's, the read's.
+        assert _error(_ask(s, claude=_no_claude)) == (503, "limits_unavailable")
+        assert _error(_stats(s)) == (503, "stats_unavailable")
+        assert _health_of(s)["visitor"]["limits"] == "unavailable"
+        quiet = [r for r in caplog.records if r.name.startswith(("httpx", "httpcore"))]
+        # The same client outside those exchanges still logs as it always did.
+        with httpx.Client(transport=httpx.MockTransport(echo)) as client:
+            client.post("https://elsewhere.example/sql")
+    assert quiet == []
+    loud = [r for r in caplog.records if r.name == "httpx"]
+    assert len(loud) == 1 and "elsewhere.example" in loud[0].getMessage()
+    text = " ".join(r.getMessage() for r in caplog.records if r not in loud)
+    for secret in URL_SECRETS:
+        assert secret not in text
+
+
+class _Stalling:
+    """A server on 127.0.0.1 that takes a request and then sends nothing (``silent``)
+    or the head of a long answer and its body one byte at a time (``trickle``), until
+    it is closed."""
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.accepted = 0
+        self._stop = threading.Event()
+        self._connections: list[socket.socket] = []
+        self._server = socket.socket()
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(32)
+        self.endpoint = f"http://127.0.0.1:{self._server.getsockname()[1]}/sql"
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                connection, _ = self._server.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            self._connections.append(connection)
+            threading.Thread(target=self._serve, args=(connection,), daemon=True).start()
+
+    def _serve(self, connection: socket.socket) -> None:
+        try:
+            connection.recv(65536)
+            if self.mode == "trickle":
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+            while not self._stop.wait(0.02):
+                if self.mode == "trickle":
+                    connection.sendall(b" ")
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._server.close()
+        for connection in self._connections:
+            connection.close()
+
+
+def _engine_executor(monkeypatch: pytest.MonkeyPatch, server: _Stalling) -> None:
+    from xwalk.retrieval.postgres import NeonHTTPExecutor
+
+    monkeypatch.setattr(
+        http_mod,
+        "make_usage_executor",
+        lambda url, timeout: NeonHTTPExecutor(
+            url, timeout=timeout, max_retries=0, endpoint=server.endpoint, trust_env=False
+        ),
+    )
+
+
+def test_against_a_silent_database_the_clients_timeout_ends_the_write(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The engine's executor as the site builds it, against a server that accepts and
+    never answers: nothing releases the write but the client's own timeout, which is
+    the request's wait, and the place comes back. Run after run is tried."""
+    server = _Stalling("silent")
+    _engine_executor(monkeypatch, server)
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.3)
+    try:
+        s = _plain_stats_site(cache_dir, tmp_path)
+        capsys.readouterr()
+        count = http_mod.USAGE_MAX_IN_FLIGHT + 2
+        for _ in range(count):
+            assert _plain_run(s)[0] == 200
+        notes = _usage_notes(capsys.readouterr().err)
+        assert set(notes) <= {"TimeoutError", "PostgresError"} and len(notes) == count
+        assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0, 2)
+        assert server.accepted == count
+    finally:
+        server.close()
+
+
+def test_a_database_that_answers_a_byte_at_a_time_pauses_recording_and_nothing_else(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """What is accepted and documented. The client's timeout is for each read, so an
+    answer that keeps trickling in never ends the write: it cannot be cancelled, and
+    it keeps its place. Four such writes and recording pauses on the instance. Every
+    answer goes out as it would without analytics, later runs skip recording at once,
+    and when the connections end the places are free again."""
+    import time
+
+    server = _Stalling("trickle")
+    _engine_executor(monkeypatch, server)
+    monkeypatch.setattr(http_mod, "USAGE_TIMEOUT_S", 0.3)
+    cap = http_mod.USAGE_MAX_IN_FLIGHT
+    try:
+        healthy = _plain_run(_settings(cache_dir, tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY))
+        s = _plain_stats_site(cache_dir, tmp_path)
+        capsys.readouterr()
+        for _ in range(cap):
+            assert _plain_run(s) == healthy
+        assert _usage_notes(capsys.readouterr().err) == ["TimeoutError"] * cap
+        # Six timeouts later every place is still taken, by daemon threads.
+        time.sleep(0.3 * 6)
+        assert http_mod._USAGE_FLIGHTS.count == cap == _usage_threads()
+        assert all(t.daemon for t in threading.enumerate() if t.name == "ner-site-usage")
+        started = time.monotonic()
+        for _ in range(3):
+            assert _plain_run(s) == healthy
+        assert time.monotonic() - started < 3 * 0.3
+        assert _usage_notes(capsys.readouterr().err) == ["saturated"] * 3
+        assert server.accepted == cap
+    finally:
+        server.close()
+    # The connections ended: the writes fail, and their places are given back.
+    assert _wait_for(lambda: http_mod._USAGE_FLIGHTS.count == 0 and _usage_threads() == 0, 5)

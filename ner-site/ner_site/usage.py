@@ -690,69 +690,69 @@ class SiteRuns:
         trip, and the same result however often it runs. For provisioning before
         recording is turned on (``tools/setup_usage.py``). Raises ``UsageUnavailable``
         when the database cannot be asked."""
+        failure: UsageUnavailable | None = None
         try:
             self._executor.transaction([(self._schema, ()), (self._create, ()), (self._index, ())])
         except Exception as exc:
-            raise _unavailable(exc) from None
+            failure = _unavailable(exc)
+        if failure is not None:  # out here: the executor's error is not its context
+            raise failure
         self._created = True
 
-    def record(self, run: Run, *, timeout: float | None = None) -> None:
-        """Store one run: one round trip. ``timeout`` is what the caller has left of
-        its own deadline, in seconds: an executor that can be told (``within``, as
-        ``deadline.DeadlineExecutor``) gets that and no more. Raises
-        ``UsageUnavailable`` when the database cannot be asked; the caller must not
-        let that reach the visitor."""
+    def record(self, run: Run) -> None:
+        """Store one run: one round trip. Raises ``UsageUnavailable`` when the database
+        cannot be asked; the caller must not let that reach the visitor."""
         document = json.dumps(asdict(run), ensure_ascii=False, allow_nan=False)
-        self._send((self._insert, (document,)), timeout)
+        self._send((self._insert, (document,)))
 
-    def stats(
-        self,
-        days: int = DEFAULT_DAYS,
-        *,
-        models: Collection[str] = (),
-        timeout: float | None = None,
-    ) -> dict[str, Any]:
+    def stats(self, days: int = DEFAULT_DAYS, *, models: Collection[str] = ()) -> dict[str, Any]:
         """The statistics of the last ``days`` UTC days, today included (1 to
         ``MAX_DAYS``, else ``ValueError``): one round trip. ``models`` are the ids the
         deployment lists (``run_of``): a model the table names that is none of them
-        is ``other`` in the answer. ``timeout`` as for ``record``. Raises
-        ``UsageUnavailable`` when the database cannot be asked or its answer cannot be
-        read."""
+        is ``other`` in the answer. Raises ``UsageUnavailable`` when the database
+        cannot be asked or its answer cannot be read."""
         if type(days) is not int or not 1 <= days <= MAX_DAYS:
             raise ValueError(f"days must be a whole number from 1 to {MAX_DAYS}")
         now = self._clock()
         last = datetime.fromtimestamp(now, tz=timezone.utc).date()
         first = last - timedelta(days=days - 1)
-        rows = self._send((self._stats, (first.isoformat(), last.isoformat())), timeout)
+        rows = self._send((self._stats, (first.isoformat(), last.isoformat())))
+        answer: dict[str, Any] | None = None
         try:
             answer = shape(rows[0]["stats"], days=days, generated_at=now, models=models)
             if len(answer["by_day"]) != days:
-                raise ValueError("the statistics do not cover the days asked for")
+                answer = None
         except (LookupError, TypeError, ValueError):
-            raise UsageUnavailable("site runs answered with an unreadable row") from None
+            answer = None
+        if answer is None:  # out here: a decoder's error holds what it could not read
+            raise UsageUnavailable("site runs answered with an unreadable row")
         return answer
 
-    def _send(self, statement: Statement, timeout: float | None = None) -> list[dict[str, Any]]:
+    def _send(self, statement: Statement) -> list[dict[str, Any]]:
         """One round trip: the statement, behind the table's creation when this instance
-        has not sent it yet. Returns the statement's rows."""
-        executor = self._executor
-        within = getattr(executor, "within", None)
-        if timeout is not None and callable(within):
-            executor = within(timeout)
+        has not sent it yet. Returns the statement's rows.
+
+        What the executor raises is replaced (``_unavailable``: its class and its
+        SQLSTATE) and the replacement is raised outside the handler, so the original,
+        whose text may quote the server or the connection string, is neither its cause
+        nor its context."""
         provisioning = not self._created
+        failure: UsageUnavailable | None = None
+        rows: list[dict[str, Any]] = []
         try:
             if provisioning:
                 lead: list[Statement] = [(self._create, ()), (self._index, ())]
-                rows = executor.transaction([*lead, statement])[-1]
+                rows = self._executor.transaction([*lead, statement])[-1]
             else:
-                rows = executor.execute(*statement)
+                rows = self._executor.execute(*statement)
         except Exception as exc:
             failure = _unavailable(exc)
+        if failure is not None:
             if failure.code == _UNDEFINED_TABLE:
                 # The table this instance created is gone (dropped to delete the data).
                 # This statement is lost; the next one creates the table again.
                 self._created = False
-            raise failure from None
+            raise failure
         if provisioning:
             # Only a call that created the table says that it is there. A plain insert
             # that succeeds says nothing: its answer may be late, from before a drop
