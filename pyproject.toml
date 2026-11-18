@@ -12,7 +12,10 @@ license = "MIT"
 dependencies = ["xwalk-match @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cryptography>=42", "hatchling", "anthropic>=2.10,<3"]
+# anthropic is pinned exactly, as in ner-site/requirements.txt: ner-site/ner_site/providers.py
+# keeps a visitor's own key apart from the operator's environment by knowing what this
+# version of the SDK reads and sends (AUDITED_SDK). Re-audit before changing it.
+dev = ["pytest>=8.2", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cryptography>=42", "hatchling", "anthropic==2.10.0"]
 chatgpt = ["xwalk-match[chatgpt] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 dense = ["xwalk-match[dense] @ git+https://github.com/jan3657/xwalk.git@62b8d592515ade0d59c39462eca4f079954b7856"]
 

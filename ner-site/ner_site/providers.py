@@ -26,6 +26,11 @@ The rules everything here follows:
   ``NER_SITE_BASE_URL`` and ``ANTHROPIC_BASE_URL`` do not apply. Redirects are not
   followed and the environment's proxies, ``.netrc`` and credentials are not read
   (``_claude``, ``_compat``), so the key goes to the provider's host and nowhere else.
+  Every client sends through a transport of this module (``_Wire``) that looks at each
+  request as it leaves and each response as it arrives: a request that is not for the
+  pinned host with the visitor's key is not sent, and a redirect or a response header
+  that echoes the key is cut down before the HTTP library can parse it into a cache
+  that outlives the request.
 - **The operator's keys are not used.** Each client is given the visitor's key
   explicitly; there is no fallback chain, no server-side refusal fallback, no Claude
   block and no key check. Nothing the operator's environment holds for the site's own
@@ -84,6 +89,20 @@ BASE_URLS: dict[str, str] = {
 }
 # The SDK adds the path itself; passed explicitly so ANTHROPIC_BASE_URL is not read.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# Where each provider's requests may go, and nowhere else (``_Wire``).
+HOSTS: dict[str, str] = {
+    "anthropic": "api.anthropic.com",
+    "openai": "api.openai.com",
+    "openrouter": "openrouter.ai",
+}
+# The version of the ``anthropic`` SDK that ``_claude`` was written against: what it
+# reads from the environment and what it puts on the wire were read in that version's
+# source. It is pinned in ner-site/requirements.txt and pyproject.toml, and a test fails
+# on any other version, naming what to look at again before the pin moves.
+AUDITED_SDK = "2.10.0"
+# The ``anthropic-version`` header of that SDK (its ``ANTHROPIC_API_VERSION``, which it
+# does not export).
+ANTHROPIC_VERSION = "2026-10-21"
 KEY_MIN, KEY_MAX = 20, 512
 
 EXTRACT, SELECT = "extract", "select"
@@ -436,7 +455,9 @@ def _sealed_error(exc: Exception, provider: str) -> Exception:
     usage = getattr(exc, "usage", None)
     usage = usage if isinstance(usage, Usage) else None
     sealed: Exception
-    if isinstance(exc, CallLimitExceeded):
+    if isinstance(exc, WireRefused):
+        sealed = WireRefused(f"{name} request failed ({word})", usage=usage)
+    elif isinstance(exc, CallLimitExceeded):
         sealed = CallLimitExceeded(f"{name} call limit for this request reached", usage=usage)
     elif isinstance(exc, ClaudeRefused):
         sealed = ClaudeRefused(f"{name} request failed ({word})", usage=usage)
@@ -448,6 +469,112 @@ def _sealed_error(exc: Exception, provider: str) -> Exception:
         sealed = LLMFatalError(f"{name} request failed ({word})", usage=usage)
     sealed.reason = word  # type: ignore[attr-defined]
     return sealed
+
+
+class WireRefused(LLMFatalError):
+    """A request built for a visitor's key was not sent: it was not for the provider's
+    host, did not carry exactly the visitor's key, or (Anthropic) carried a header or a
+    value the SDK does not send on its own. The message is the fixed one of any failed
+    request; the class name is what the log shows (``own_error``)."""
+
+
+class _NotSent(RuntimeError):
+    """Raised inside the transport; replaced by :class:`WireRefused` before it leaves."""
+
+
+class _Wire:
+    """The last thing a request passes and the first thing a response meets: a wrapper
+    around the real transport of one own-key client (``_HttpxWire`` for the engine's
+    client, ``_Httpx2Wire`` for the SDK's).
+
+    Going out, a request is refused unless it is ``https`` to the provider's host on the
+    default port, with exactly one ``Authorization`` header holding the visitor's key.
+    For Anthropic the whole header set is checked as well (``expect``): every name must
+    be one the SDK sends on its own, once, with the value the SDK computes, so nothing
+    from the operator's environment rides along under any name. Until ``expect`` has
+    been called such a wire refuses everything. A refusal sends nothing, names no header
+    and no value, and sets ``refused``.
+
+    Coming back, before the HTTP library reads the response:
+
+    - a redirect (any 3xx) is replaced by a bare response of the same status. Redirects
+      are not followed, but the library still works out where one points, and a
+      relative ``Location`` goes through ``urllib.parse``, whose ``urlsplit`` cache
+      lives as long as the process: a ``Location`` that echoed the key would stay
+      there on a warm instance after the client is closed.
+    - any other response loses each header whose value contains the key. A charset is
+      looked up through ``codecs`` and ``encodings`` remembers every name it did not
+      find; cookies and the rest are parsed too. The body is not touched: what a body
+      says is replaced further in (``_Sealed``)."""
+
+    _response: Any  # the library's Response class
+    _headers: Any  # the library's Headers class
+
+    def __init__(self, inner: Any, credential: Credential, *, strict: bool = False) -> None:
+        self._inner = inner
+        self._host = HOSTS[credential.provider]
+        self._token = credential.token  # a callable whose repr shows nothing
+        self._strict = strict
+        self._expected: dict[str, frozenset[str]] | None = None
+        self.refused = False
+
+    def expect(self, headers: Mapping[str, Sequence[str]]) -> None:
+        """The header names a request may carry beside ``Authorization``, ``Host`` and
+        ``Content-Length``, each with the values it may have."""
+        self._expected = {name.lower(): frozenset(values) for name, values in headers.items()}
+
+    def _allowed(self, request: Any) -> bool:
+        url = request.url
+        if url.scheme != "https" or url.host != self._host or url.port is not None or url.userinfo:
+            return False
+        sent: dict[str, list[str]] = {}
+        for name, value in request.headers.multi_items():
+            sent.setdefault(name.lower(), []).append(value)
+        if sent.get("authorization") != [f"Bearer {self._token()}"]:
+            return False
+        if not self._strict:
+            return True
+        if self._expected is None or sent.get("host") != [self._host]:
+            return False
+        for name, values in sent.items():
+            if len(values) != 1:
+                return False
+            if name in ("authorization", "host"):
+                continue
+            if name == "content-length":
+                if not values[0].isascii() or not values[0].isdigit():
+                    return False
+            elif values[0] not in self._expected.get(name, ()):
+                return False
+        return True
+
+    async def handle_async_request(self, request: Any) -> Any:
+        if not self._allowed(request):
+            self.refused = True
+            raise _NotSent("a request was not the one built for this key; nothing was sent")
+        response = await self._inner.handle_async_request(request)
+        if 300 <= response.status_code < 400:
+            await response.aclose()
+            return self._response(response.status_code, request=request)
+        key = self._token().encode("ascii")
+        if any(key in value for _, value in response.headers.raw):
+            response.headers = self._headers(
+                [(name, value) for name, value in response.headers.raw if key not in value]
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class _HttpxWire(_Wire, httpx.AsyncBaseTransport):
+    _response = httpx.Response
+    _headers = httpx.Headers
+
+
+class _Httpx2Wire(_Wire, httpx2.AsyncBaseTransport):
+    _response = httpx2.Response
+    _headers = httpx2.Headers
 
 
 class _QuietBudget:
@@ -470,10 +597,11 @@ class _Sealed:
     upstream text passes: every error is replaced (``_sealed_error``), and the key is
     removed from an answer's text and model name should either ever contain it."""
 
-    def __init__(self, inner: LLMClient, credential: Credential) -> None:
+    def __init__(self, inner: LLMClient, credential: Credential, wire: _Wire | None = None) -> None:
         self._inner = inner
         self._provider = credential.provider
         self._token = credential.token
+        self._wire = wire
 
     @property
     def model(self) -> str:
@@ -506,6 +634,14 @@ class _Sealed:
             response = await self._inner.complete(request)
         except Exception as exc:  # noqa: BLE001 - every failure leaves in fixed words
             failure = _seal(exc, self._provider)
+            if self._wire is not None and self._wire.refused:
+                # Not a provider's failure: the request never left (``_Wire``). The
+                # libraries report it as a dropped connection; say what it was.
+                failure = WireRefused(
+                    f"{_name(self._provider)} request failed (error)",
+                    usage=getattr(failure, "usage", None),
+                )
+                failure.reason = "error"  # type: ignore[attr-defined]
         else:
             return self._clean(response)
         # Raised out here, not inside the handler, so that the original is neither the
@@ -577,8 +713,8 @@ _SDK_HEADERS = frozenset(
 
 def _own_headers_only(headers: Mapping[str, Any], key: str) -> None:
     """Refuse a client whose default headers are not the SDK's own with the visitor's
-    key: the last check that nothing from the operator's environment rides along. The
-    message names no header and no value."""
+    key. This looks at the client, by name; what is checked on every request, by name
+    and value, is ``_Wire``. The message names no header and no value."""
     names = {str(name).lower() for name in headers}
     foreign = {
         name for name in names if name not in _SDK_HEADERS and not name.startswith("x-stainless-")
@@ -588,11 +724,35 @@ def _own_headers_only(headers: Mapping[str, Any], key: str) -> None:
         raise RuntimeError("the Anthropic client would send headers it was not given")
 
 
+def _sdk_wire_headers(sdk: Any, http: Any, timeout: float) -> dict[str, tuple[str, ...]]:
+    """What a request of the SDK (2.10.0) carries beside the credential, with the values
+    the SDK and its HTTP client compute themselves: ``_base_client._build_headers``,
+    ``default_headers`` and ``platform_headers``, read through public attributes only.
+    Anything else on a request, or another value under one of these names, did not come
+    from the SDK."""
+    return {
+        "accept": ("application/json",),
+        "content-type": ("application/json",),
+        # The HTTP client's own defaults (it is built here, with no headers of ours).
+        "accept-encoding": (http.headers["accept-encoding"],),
+        "connection": (http.headers["connection"],),
+        "user-agent": (sdk.user_agent,),
+        "anthropic-version": (ANTHROPIC_VERSION,),
+        **{name.lower(): (value,) for name, value in sdk.platform_headers().items()},
+        "x-stainless-async": ("async:asyncio",),
+        "x-stainless-retry-count": ("0",),  # max_retries=0: there is no second attempt
+        # The per-request timeout (none is passed) and the client's, as the SDK prints them.
+        "x-stainless-timeout": ("NOT_GIVEN", str(timeout)),
+        "x-stainless-read-timeout": (str(timeout),),
+    }
+
+
 def _claude(
     credential: Credential, model: str, purpose: str, effort: str, timeout: float, transport: Any
-) -> LLMClient:
+) -> tuple[LLMClient, _Wire]:
     """Claude on the visitor's key: the adapter with the site's effort and token limits,
     no server-side refusal fallback, and an SDK client that can reach one host only.
+    Returned with the wire it sends through.
 
     The SDK's default HTTP client follows redirects and builds its proxies from the
     environment even with ``trust_env=False`` (2.10.0 ``_DefaultAsyncHttpxClient`` reads
@@ -614,12 +774,27 @@ def _claude(
       for it. ``default_headers`` wins over the variable for the same name, which covers
       the credential; every other line is dropped by emptying the custom headers once
       the client exists (they then hold nothing else: this client is given none).
-      ``_own_headers_only`` then checks what the client would send and refuses to build
-      it otherwise, so an SDK that stores them elsewhere fails closed, not open.
+
+    The emptying goes through a private attribute, so it is not what the rest relies
+    on. ``_own_headers_only`` refuses a client whose defaults are not the SDK's own, and
+    the wire (``_Wire``, strict) refuses every single request that is not: the pinned
+    host, the visitor's key once, and no header but the SDK's own with the SDK's own
+    value (``_sdk_wire_headers``). An SDK that kept the environment's headers somewhere
+    else, or applied them later, would have its requests stopped there, unsent. That
+    list of headers is the SDK's of one version, which is why the version is pinned
+    (``AUDITED_SDK``).
 
     One request per call (``max_retries=0``), as on the site's key, so nothing is
     retried out of sight of the call budget."""
     key = credential.token()
+    wire = _Httpx2Wire(
+        transport if transport is not None else httpx2.AsyncHTTPTransport(trust_env=False),
+        credential,
+        strict=True,
+    )
+    http = anthropic.DefaultAsyncHttpxClient(
+        transport=wire, follow_redirects=False, trust_env=False
+    )
     sdk = anthropic.AsyncAnthropic(
         api_key=key,
         base_url=ANTHROPIC_BASE_URL,
@@ -627,17 +802,12 @@ def _claude(
         timeout=timeout,
         open_telemetry=False,
         default_headers={"Authorization": f"Bearer {key}"},
-        http_client=anthropic.DefaultAsyncHttpxClient(
-            transport=transport
-            if transport is not None
-            else httpx2.AsyncHTTPTransport(trust_env=False),
-            follow_redirects=False,
-            trust_env=False,
-        ),
+        http_client=http,
     )
     sdk._custom_headers = {}  # noqa: SLF001 - ANTHROPIC_CUSTOM_HEADERS, see above
     _own_headers_only(sdk.default_headers, key)
-    return ClaudeClient(
+    wire.expect(_sdk_wire_headers(sdk, http, timeout))
+    client = ClaudeClient(
         model,
         api_key=key,
         max_tokens=EXTRACT_MAX_TOKENS if purpose == EXTRACT else SELECT_MAX_TOKENS,
@@ -646,35 +816,43 @@ def _claude(
         refusal_fallback=False,
         client=sdk,
     )
+    return client, wire
 
 
 def _compat(
     credential: Credential, model: str, purpose: str, transport: Any, backoff_base: float
-) -> LLMClient:
+) -> tuple[LLMClient, _Wire]:
     """OpenAI or OpenRouter on the visitor's key, through the engine's client: redirects
     are not followed (httpx's default, which the engine keeps) and ``trust_env=False``
     keeps the environment's proxies and ``.netrc`` out of it. Retries, timeout and, on
-    OpenRouter, the token limits are the site's own for the same purpose."""
+    OpenRouter, the token limits are the site's own for the same purpose. Returned with
+    the wire it sends through (``_Wire``: the pinned host, the visitor's key)."""
     from ner_site import service  # at call time: service imports this module
 
     extract = purpose == EXTRACT
+    wire = _HttpxWire(
+        # What the engine's client would build for itself when given no transport.
+        transport if transport is not None else httpx.AsyncHTTPTransport(trust_env=False),
+        credential,
+    )
     common: dict[str, Any] = {
         "api_key": credential.token(),
         "timeout": service.LLM_TIMEOUT_S,
         "max_retries": service.LLM_MAX_RETRIES if extract else SELECT_MAX_RETRIES,
         "backoff_base": backoff_base,
-        "transport": transport,
+        "transport": wire,
         "trust_env": False,
     }
     if credential.provider == "openai":
-        return OpenAIClient(
+        client: LLMClient = OpenAIClient(
             BASE_URLS["openai"],
             model,
             profile="openai",
             max_tokens=EXTRACT_MAX_TOKENS if extract else SELECT_MAX_TOKENS,
             **common,
         )
-    return service.OpenRouterClient(
+        return client, wire
+    client = service.OpenRouterClient(
         BASE_URLS["openrouter"],
         model,
         profile=service.provider_profile(model),
@@ -683,6 +861,7 @@ def _compat(
         extra_headers={"HTTP-Referer": service.SITE_URL, "X-Title": service.SITE_TITLE},
         **common,
     )
+    return client, wire
 
 
 def own_llm(
@@ -717,14 +896,17 @@ def own_llm(
 
         # No chain to leave time for, so both purposes get the ordinary request timeout
         # rather than the shorter one a chain's Claude extraction has.
-        claude = _claude(credential, model, purpose, effort, service.LLM_TIMEOUT_S, transport)
-        return _Budgeted(_Sealed(claude, credential), budget, credential.provider)
-    inner = _compat(credential, model, purpose, transport, backoff_base)
-    return _Budgeted(_SealedGated(inner, credential), budget, credential.provider)
+        claude, wire = _claude(credential, model, purpose, effort, service.LLM_TIMEOUT_S, transport)
+        return _Budgeted(_Sealed(claude, credential, wire), budget, credential.provider)
+    inner, wire = _compat(credential, model, purpose, transport, backoff_base)
+    return _Budgeted(_SealedGated(inner, credential, wire), budget, credential.provider)
 
 
 __all__ = [
+    "ANTHROPIC_VERSION",
+    "AUDITED_SDK",
     "BASE_URLS",
+    "HOSTS",
     "KEY_MAX",
     "KEY_MIN",
     "OWN_PROVIDERS",
@@ -732,6 +914,7 @@ __all__ = [
     "SITE",
     "WORDS",
     "Credential",
+    "WireRefused",
     "OpenAIClient",
     "ProviderInfo",
     "failure_word",

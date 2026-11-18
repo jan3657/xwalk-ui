@@ -1101,3 +1101,352 @@ async def test_a_request_leaves_no_module_level_state(provider: str) -> None:
     assert service._KEY_CACHE == {}  # noqa: SLF001
     for text in after.values():
         assert KEY not in text
+
+
+# --- the transport boundary: redirects, echoing headers, the wire guard (final review) --
+
+
+def in_parse_caches(needle: str) -> list[str]:
+    """Strings containing `needle` in any cache reachable from ``urllib.parse``: the
+    ``lru_cache`` of ``urlsplit`` and friends (3.11 and later) or ``_parse_cache`` (3.10)."""
+    import gc
+    import types
+    import urllib.parse
+
+    stack: list[Any] = [
+        value
+        for name, value in vars(urllib.parse).items()
+        if hasattr(value, "cache_info")
+        or (isinstance(value, (dict, list, set)) and not name.startswith("__"))
+    ]
+    seen: set[int] = set()
+    hits: list[str] = []
+    skipped = (types.ModuleType, types.FunctionType, types.BuiltinFunctionType, type)
+    while stack:
+        item = stack.pop()
+        if id(item) in seen or isinstance(item, skipped):
+            continue
+        seen.add(id(item))
+        if isinstance(item, (str, bytes)):
+            if (needle if isinstance(item, str) else needle.encode()) in item:
+                hits.append(repr(item))
+            continue
+        stack.extend(gc.get_referents(item))
+    return hits
+
+
+def held_anywhere(needle: str, mine: tuple[Any, ...]) -> list[str]:
+    """Every string containing `needle` that a live container still refers to, other
+    than the test's own (`mine`, by identity)."""
+    import gc
+    import types
+
+    gc.collect()
+    own = {id(item) for item in mine}
+    hits: list[str] = []
+    for holder in gc.get_objects():
+        if isinstance(holder, (types.FrameType, types.CodeType)) or id(holder) in own:
+            continue
+        for item in gc.get_referents(holder):
+            if id(item) in own or not isinstance(item, (str, bytes)):
+                continue
+            if (needle if isinstance(item, str) else needle.encode()) in item:
+                hits.append(f"{type(holder).__name__}: {item!r}")
+    return hits
+
+
+async def fail_once(provider: str, key: str, respond: Any) -> tuple[str, int]:
+    """One failing call on `key` against `respond`, the client closed and dropped: the
+    error's text and how many requests went out. Nothing of the call is returned."""
+    lib: Any = httpx2 if provider == "anthropic" else httpx
+    sent = 0
+
+    def handler(request: Any) -> Any:
+        nonlocal sent
+        sent += 1
+        return respond(lib, request.headers["authorization"].split(" ", 1)[1])
+
+    llm = own_llm(
+        credential_for(provider, key),
+        MODELS[provider],
+        purpose="extract",
+        effort="low",
+        max_entities=30,
+        call_cap=1,
+        transport=lib.MockTransport(handler),
+        backoff_base=0.0,
+    )
+    try:
+        await llm.complete(REQUEST)
+    except LLMError as exc:
+        said = f"{type(exc).__name__}: {exc} ({failure_word(exc)})"
+    else:
+        said = "answered"
+    await llm.aclose()
+    return said, sent
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_redirect_that_echoes_the_key_leaves_it_in_no_cache(
+    provider: str, status: int
+) -> None:
+    """Even with redirects not followed, the HTTP library works out where a redirect
+    points, and a relative ``Location`` goes through ``urllib.parse.urljoin``, whose
+    ``urlsplit`` cache outlives the client on a warm instance. A provider that echoes
+    the key there must leave nothing behind."""
+    import urllib.parse
+
+    key = f"sk-REDIRECT-{provider}-{status}-0123456789abcdef"
+    needle = key[3:]  # also found inside a longer string
+    urllib.parse.clear_cache()
+
+    def respond(lib: Any, echoed: str) -> Any:
+        return lib.Response(status, headers={"Location": f"/v1/moved?echo={echoed}"})
+
+    said, sent = await fail_once(provider, key, respond)
+    assert sent == 1  # the provider's redirect is the failure; nothing followed it
+    assert said == f"LLMFatalError: {PROVIDER_NAMES[provider]} request failed (error) (error)"
+    assert in_parse_caches(needle) == []
+    assert held_anywhere(needle, (key, needle)) == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_an_absolute_redirect_is_stripped_too(provider: str) -> None:
+    key = f"sk-ABSOLUTE-{provider}-0123456789abcdef"
+
+    def respond(lib: Any, echoed: str) -> Any:
+        return lib.Response(
+            302, headers={"Location": f"https://elsewhere.invalid/collect?k={echoed}"}, text=echoed
+        )
+
+    needle = key[3:]
+    said, sent = await fail_once(provider, key, respond)
+    assert (sent, failure_word_of(said)) == (1, "error")
+    assert held_anywhere(needle, (key, needle)) == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_redirect_location_is_never_parsed(provider: str) -> None:
+    """Not only a literal echo: the key reversed, encoded or cut in pieces would pass a
+    search for it, so no ``Location`` reaches the HTTP library at all."""
+    import urllib.parse
+
+    key = f"sk-MIRRORED-{provider}-0123456789abcdef"
+    mirrored = key[::-1]
+    urllib.parse.clear_cache()
+
+    def respond(lib: Any, echoed: str) -> Any:
+        return lib.Response(307, headers={"Location": f"/v1/moved?echo={echoed[::-1]}"})
+
+    said, sent = await fail_once(provider, key, respond)
+    assert (sent, failure_word_of(said)) == (1, "error")
+    assert in_parse_caches(mirrored) == []
+    assert held_anywhere(mirrored, (mirrored,)) == []
+
+
+def failure_word_of(said: str) -> str:
+    return said.rsplit("(", 1)[1].rstrip(")")
+
+
+@pytest.mark.parametrize("status", [200, 401])
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_key_echoed_in_a_response_header_reaches_no_process_cache(
+    provider: str, status: int
+) -> None:
+    """A charset the response claims is looked up through ``codecs``, and the
+    ``encodings`` package remembers every name it did not find, for the life of the
+    process. A header that carries the key is dropped before the HTTP library reads it."""
+    import encodings
+
+    key = f"sk-CHARSET.{provider}.{status}.0123456789abcdef"
+
+    def respond(lib: Any, echoed: str) -> Any:
+        return lib.Response(
+            status,
+            headers={
+                "Content-Type": f"text/plain; charset={echoed}",
+                "Set-Cookie": f"session={echoed}",
+                "X-Request-Id": echoed,
+            },
+            content=b"not json",
+        )
+
+    needle = key[3:]
+    said, sent = await fail_once(provider, key, respond)
+    assert sent == 1 and needle not in said
+    marker = f"charset.{provider}.{status}"
+    assert [name for name in encodings._cache if marker in name.lower()] == []  # noqa: SLF001
+    assert held_anywhere(needle, (key, needle)) == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_an_answer_whose_header_echoes_the_key_is_still_read(provider: str) -> None:
+    def echoing(request: Any) -> Any:
+        lib: Any = httpx2 if provider == "anthropic" else httpx
+        model = json.loads(request.content)["model"]
+        body = message_body(model) if provider == "anthropic" else chat_body(model)
+        return lib.Response(200, headers={"X-Echo": KEY, "X-Kept": "kept"}, json=body)
+
+    llm = build(Wire(provider, echoing))
+    response = await llm.complete(REQUEST)
+    await llm.aclose()
+    assert response.text == '{"entities": []}'
+
+
+# What an SDK that applied the operator's environment in another layer than the one
+# ``providers._claude`` empties would put on the wire: each under a name the SDK itself
+# sends (so a check of names alone passes it), or beside them.
+OPERATOR_ON_THE_WIRE = [
+    {"Authorization": f"Bearer {SITE_ANTHROPIC_KEY}"},
+    {"X-Api-Key": SITE_ANTHROPIC_KEY},
+    {"User-Agent": "OPERATOR-agent"},
+    {"anthropic-version": "1999-01-01"},
+    {"X-Stainless-Lang": "OPERATOR-lang"},
+    {"X-Stainless-Package-Version": "OPERATOR"},
+    {"X-Stainless-OS": "OPERATOR-os"},
+    {"x-stainless-retry-count": "OPERATOR"},
+    {"X-Stainless-Helper": "OPERATOR-helper"},
+    {"Accept": "OPERATOR/accept"},
+    {"Accept-Encoding": "OPERATOR"},
+    {"anthropic-beta": "server-side-fallback-2026-07-01"},
+    {"X-Operator-Org": "OPERATOR-org"},
+    {"traceparent": "00-OPERATOR-01"},
+]
+
+
+@pytest.mark.parametrize("extra", OPERATOR_ON_THE_WIRE, ids=lambda extra: next(iter(extra)))
+async def test_an_operator_header_on_the_wire_stops_the_anthropic_request(
+    extra: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check is of the request about to be sent, not of the client's defaults: a
+    header an upgraded SDK adds after them is seen, and so is the operator's value
+    under a name the SDK uses."""
+    import anthropic
+
+    real = anthropic.AsyncAnthropic._build_headers  # noqa: SLF001
+
+    def late(self: Any, *args: Any, **kwargs: Any) -> Any:
+        headers = real(self, *args, **kwargs)
+        for name, value in extra.items():
+            headers[name] = value
+        return headers
+
+    monkeypatch.setattr(anthropic.AsyncAnthropic, "_build_headers", late)
+    wire = Wire("anthropic")
+    llm = build(wire)
+    with pytest.raises(providers.WireRefused) as caught:
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []  # nothing left the process
+    assert str(caught.value) == "Anthropic request failed (error)"
+    assert failure_word(caught.value) == "error"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert leaks(str(caught.value) + repr(vars(caught.value))) == []
+    error = provider_error(caught.value, "anthropic")
+    assert (error.status, error.code) == (502, "provider_error")
+    assert "OPERATOR" not in strings(error) and SITE_ANTHROPIC_KEY not in strings(error)
+
+
+async def test_a_second_authorization_header_stops_the_anthropic_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anthropic
+
+    real = anthropic.AsyncAnthropic._build_request  # noqa: SLF001
+
+    def doubled(self: Any, *args: Any, **kwargs: Any) -> Any:
+        request = real(self, *args, **kwargs)
+        raw = [*request.headers.raw, (b"Authorization", f"Bearer {SITE_ANTHROPIC_KEY}".encode())]
+        request.headers = httpx2.Headers(raw)
+        return request
+
+    monkeypatch.setattr(anthropic.AsyncAnthropic, "_build_request", doubled)
+    wire = Wire("anthropic")
+    llm = build(wire)
+    with pytest.raises(providers.WireRefused):
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+@pytest.mark.parametrize(
+    "elsewhere",
+    [
+        "https://elsewhere.invalid/v1/",
+        "http://{host}/v1/",
+        "https://{host}:8443/v1/",
+        "https://user:pw@{host}/v1/",
+        "https://{host}.elsewhere.invalid/v1/",
+    ],
+)
+async def test_a_request_to_another_address_is_not_sent(provider: str, elsewhere: str) -> None:
+    """The base URLs are constants; should anything ever move a client off its host,
+    the key does not follow."""
+    wire = Wire(provider)
+    llm = build(wire)
+    inner = llm.inner._inner  # type: ignore[attr-defined]  # noqa: SLF001
+    target = elsewhere.format(host=HOSTS[provider])
+    if provider == "anthropic":
+        inner._client.base_url = target  # noqa: SLF001
+    else:
+        inner._base_url = target.rstrip("/")  # noqa: SLF001
+    with pytest.raises(providers.WireRefused) as caught:
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []
+    assert str(caught.value) == f"{PROVIDER_NAMES[provider]} request failed (error)"
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter"])
+async def test_another_bearer_on_an_openai_compatible_request_is_not_sent(provider: str) -> None:
+    wire = Wire(provider)
+    llm = build(wire)
+    llm.inner._inner._api_key = SITE_OPENROUTER_KEY  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(providers.WireRefused):
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_the_wire_guard_shows_no_key(provider: str) -> None:
+    llm = build(Wire(provider))
+    inner = llm.inner._inner  # type: ignore[attr-defined]  # noqa: SLF001
+    http = inner._client._client if provider == "anthropic" else inner._client  # noqa: SLF001
+    guard = http._transport  # noqa: SLF001
+    assert isinstance(guard, providers._Wire)  # noqa: SLF001
+    assert KEY not in repr(guard) and KEY not in repr(vars(guard))
+    await llm.aclose()
+
+
+def test_the_anthropic_sdk_is_the_audited_version() -> None:
+    """``providers._claude`` keeps the operator's environment out of a visitor's request
+    by knowing exactly what SDK 2.10.0 reads and sends. A different version has not been
+    looked at."""
+    import anthropic
+
+    assert anthropic.__version__ == providers.AUDITED_SDK == "2.10.0", (
+        f"anthropic {anthropic.__version__} is installed but providers._claude was audited "
+        f"against {providers.AUDITED_SDK}. Before changing the pin, re-audit for the new "
+        "version: (1) every environment variable the SDK reads (_client.py, _tracing.py) "
+        "and whether an explicit api_key, base_url and open_telemetry=False still keep it "
+        "out; (2) where ANTHROPIC_CUSTOM_HEADERS is stored and applied, and that emptying "
+        "it still works; (3) the headers a request carries on the wire and their values "
+        "(providers._claude's expected set, ANTHROPIC_VERSION); (4) that the default HTTP "
+        "client still takes a transport and reads no proxy with one. Then update "
+        "AUDITED_SDK, both pins (ner-site/requirements.txt, pyproject.toml) and run the "
+        "own-key Anthropic rollout check in ner-site/README.md."
+    )
+
+
+def test_the_anthropic_sdk_is_pinned_where_it_is_installed_from() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    pin = f"anthropic=={providers.AUDITED_SDK}"
+    requirements = (root / "ner-site" / "requirements.txt").read_text().splitlines()
+    assert [line for line in requirements if line.startswith("anthropic")] == [pin]
+    assert f'"{pin}"' in (root / "pyproject.toml").read_text()
+    assert providers.ANTHROPIC_VERSION == "2026-10-21"
