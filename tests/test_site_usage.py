@@ -780,6 +780,42 @@ def test_a_late_answer_to_an_insert_sent_before_the_drop_does_not_bring_the_flag
     assert fake.tags()[-1] == "site_run" and fake.tags().count("site_runs_table") == 2
 
 
+def test_a_late_answer_to_a_provisioning_sent_before_the_drop_does_not_set_the_flag() -> None:
+    """The same for a call that created the table: its answer, late, from before a drop
+    that another call has met since, says nothing about the table now."""
+    import threading
+
+    runs, fake = make()
+    sent, release = threading.Event(), threading.Event()
+    real = fake.transaction
+
+    def slow(statements: Any, **kwargs: Any) -> Any:
+        rows = real(statements, **kwargs)  # the table is made, the row is in
+        sent.set()
+        release.wait(10)
+        return rows
+
+    fake.transaction = slow  # type: ignore[method-assign]
+    early = threading.Thread(target=lambda: runs.record(a_run(status=201)))
+    early.start()
+    assert sent.wait(10)
+    fake.transaction = real  # type: ignore[method-assign]
+    runs.record(a_run(status=202))  # another call provisions, and is acknowledged
+    assert fake.tags()[-3:] == ["site_runs_table", "site_runs_index", "site_run"]
+    fake.created, fake.rows = False, []  # DROP TABLE
+    with pytest.raises(UsageUnavailable) as caught:
+        runs.record(a_run(status=203))
+    assert caught.value.code == "42P01"
+    release.set()
+    early.join(10)
+    # The late acknowledgement changed nothing: the next run provisions and is kept.
+    runs.record(a_run(status=204))
+    assert [row["status"] for row in fake.rows] == [204]
+    assert fake.tags()[-3:] == ["site_runs_table", "site_runs_index", "site_run"]
+    runs.record(a_run(status=205))
+    assert fake.tags()[-1] == "site_run" and len(fake.rows) == 2
+
+
 def test_a_failed_first_call_creates_the_table_on_the_next() -> None:
     runs, fake = make()
     fake.fail = PostgresError("down")
@@ -1150,10 +1186,10 @@ def test_runs_that_never_reached_a_model_are_in_the_null_row_and_not_unpriced() 
     assert answer["totals"]["runs"] == 5
 
 
-def test_numbers_that_arrive_as_strings_or_floats_are_read() -> None:
-    raw = _raw([_group(runs="2", prompt_tokens="1000000", selector_cost_usd="0")])
-    raw["by_day"][0].update(runs="2", ok="1", visitors="1", p50_ms="1500", p95_ms=2900.0)
-    raw["by_code"] = [{"code": "provider_error", "runs": "1"}]
+def test_whole_numbers_that_arrive_as_floats_are_read() -> None:
+    raw = _raw([_group(runs=2.0, prompt_tokens=1000000.0, selector_cost_usd=0)])
+    raw["by_day"][0].update(runs=2, ok=1, visitors=1.0, p50_ms=1500, p95_ms=2900.0)
+    raw["by_code"] = [{"code": "provider_error", "runs": 1}]
     answer = shape(json.dumps(raw), days=1, generated_at=NOW)
     assert answer["totals"] == {
         "runs": 2,
@@ -1167,6 +1203,131 @@ def test_numbers_that_arrive_as_strings_or_floats_are_read() -> None:
     }
     assert (answer["by_day"][0]["p50_ms"], answer["by_day"][0]["p95_ms"]) == (1500, 2900)
     assert answer["by_code"] == [{"code": "provider_error", "runs": 1}]
+    assert all(
+        type(v) is int for v in answer["by_day"][0].values() if not isinstance(v, (str, float))
+    )
+
+
+# What the reader passes on is checked value by value: an answer that is the statement's
+# in shape and not in content is refused whole (fix round 5).
+HOST = "db-sentinel.example"
+THREE_DAYS = ("2026-11-16", "2026-11-17", "2026-11-18")
+
+
+def _good() -> dict[str, Any]:
+    raw = _raw([_group(day="2026-11-17", prompt_tokens=10)], THREE_DAYS)
+    raw["by_code"] = [{"code": "provider_error", "runs": 1}]
+    raw["by_fallback"] = [{"reason": "rate_limited", "runs": 1}]
+    raw["by_country"] = [{"country": "SI", "runs": 1}, {"country": None, "runs": 0}]
+    return raw
+
+
+def _set(path: tuple[Any, ...], value: Any) -> Any:
+    def change(raw: dict[str, Any]) -> None:
+        node: Any = raw
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+
+    return change
+
+
+def _drop(path: tuple[Any, ...]) -> Any:
+    def change(raw: dict[str, Any]) -> None:
+        node: Any = raw
+        for key in path[:-1]:
+            node = node[key]
+        del node[path[-1]]
+
+    return change
+
+
+BAD_ANSWERS: dict[str, Any] = {
+    # The days: exactly the UTC days asked for, as ISO dates, in order.
+    "the host as a day": _set(("by_day", 0, "day"), HOST),
+    "a day with words after it": _set(("by_day", 0, "day"), f"2026-11-16 {HOST}"),
+    "a day in another form": _set(("by_day", 0, "day"), "16.11.2026"),
+    "a day that is no string": _set(("by_day", 0, "day"), 20261116),
+    "another day": _set(("by_day", 0, "day"), "2026-11-15"),
+    "a day twice": _set(("by_day", 1, "day"), "2026-11-16"),
+    "days out of order": lambda raw: raw["by_day"].reverse(),
+    "a day too many": lambda raw: raw["by_day"].append(dict(raw["by_day"][0])),
+    "a day too few": _drop(("by_day", 2)),
+    "a day that is no object": _set(("by_day", 1), ["2026-11-17"]),
+    "spend on a day outside the period": _set(("spend", 0, "day"), "2026-11-15"),
+    "spend on the host": _set(("spend", 0, "day"), HOST),
+    # Counts: whole numbers, not negative, of a size a table of runs can hold.
+    "a count that is a string": _set(("by_day", 1, "runs"), "3"),
+    "a count that is the host": _set(("by_day", 1, "ok"), HOST),
+    "a count with a fraction": _set(("by_day", 1, "visitors"), 1.5),
+    "a negative count": _set(("by_day", 1, "opus"), -1),
+    "a count that is true": _set(("by_day", 1, "own"), True),
+    "a count that is null": _set(("by_day", 1, "stepped_down"), None),
+    "a count beyond any table": _set(("spend", 0, "runs"), 10**19),
+    "a count that is infinite": _set(("by_code", 0, "runs"), float("inf")),
+    "a count that is no number": _set(("by_country", 0, "runs"), float("nan")),
+    "a count that is a list": _set(("by_fallback", 0, "runs"), [1]),
+    "tokens that are a string": _set(("spend", 0, "prompt_tokens"), "10"),
+    "negative tokens": _set(("spend", 0, "selector_completion_tokens"), -5),
+    "a run time that is the host": _set(("by_day", 1, "p50_ms"), HOST),
+    "a negative run time": _set(("by_day", 1, "p95_ms"), -1),
+    "selections that are a string": _set(("spend", 0, "unreported_selections"), "1"),
+    # The one amount: a number, not negative, finite.
+    "a cost that is a string": _set(("spend", 0, "selector_cost_usd"), "0.5"),
+    "a negative cost": _set(("spend", 0, "selector_cost_usd"), -0.01),
+    "a cost that is no number": _set(("spend", 0, "selector_cost_usd"), float("nan")),
+    "a cost beyond belief": _set(("spend", 0, "selector_cost_usd"), 1e12),
+    # Words: a string or null where the column may be null; never anything else.
+    "a model that is a number": _set(("spend", 0, "model"), 5),
+    "a model that is a list": _set(("spend", 0, "model"), [HOST]),
+    "a selector that is an object": _set(("spend", 0, "selector"), {"x": HOST}),
+    "a credential that is null": _set(("spend", 0, "credential"), None),
+    "a code that is null": _set(("by_code", 0, "code"), None),
+    "a code that is a number": _set(("by_code", 0, "code"), 42),
+    "a reason that is null": _set(("by_fallback", 0, "reason"), None),
+    "a country that is a number": _set(("by_country", 0, "country"), 386),
+    # The shape.
+    "a list that is a string": _set(("by_code",), HOST),
+    "a group that is a string": _set(("spend", 0), HOST),
+    "a missing field": _drop(("spend", 0, "unreported_selections")),
+    "a missing list": _drop(("by_country",)),
+}
+
+
+def test_the_answer_these_are_made_from_is_a_good_one() -> None:
+    answer = shape(_good(), days=3, generated_at=NOW)
+    assert [day["day"] for day in answer["by_day"]] == list(THREE_DAYS)
+    assert answer["by_country"] == [{"country": "SI", "runs": 1}, {"country": None, "runs": 0}]
+
+
+@pytest.mark.parametrize("case", list(BAD_ANSWERS), ids=list(BAD_ANSWERS))
+def test_an_answer_with_one_value_that_is_not_what_it_should_be_is_refused_whole(
+    case: str,
+) -> None:
+    raw = _good()
+    BAD_ANSWERS[case](raw)
+    with pytest.raises((LookupError, TypeError, ValueError)) as caught:
+        shape(raw, days=3, generated_at=NOW)
+    assert HOST not in str(caught.value)
+    runs, fake = make()
+    fake._site_runs_stats = lambda sql, p: [{"stats": json.dumps(raw)}]  # type: ignore[method-assign]
+    with pytest.raises(UsageUnavailable) as unavailable:
+        runs.stats(3)
+    assert str(unavailable.value) == "site runs answered with an unreadable row"
+    assert unavailable.value.__cause__ is None and unavailable.value.__context__ is None
+
+
+def test_words_the_site_does_not_define_are_still_only_renamed() -> None:
+    """Strings of the right kind are normalised, not refused (round 2): only a value of
+    the wrong kind makes the answer unreadable."""
+    raw = _good()
+    raw["spend"][0].update(model=HOST, selector=HOST)
+    raw["by_code"][0]["code"] = HOST
+    raw["by_fallback"][0]["reason"] = HOST
+    raw["by_country"][0]["country"] = HOST
+    answer = shape(raw, days=3, generated_at=NOW)
+    assert HOST not in json.dumps(answer)
+    assert answer["by_code"] == [{"code": "other", "runs": 1}]
 
 
 @pytest.mark.parametrize(

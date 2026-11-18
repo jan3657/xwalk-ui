@@ -503,9 +503,38 @@ def run_of(
     )
 
 
+# More than any count or sum of a table of runs can be: a number beyond it is not one
+# the statement made.
+_MAX_COUNT = 10**15
+_MAX_USD = 1e9
+_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def _count(value: Any) -> int:
-    """A count or a sum as the database sent it: a number, or a string of one."""
-    return int(round(float(value)))
+    """A count or a sum as the statistics statement sends it: a whole number that is
+    not negative, as a JSON number. ``ValueError`` for anything else (a string, a
+    boolean, a fraction, a number no table of runs could hold): the answer is then not
+    the statement's, and none of it is passed on."""
+    if type(value) is float and value.is_integer():  # 2900.0, from a rounded numeric
+        value = int(value)
+    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
+        raise ValueError("a count that is not a whole number in range")
+    return value
+
+
+def _amount(value: Any) -> float:
+    """The cost a provider reported, summed: a finite number that is not negative."""
+    if type(value) not in (int, float) or not 0 <= value <= _MAX_USD:  # NaN fails this
+        raise ValueError("an amount that is not a number in range")
+    return float(value)
+
+
+def _word(value: Any, *, null: bool = False) -> Any:
+    """A string as it is (the caller maps it to one of the site's own); None where the
+    column may be null. ``ValueError`` for any other kind of value."""
+    if isinstance(value, str) or (null and value is None):
+        return value
+    raise ValueError("a word that is not a string")
 
 
 def _usd(model: str | None, prompt: int, completion: int) -> float:
@@ -519,7 +548,9 @@ def shape(
     """The answer of ``GET /api/stats`` (design section 4) from the document the
     statistics statement returns (a JSON string, or the object an executor parsed it
     into). Raises ``KeyError``, ``TypeError`` or ``ValueError`` on a document that is
-    not that statement's.
+    not that statement's: every value is checked for what it has to be (the days asked
+    for, whole numbers that are not negative, words that are strings), and one that is
+    not makes the whole document unreadable.
 
     Every string of the answer goes through the mapping a row's strings go through
     when it is written (``run_of``; ``models`` as there): a row may be older than that
@@ -530,6 +561,11 @@ def shape(
     if not isinstance(raw, Mapping):
         raise TypeError("the statistics document is not an object")
     known = _MODELS | frozenset(models)
+    # The days of the answer are the ones that were asked for and no others: the last
+    # `days` UTC days up to the day of `generated_at`, as ISO dates, in order. A day is
+    # never passed on as it came.
+    last = datetime.fromtimestamp(generated_at, tz=timezone.utc).date()
+    period = [(last - timedelta(days=back)).isoformat() for back in range(days - 1, -1, -1)]
 
     day_usd: dict[str, float] = {}
     models: dict[tuple[str, str], dict[str, Any]] = {}
@@ -549,15 +585,17 @@ def shape(
         )
 
     for group in raw["spend"]:
-        day = str(group["day"])
-        credential = _one_of(group["credential"], _CREDENTIALS) or OTHER
-        model = _model_of(group["model"], known)
-        selector = _model_of(group["selector"], known)
+        day = group["day"]
+        if day not in period:
+            raise ValueError("spend on a day that was not asked for")
+        credential = _one_of(_word(group["credential"]), _CREDENTIALS) or OTHER
+        model = _model_of(_word(group["model"], null=True), known)
+        selector = _model_of(_word(group["selector"], null=True), known)
         runs = _count(group["runs"])
         prompt, completion = _count(group["prompt_tokens"]), _count(group["completion_tokens"])
         picked_prompt = _count(group["selector_prompt_tokens"])
         picked_completion = _count(group["selector_completion_tokens"])
-        reported = float(group["selector_cost_usd"])
+        reported = _amount(group["selector_cost_usd"])
         # The group's runs whose selection ran and whose provider reported no cost.
         selections = _count(group["unreported_selections"])
         site = credential == SITE
@@ -601,19 +639,21 @@ def shape(
             spent += extra
         day_usd[day] = day_usd.get(day, 0.0) + spent
 
+    if [found["day"] for found in raw["by_day"]] != period:
+        raise ValueError("the days are not the days that were asked for")
     by_day = [
         {
-            "day": str(found["day"]),
+            "day": day,  # ours, not the answer's
             "runs": _count(found["runs"]),
             "ok": _count(found["ok"]),
             "visitors": _count(found["visitors"]),
             **{tier: _count(found[tier]) for tier in TIERS},
             "stepped_down": _count(found["stepped_down"]),
-            "estimated_usd": round(day_usd.get(str(found["day"]), 0.0), USD_DIGITS),
+            "estimated_usd": round(day_usd.get(day, 0.0), USD_DIGITS),
             "p50_ms": _count(found["p50_ms"]),
             "p95_ms": _count(found["p95_ms"]),
         }
-        for found in raw["by_day"]
+        for day, found in zip(period, raw["by_day"], strict=True)
     ]
     runs_total = sum(day["runs"] for day in by_day)
     ok_total = sum(day["ok"] for day in by_day)
@@ -656,9 +696,11 @@ def shape(
         },
         "by_day": by_day,
         "by_model": by_model,
-        "by_code": counted("by_code", "code", lambda v: _one_of(v, CODES) or OTHER),
-        "by_fallback": counted("by_fallback", "reason", lambda v: _one_of(v, REASONS) or OTHER),
-        "by_country": counted("by_country", "country", country_of),
+        "by_code": counted("by_code", "code", lambda v: _one_of(_word(v), CODES) or OTHER),
+        "by_fallback": counted(
+            "by_fallback", "reason", lambda v: _one_of(_word(v), REASONS) or OTHER
+        ),
+        "by_country": counted("by_country", "country", lambda v: country_of(_word(v, null=True))),
     }
 
 
@@ -684,12 +726,16 @@ class SiteRuns:
         self._insert = _INSERT.format(table=table)
         self._stats = _STATS.format(table=table)
         self._created = False
+        # How many times this instance has met the table gone. An answer to a
+        # statement sent before the last of them says nothing about the table now.
+        self._drops = 0
 
     def create(self) -> None:
         """Make the schema, the table and its index where they are missing: one round
         trip, and the same result however often it runs. For provisioning before
         recording is turned on (``tools/setup_usage.py``). Raises ``UsageUnavailable``
         when the database cannot be asked."""
+        drops = self._drops
         failure: UsageUnavailable | None = None
         try:
             self._executor.transaction([(self._schema, ()), (self._create, ()), (self._index, ())])
@@ -697,7 +743,8 @@ class SiteRuns:
             failure = _unavailable(exc)
         if failure is not None:  # out here: the executor's error is not its context
             raise failure
-        self._created = True
+        if drops == self._drops:
+            self._created = True
 
     def record(self, run: Run) -> None:
         """Store one run: one round trip. Raises ``UsageUnavailable`` when the database
@@ -737,6 +784,7 @@ class SiteRuns:
         whose text may quote the server or the connection string, is neither its cause
         nor its context."""
         provisioning = not self._created
+        drops = self._drops
         failure: UsageUnavailable | None = None
         rows: list[dict[str, Any]] = []
         try:
@@ -752,9 +800,11 @@ class SiteRuns:
                 # The table this instance created is gone (dropped to delete the data).
                 # This statement is lost; the next one creates the table again.
                 self._created = False
+                self._drops += 1
             raise failure
-        if provisioning:
-            # Only a call that created the table says that it is there. A plain insert
+        if provisioning and drops == self._drops:
+            # Only a call that created the table says that it is there, and only when
+            # no call has met the table gone since this one was sent. A plain insert
             # that succeeds says nothing: its answer may be late, from before a drop
             # another call has found out about since.
             self._created = True
