@@ -449,7 +449,14 @@ def test_the_ids_the_site_always_knows_need_no_list() -> None:
     [
         f"claude-opus-5-5-{SENTINEL}",
         SENTINEL,
-        "claude-opus-5-5-20261101",
+        "claude-opus-5-5-latest",
+        "claude-opus-5-5-2026x",
+        "claude-opus-5-5/20261101",
+        "claude-opus-5-5-",
+        "claude-opus-5-5--1",
+        "claude-opus-5-5-20261101\n",
+        "claude-opus-5-5-20261101-" + "1" * 9,
+        "claude-opus-5-520261101",
         "CLAUDE-OPUS-5-5",
         " claude-opus-5-5",
         "openai/gpt-6-luna",
@@ -468,6 +475,64 @@ def test_a_model_name_the_site_does_not_know_is_stored_as_other(upstream: str) -
     asked = {**OK_LOG, "model": upstream or SENTINEL, "selector": upstream or SENTINEL}
     row = run_of(asked, at=NOW, visitor_day="f" * 32, models=known)
     assert (row.requested_model, row.requested_selector) == ("other", "other")
+
+
+@pytest.mark.parametrize(
+    ("echoed", "base"),
+    [
+        ("claude-opus-5-5-20261101", OPUS),
+        ("claude-sonnet-5-5-20261101", SONNET),
+        ("claude-sonnet-5-5-2026-11-01", SONNET),
+        ("claude-opus-5-5-1", OPUS),
+        ("claude-opus-5-5-" + "1" * 16, OPUS),
+        ("google/gemini-3.1-flash-lite-001", GEMINI),
+    ],
+)
+def test_a_known_id_with_a_date_or_version_suffix_is_recorded_as_the_known_id(
+    echoed: str, base: str
+) -> None:
+    """A provider may answer with a dated snapshot of the id that was asked for. Only
+    digits and hyphens may follow the id, so nothing free-form passes."""
+    log = {**OK_LOG, "model": echoed, "ran": echoed, "selector": echoed}
+    row = run_of(log, at=NOW, visitor_day="f" * 32, models=(GEMINI,))
+    assert (row.requested_model, row.model, row.requested_selector) == (base,) * 3
+    failed = {"model": echoed, "llm_calls": 1, "prompt_tokens": 5, "completion_tokens": 1}
+    assert (
+        run_of(FAILED_LOG, at=NOW, visitor_day="f" * 32, models=(GEMINI,), failed=failed).model
+        == base
+    )
+
+
+def test_of_two_known_ids_that_could_match_the_longer_one_is_taken() -> None:
+    known = ("vendor/model", "vendor/model-2", "vendor/model-2-5")
+    for echoed, expected in [
+        ("vendor/model-2", "vendor/model-2"),  # itself an id: never read as a suffix
+        ("vendor/model-2-5", "vendor/model-2-5"),
+        ("vendor/model-2-5-20261101", "vendor/model-2-5"),
+        ("vendor/model-2-20261101", "vendor/model-2"),
+        ("vendor/model-3", "vendor/model"),
+        ("vendor/model-2-5x", "other"),
+    ]:
+        for order in (known, known[::-1]):
+            row = run_of({**OK_LOG, "ran": echoed}, at=NOW, visitor_day="f" * 32, models=order)
+            assert row.model == expected, echoed
+
+
+def test_dated_claude_ids_are_priced_as_their_base_ids() -> None:
+    """From the log record to the dollars: the row holds the base id, so ``by_model``,
+    the estimate and ``unpriced_runs`` all see it."""
+    runs, fake = make()
+    for echoed in ("claude-opus-5-5-20261101", "claude-sonnet-5-5-20261101"):
+        log = {**OK_LOG, "fallbacks": [], "ran": echoed, "selector": "retrieval"}
+        log.update(prompt_tokens=1_000_000, completion_tokens=100_000, selector_cost_usd=None)
+        runs.record(run_of(log, at=NOW, visitor_day="f" * 32))
+    answer = runs.stats(1)
+    assert [(row["model"], row["estimated_usd"]) for row in answer["by_model"]] == [
+        (OPUS, 6.0),
+        (SONNET, 3.0),
+    ]
+    assert answer["totals"]["estimated_usd"] == 9.0 and answer["totals"]["unpriced_runs"] == 0
+    assert "20261101" not in json.dumps([fake.sent, [str(row) for row in fake.rows]], default=str)
 
 
 def test_codes_reasons_and_the_rest_are_the_sites_own_words_or_other() -> None:

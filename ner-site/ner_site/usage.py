@@ -10,7 +10,8 @@ field of the wrong type becomes null. No string in the row is free text either: 
 model or selector is an id the deployment itself lists, an error code and a step-down
 reason are words this site defines, and anything else is stored as the one word
 ``other`` (the model that answered is named by the provider's response, which is not
-ours to trust with a column).
+ours to trust with a column; a known id with a dated or versioned suffix of digits
+and hyphens is stored as the known id).
 
 Who a visitor is. ``visitor_day`` is a keyed hash of the visitor id (itself a keyed hash
 of the address, ``limits.visitor_id``) and the UTC date. Distinct values per day count
@@ -174,6 +175,8 @@ REASONS = frozenset(
 _IDENT = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SQLSTATE = re.compile(r"[0-9A-Z]{5}")
 _COUNTRY = re.compile(r"[A-Z]{2}")
+# What may follow a known model id and its hyphen: a date or a version.
+_SUFFIX = re.compile(r"[0-9][0-9-]{0,15}")
 
 
 @dataclass(frozen=True)
@@ -393,6 +396,23 @@ def _one_of(value: Any, known: Collection[str]) -> str | None:
     return value if value in known else OTHER
 
 
+def _model_of(value: Any, known: Collection[str]) -> str | None:
+    """`value` as a model or selector id of the row: a known id as it is; a known id
+    followed by a hyphen and a date or version made of digits and hyphens (a provider
+    may answer as ``claude-opus-5-5-20261101`` when asked for ``claude-opus-5-5``) as
+    that known id; ``other`` for any other string that is not empty. The longest
+    known id that fits is taken, so an id that is the start of another does not
+    claim the other's snapshots. Nothing of the suffix is kept, and nothing but
+    digits and hyphens can be one."""
+    found = _one_of(value, known)
+    if found != OTHER:
+        return found
+    for base in sorted(known, key=len, reverse=True):
+        if value.startswith(base + "-") and _SUFFIX.fullmatch(value, len(base) + 1):
+            return base
+    return OTHER
+
+
 def run_of(
     log: Mapping[str, Any],
     *,
@@ -409,8 +429,9 @@ def run_of(
     the time in seconds since the epoch.
 
     ``models`` are the model and selector ids this deployment lists, beside the ones
-    every deployment knows. A model or selector that is none of them is stored as
-    ``other``, like an error code or a step-down reason the site does not define: the
+    every deployment knows. A model or selector that is one of them with a date or
+    version suffix is stored as that id (``_model_of``); one that is none of them is
+    stored as ``other``, like an error code or a step-down reason the site does not define: the
     model that answered comes out of the provider's response, and a row holds no text
     that came from anywhere but this site. A tier that is none of the four is null
     (``other`` is one of the four).
@@ -422,7 +443,7 @@ def run_of(
     with the model that was asked, so that a failure that was paid for is priced."""
     known = _MODELS | frozenset(models)
     status = _whole(log.get("status")) or 0
-    requested = _one_of(log.get("model"), known)
+    requested = _model_of(log.get("model"), known)
     timing = log.get("timing_ms")
     timing = timing if isinstance(timing, Mapping) else {}
     notes = log.get("fallbacks")
@@ -434,7 +455,7 @@ def run_of(
     cost = log.get("selector_cost_usd")
     custom = log.get("custom_prompt")
     tier = log.get("tier")
-    ran = _one_of(log.get("ran"), known) or (requested if status == 200 else None)
+    ran = _model_of(log.get("ran"), known) or (requested if status == 200 else None)
     calls = _whole(log.get("llm_calls"))
     prompt_tokens = _whole(log.get("prompt_tokens"))
     completion_tokens = _whole(log.get("completion_tokens"))
@@ -443,7 +464,7 @@ def run_of(
         prompt_tokens = _whole(failed.get("prompt_tokens"))
         completion_tokens = _whole(failed.get("completion_tokens"))
         if prompt_tokens is not None or completion_tokens is not None:
-            ran = _one_of(failed.get("model"), known)
+            ran = _model_of(failed.get("model"), known)
     return Run(
         at=datetime.fromtimestamp(at, tz=timezone.utc).isoformat(),
         visitor_day=visitor_day,
@@ -454,7 +475,7 @@ def run_of(
         tier=tier if isinstance(tier, str) and tier in TIERS else None,
         requested_model=requested,
         model=ran,
-        requested_selector=_one_of(log.get("selector"), known),
+        requested_selector=_model_of(log.get("selector"), known),
         fallback_reasons=",".join(dict.fromkeys(r for r in reasons if r is not None)),
         country=country_of(country),
         text_chars=_whole(log.get("text_chars")),

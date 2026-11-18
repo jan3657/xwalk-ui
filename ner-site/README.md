@@ -1046,8 +1046,10 @@ deployment lists (`NER_SITE_MODELS`, `NER_SITE_SELECTORS`, `NER_SITE_FALLBACK_MO
 the own-key lists, the Claude ids, `jev`, `retrieval`), an error code and a step-down
 reason only when they are ones the site defines, and anything else is stored as the
 word `other`. That matters for `model`: the model that answered is named by the
-provider's response, so a response that names itself in another spelling (a dated
-snapshot id, for example) is a row with `model: other`, which has no price.
+provider's response. One other spelling is recognised: a known id followed by a hyphen
+and a date or version of digits and hyphens (`claude-opus-5-5-20261101`) is stored as
+the known id (`claude-opus-5-5`), so a dated snapshot is priced like the model that
+was asked for. Any other spelling is a row with `model: other`, which has no price.
 
 A run that failed after a model had answered (an answer that could not be parsed, a
 refusal that reported its tokens) records the calls and tokens its failure carried and
@@ -1155,9 +1157,9 @@ they are deleted. Web Analytics is turned off in the Vercel dashboard.
    endpoint has not been exercised with them. `usage: "PostgresError"` on every run
    means the insert is refused there and nothing is being recorded.
 4. In the Neon console, look at the first rows: no text, no address, and `model`
-   showing the model ids rather than `other`. If Anthropic's responses name the model
-   in another spelling, every Claude run is `other` and unpriced until that spelling
-   is known to the site.
+   showing the model ids rather than `other`. A dated snapshot id is stored as its
+   base id; if Anthropic's responses name the model in some other spelling, every
+   Claude run is `other` and unpriced until that spelling is known to the site.
 5. `curl -si https://<deployment>/api/stats` answers 401 `stats_passcode_required`,
    and with a wrong `X-Stats-Passcode` 401 `stats_passcode_invalid`.
 
@@ -1758,7 +1760,7 @@ after the fixes.
 
 What was run (Python 3.13.3, the repository venv, no key in the environment):
 
-- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1557 passed, 32
+- `python -m pytest -q -m 'not integration' tests/test_site_*.py`: 1572 passed, 32
   deselected (1431 before the fixes). The fixes were written test first. Reproduced
   before the code changed: four requests in a row against a database that never
   answers gave four `usage: "TimeoutError"` lines and left four live worker threads;
@@ -1798,8 +1800,9 @@ Not run or not verified:
   `tools/setup_usage.py` was run against a fake executor and, through
   `SiteRuns.create`, on the local Postgres; never against Neon.
 - What Anthropic's responses put in `model` for `claude-opus-5-5` and
-  `claude-sonnet-5-5`. If it is not the id as requested, Claude runs are stored as
-  `other` and are unpriced (rollout check 4).
+  `claude-sonnet-5-5`. The id as requested and a dated or versioned form of it are
+  both stored as the id; any other spelling would be `other` and unpriced (rollout
+  check 4).
 - The real `/api/stats` in a browser (the page ran against canned answers only),
   Firefox and Safari, a screen reader, a password manager.
 - Python 3.10 (no interpreter on the machine; the code uses nothing newer and ruff

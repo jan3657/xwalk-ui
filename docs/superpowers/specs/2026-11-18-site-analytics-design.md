@@ -205,7 +205,11 @@ The sections above are the design. Where the code differs, this section holds.
 - **Only the site's own words are stored (amends 3.2).** A model or selector that is
   not an id the deployment lists (the answering model comes from the provider's
   response), and an error code or step-down reason the site does not define, are
-  stored as `other`. An unknown tier is null.
+  stored as `other`. An unknown tier is null. One exception, decided after the
+  fixes: a known id followed by `-` and a date or version made of digits and hyphens
+  (`[0-9][0-9-]{0,15}`, to the end of the string; `claude-opus-5-5-20261101`) is
+  stored as the known id, the longest one that fits, so that a dated echo of a Claude
+  id is priced. Nothing of the suffix is stored.
 - **Spend (amends 3.3 and 4).** A run that failed after a model answered records the
   calls and tokens its failure carried and the model that was asked. `unpriced_runs`
   counts a site-key run once when either stage has no list price: the extraction
