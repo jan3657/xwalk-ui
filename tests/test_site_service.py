@@ -1877,6 +1877,31 @@ UNUSABLE_URLS = [
     "postgresql://owner:pw@ep-x.neon.tech:54 32/db",
     "postgresql://owner:pw@ep x.neon.tech/db",
     "postgresql://owner:pw@ep-x.neon.tech\n/db",
+    # Host names that are not names: an empty label, a label of 64 characters, a
+    # hyphen at an end of one, two dots at the end, and addresses (Neon hosts are names).
+    "postgresql://owner:retrieval@db..example/db",
+    "postgresql://owner:retrieval@" + "a" * 64 + ".example/db",
+    "postgresql://owner:pw@-db.example/db",
+    "postgresql://owner:pw@db-.example/db",
+    "postgresql://owner:pw@db.example../db",
+    "postgresql://owner:pw@.db.example/db",
+    "postgresql://owner:pw@db_x.example/db",
+    "postgresql://owner:pw@" + ".".join(["a" * 63] * 4) + "/db",
+    "postgresql://owner:pw@[::1]/db",
+    "postgresql://owner:pw@[2001:db8::7]:5432/db",
+    "postgresql://owner:pw@127.0.0.1/db",
+    "postgresql://owner:pw@127.0.0.1:5432/db",
+    # A credential that cannot travel in a header.
+    "postgresql://owner:p\u00e4ss@ep-x.neon.tech/db",
+]
+USABLE_URLS = [
+    "postgresql://owner:pw@ep-x-pooler.c-1.eu.aws.neon.tech/neondb?sslmode=require",
+    "postgres://owner:pw@db.example./db",
+    "postgresql://owner:pw@DB.Example:5432/db",
+    "postgresql://owner:pw@" + "a" * 63 + ".example/db",
+    "postgresql://owner:pw@localhost/db",
+    "postgresql://owner:pw@1.example/db",
+    "postgresql://ep-x.neon.tech",
 ]
 
 
@@ -1915,6 +1940,13 @@ def test_a_usable_analytics_database_url_may_name_a_port() -> None:
     url = "postgresql://owner:pw@ep-x.neon.tech:5432/db"
     s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
     assert s.database_url == url
+
+
+@pytest.mark.parametrize("url", USABLE_URLS)
+def test_an_analytics_database_url_with_an_ordinary_host_name_is_kept(url: str) -> None:
+    """Also one with a dot at its end, which is a name like any other."""
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url and url in s.secrets()
 
 
 @pytest.mark.parametrize(

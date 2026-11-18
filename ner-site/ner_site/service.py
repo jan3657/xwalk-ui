@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import re
 import threading
 import time
@@ -226,26 +227,37 @@ def uses_database(env: Mapping[str, str]) -> bool:
     return _site_uses_database(env) or bool((env.get("NER_SITE_STATS_PASSCODE") or "").strip())
 
 
+# One label of a host name: 1 to 63 letters, digits and hyphens, no hyphen at an end.
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
 def _usable_database_url(url: str) -> bool:
-    """Whether the executors can use `url`: a postgres:// or postgresql:// URL with a
-    plain host name (or a bracketed address) and, if it names a port, a port number in
-    range. Never raises: the URL parser leaves the port and the brackets to whoever
-    asks for them, and anything it stumbles on then means "not usable". A URL with a
-    space or a control character anywhere is not one either (the parser drops some of
-    them in silence, and the string is sent in a header as it is)."""
-    if any(ch.isspace() or not ch.isprintable() for ch in url):
+    """Whether a URL that only the record of runs reads can be used: a postgres:// or
+    postgresql:// URL, in plain ASCII without spaces (it is sent in a header as it
+    is), whose host is a DNS name and whose port, if it names one, is a number in
+    range. A name is labels of 1 to 63 letters, digits and hyphens, no hyphen at an
+    end of one, at most 253 characters, with or without one dot at its very end. An
+    address is not a name (a Neon host always is one), in brackets or not. Never
+    raises: the URL parser leaves the port and the brackets to whoever asks for them,
+    and anything it stumbles on then means "not usable"."""
+    if not url.isascii() or not all(0x21 <= ord(ch) <= 0x7E for ch in url):
         return False
     try:
         parts = urlsplit(url)
-        host = parts.hostname
+        host = parts.hostname or ""
         parts.port  # noqa: B018 - raises for a port that is not a number in range
     except ValueError:
         return False
-    return (
-        parts.scheme in {"postgres", "postgresql"}
-        and bool(host)
-        and re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?|[0-9a-f:.]+", host or "") is not None
-    )
+    if parts.scheme not in {"postgres", "postgresql"} or not host or len(host) > 254:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return False
+    name = host[:-1] if host.endswith(".") else host
+    return len(name) <= 253 and all(_DNS_LABEL.fullmatch(label) for label in name.split("."))
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:
