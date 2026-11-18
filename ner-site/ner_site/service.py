@@ -189,36 +189,46 @@ class SettingsError(ValueError):
     """A bad environment value. The message names the variable, never a secret."""
 
 
+def _listed_own(env: Mapping[str, str]) -> tuple[str, ...]:
+    """The provider names ``NER_SITE_OWN_PROVIDERS`` lists, lower-cased, without empty
+    items or repeats, not yet checked. Own keys are off unless the operator lists
+    providers: unset, empty and a value of only spaces and commas all give none."""
+    raw = env.get("NER_SITE_OWN_PROVIDERS") or ""
+    return tuple(dict.fromkeys(p for p in (item.strip().lower() for item in raw.split(",")) if p))
+
+
 def uses_database(env: Mapping[str, str]) -> bool:
     """The index backend or a live allowance needs the URL, including in the settings cache."""
     if env.get("NER_SITE_BACKEND", "").strip().lower() == "neon":
         return True
     if env.get("NER_SITE_OFFLINE", "").strip().lower() in _TRUE:
         return False
-    return bool(
-        env.get("ANTHROPIC_API_KEY", "").strip() or env.get("NER_SITE_OWN_PROVIDERS", "all").strip()
-    )
+    return bool(env.get("ANTHROPIC_API_KEY", "").strip() or _listed_own(env))
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:
-    raw = env.get("NER_SITE_OWN_PROVIDERS", ",".join(providers.OWN_PROVIDERS)).strip()
-    enabled = tuple(dict.fromkeys(p.strip() for p in raw.split(","))) if raw else ()
+    """The own-key providers the operator turned on, with their model lists. A model
+    list is read only for a provider that is on, and an empty one counts as unset, so
+    a deployment without own keys is not refused over a variable nothing uses."""
+    enabled = _listed_own(env)
     if any(p not in providers.OWN_PROVIDERS for p in enabled):
         raise SettingsError("NER_SITE_OWN_PROVIDERS must list anthropic, openai or openrouter")
-    infos = {}
-    for provider, defaults in _OWN_MODELS.items():
+    infos = []
+    for provider in enabled:
+        defaults = _OWN_MODELS[provider]
         name = f"NER_SITE_OWN_MODELS_{provider.upper()}"
-        ids = tuple(dict.fromkeys(m.strip() for m in env.get(name, ",".join(defaults)).split(",")))
+        raw = (env.get(name) or "").strip()
+        ids = tuple(dict.fromkeys(m.strip() for m in raw.split(","))) if raw else defaults
         if any(not m or m in (JEV, RETRIEVAL_ONLY) for m in ids):
             raise SettingsError(
                 f"{name} must list non-empty model ids distinct from jev and retrieval"
             )
         if provider == "anthropic" and any(m not in defaults for m in ids):
             raise SettingsError(f"{name} must list models from {', '.join(defaults)}")
-        infos[provider] = providers.ProviderInfo(
-            provider, providers.PROVIDER_NAMES[provider], ids, ids[0]
+        infos.append(
+            providers.ProviderInfo(provider, providers.PROVIDER_NAMES[provider], ids, ids[0])
         )
-    return tuple(infos[p] for p in enabled)
+    return tuple(infos)
 
 
 @dataclass(frozen=True)
@@ -261,9 +271,8 @@ class Settings:
     allowance: Allowance = field(default_factory=Allowance)
     visitor_salt: str | None = field(default=None, repr=False)
 
-    own_providers: tuple[providers.ProviderInfo, ...] = field(
-        default_factory=lambda: _own_providers({})
-    )
+    # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
+    own_providers: tuple[providers.ProviderInfo, ...] = ()
 
     def __post_init__(self) -> None:
         if self.offline:

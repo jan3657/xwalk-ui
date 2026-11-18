@@ -1221,6 +1221,20 @@ def _open_site(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
     return _settings(cache_dir, tmp_path, **{**base, **env})
 
 
+# Own keys are off unless the operator lists providers; these tests turn them on.
+ALL_OWN = "anthropic,openai,openrouter"
+
+
+def _own_only(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """No site key at all, and visitors' own keys turned on for every provider."""
+    return _settings(cache_dir, tmp_path, **{"NER_SITE_OWN_PROVIDERS": ALL_OWN, **env})
+
+
+def _own_site(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """The open deployment with visitors' own keys turned on for every provider."""
+    return _open_site(cache_dir, tmp_path, **{"NER_SITE_OWN_PROVIDERS": ALL_OWN, **env})
+
+
 def _ask(
     settings: Settings,
     payload: dict[str, Any] | None = None,
@@ -1285,7 +1299,7 @@ def test_a_request_runs_on_opus_by_default(
 def test_the_eleventh_request_runs_on_sonnet_and_the_thirty_first_is_refused(
     cache_dir: Path, tmp_path: Path, visits: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    s = _open_site(cache_dir, tmp_path)
+    s = _own_site(cache_dir, tmp_path)
     for _ in range(10):
         tenth = _ask(s)
     assert _json(tenth)["model"] == OPUS and _json(tenth)["notices"] == []
@@ -1345,7 +1359,7 @@ def test_an_unreachable_limiter_refuses_every_site_model(
     from xwalk.retrieval.postgres import PostgresError
 
     visits.fail = PostgresError(f"could not reach Neon at ep-x-pooler ({DB_URL})", code="08006")
-    s = _open_site(cache_dir, tmp_path)
+    s = _own_site(cache_dir, tmp_path)
     for model in (OPUS, SONNET, GEMINI):
         result = _ask(s, {"model": model}, claude=_no_claude)
         assert _error(result) == (503, "limits_unavailable")
@@ -1919,7 +1933,7 @@ def test_own_stages_use_only_the_chosen_provider(
     own_clients: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    s = _settings(cache_dir, tmp_path, DATABASE_URL=DB_URL)
+    s = _settings(cache_dir, tmp_path, DATABASE_URL=DB_URL, NER_SITE_OWN_PROVIDERS=ALL_OWN)
     result = _ask(
         s, {"provider": provider, "text": HALO_TEXT, "selector": model}, headers=OWN_HEADERS
     )
@@ -1945,7 +1959,7 @@ def test_own_runs_when_site_limits_unavailable(
     database: str, cache_dir: Path, tmp_path: Path, visits: Any, own_clients: Any
 ) -> None:
     visits.fail = RuntimeError("database unavailable")
-    s = _open_site(cache_dir, tmp_path, DATABASE_URL=database)
+    s = _own_site(cache_dir, tmp_path, DATABASE_URL=database)
     result = _post(
         s, {"text": HALO_TEXT, "provider": "anthropic"}, headers=OWN_HEADERS, llm_factory=_never
     )
@@ -1957,7 +1971,7 @@ def test_own_runs_when_site_limits_unavailable(
 def test_own_refusals_precede_admission_and_construction(
     cache_dir: Path, tmp_path: Path, visits: Any, own_clients: Any
 ) -> None:
-    s = _open_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
+    s = _own_site(cache_dir, tmp_path, NER_SITE_PASSCODE=PASSCODE)
     payload = {"provider": "openai"}
     headers = {**OWN_HEADERS, "X-Passcode": PASSCODE}
     duplicate = {"authorization": OWN_HEADERS["Authorization"]}
@@ -1990,7 +2004,7 @@ def test_duplicate_authorization_survives_shim(
         headers[k] = v
     headers["authorization"] = "Bearer " + OWN_KEY
     request = SimpleNamespace(headers=headers, command="POST", path="/api/ner", rfile=BytesIO(body))
-    result = http_mod._shim_response(request, _settings(cache_dir, tmp_path))
+    result = http_mod._shim_response(request, _own_only(cache_dir, tmp_path))
     assert _error(result) == (400, "bad_credential")
     assert "exactly one" in _json(result)["error"]["message"]
     assert not own_clients
@@ -2011,7 +2025,7 @@ def test_daily_and_own_flood_limit_wording(
         if own
         else {"NER_SITE_SONNET_PER_DAY": "0", "NER_SITE_OPUS_PER_DAY": "0"}
     )
-    s = _open_site(cache_dir, tmp_path, **env)
+    s = _own_site(cache_dir, tmp_path, **env)
     result = _ask(
         s, {"provider": "openai"} if own else {}, headers=OWN_HEADERS if own else VISITOR_HEADERS
     )
@@ -2030,7 +2044,8 @@ def test_health_lists_own_models_even_without_site_credentials(
     cache_dir: Path, tmp_path: Path
 ) -> None:
     fixture = json.loads((PROJECT / "tools/fixtures/health.json").read_text())
-    assert _health_of(_settings(cache_dir, tmp_path))["own_keys"] == fixture["own_keys"]
+    listed = _own_only(cache_dir, tmp_path)
+    assert _health_of(listed)["own_keys"] == fixture["own_keys"]
     health = _health_of(
         _settings(
             cache_dir,
@@ -2050,10 +2065,11 @@ def test_health_lists_own_models_even_without_site_credentials(
             }
         ],
     }
-    assert _health_of(_settings(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS=""))["own_keys"] == {
-        "enabled": False,
-        "providers": [],
-    }
+    for off in ({}, {"NER_SITE_OWN_PROVIDERS": ""}):
+        assert _health_of(_settings(cache_dir, tmp_path, **off))["own_keys"] == {
+            "enabled": False,
+            "providers": [],
+        }
 
 
 def test_concurrent_own_requests_keep_keys_local(
@@ -2068,7 +2084,7 @@ def test_concurrent_own_requests_keep_keys_local(
 
     barrier = threading.Barrier(2)
     keys = [OWN_KEY, 'other-sentinel-"-key-\\0002']
-    s = _open_site(cache_dir, tmp_path, DATABASE_URL="")
+    s = _own_site(cache_dir, tmp_path, DATABASE_URL="")
 
     def build(credential: Any, model: str, **kwargs: Any) -> Any:
         key = credential.token()
@@ -2124,7 +2140,7 @@ def test_own_fixture_errors_match_the_real_credential_reader(
     cache_dir: Path, tmp_path: Path
 ) -> None:
     directory = PROJECT / "tools/fixtures"
-    s = _settings(cache_dir, tmp_path)
+    s = _own_only(cache_dir, tmp_path)
     spec = importlib.util.spec_from_file_location(
         "serve_local_own_test", PROJECT / "tools/serve_local.py"
     )
@@ -2184,7 +2200,7 @@ def test_own_selector_construction_failure_closes_extractor(
 
     monkeypatch.setattr(providers, "own_llm", build)
     result = _ask(
-        _settings(cache_dir, tmp_path),
+        _own_only(cache_dir, tmp_path),
         {"provider": "openai", "selector": "gpt-6-luna"},
         headers=OWN_HEADERS,
     )
@@ -2214,7 +2230,7 @@ def test_daily_opus_stepdown_tells_the_visitor_which_allowance_was_used(
 
 def test_invalid_provider_type_is_bad_credential(cache_dir: Path, tmp_path: Path) -> None:
     result = _post(
-        _settings(cache_dir, tmp_path), {"text": "ok", "provider": ["openai"]}, headers=OWN_HEADERS
+        _own_only(cache_dir, tmp_path), {"text": "ok", "provider": ["openai"]}, headers=OWN_HEADERS
     )
     assert _error(result) == (400, "bad_credential")
 
@@ -2233,7 +2249,7 @@ def test_unexpected_own_mapping_failure_keeps_internal_envelope(
 
     monkeypatch.setattr(service, "map_entities", broken)
     result = _ask(
-        _settings(cache_dir, tmp_path),
+        _own_only(cache_dir, tmp_path),
         {"provider": "openai", "text": HALO_TEXT},
         headers=OWN_HEADERS,
     )
@@ -2260,7 +2276,7 @@ def test_an_own_key_is_redacted_before_pick_explanations_are_capped(
 
     monkeypatch.setattr(providers, "own_llm", build)
     result = _ask(
-        _settings(cache_dir, tmp_path),
+        _own_only(cache_dir, tmp_path),
         {"provider": "openai", "selector": "gpt-6-luna", "text": HALO_TEXT},
         headers=OWN_HEADERS,
     )
@@ -2273,6 +2289,7 @@ def test_ignored_database_url_is_not_read_into_settings_cache() -> None:
             assert key != "DATABASE_URL"
             return super().get(key, default)
 
+    assert http_mod.env_settings(Env()).database_url is None
     assert http_mod.env_settings(Env(NER_SITE_OWN_PROVIDERS="")).database_url is None
     assert http_mod.env_settings(Env(NER_SITE_OFFLINE="1")).database_url is None
 
@@ -2315,7 +2332,7 @@ def test_provider_diagnostics_cannot_log_an_echoed_visitor_key(
 
     monkeypatch.setattr(providers, "own_llm", build)
     caplog.set_level(logging.DEBUG)
-    result = _ask(_settings(cache_dir, tmp_path), {"provider": provider}, headers=OWN_HEADERS)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": provider}, headers=OWN_HEADERS)
     assert _error(result) == (401, "provider_key_refused")
     assert OWN_KEY not in caplog.text
     assert (
@@ -2336,7 +2353,7 @@ def test_a_key_duplicated_in_address_headers_is_never_hashed(
 
     monkeypatch.setattr(http_mod.limits, "visitor_id", identify)
     result = _ask(
-        _open_site(cache_dir, tmp_path),
+        _own_site(cache_dir, tmp_path),
         {"provider": "openai"},
         headers={**OWN_HEADERS, "x-real-ip": OWN_KEY},
     )
@@ -2369,6 +2386,7 @@ def test_duplicate_authorization_over_http(
     shim_server: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("NER_SITE_OFFLINE", "0")
+    monkeypatch.setenv("NER_SITE_OWN_PROVIDERS", "openai")
     body = b'{"text":"sample","provider":"openai"}'
     first = b"Authorization: Bearer first-synthetic-key-0001\r\n"
     second = b"aUThorization: Bearer second-synthetic-key-0002\r\n"
@@ -2411,7 +2429,7 @@ def test_health_never_reads_authorization(
 def test_offline_settings_never_offer_chat_on_visitor_keys(cache_dir: Path, tmp_path: Path) -> None:
     from dataclasses import replace
 
-    offline = replace(_open_site(cache_dir, tmp_path), offline=True)
+    offline = replace(_own_site(cache_dir, tmp_path), offline=True)
     assert _health_of(offline)["own_keys"] == {"enabled": False, "providers": []}
     assert _error(_ask(offline, {"provider": "openai"}, headers=OWN_HEADERS)) == (
         400,
@@ -2419,15 +2437,27 @@ def test_offline_settings_never_offer_chat_on_visitor_keys(cache_dir: Path, tmp_
     )
 
 
+@pytest.mark.parametrize("off", [{}, {"NER_SITE_OWN_PROVIDERS": ""}], ids=["unset", "empty"])
 @pytest.mark.parametrize("window", ["hour", "day"])
 def test_used_site_allowance_with_own_keys_off(
-    window: str, cache_dir: Path, tmp_path: Path, visits: Any
+    window: str, off: dict[str, str], cache_dir: Path, tmp_path: Path, visits: Any
 ) -> None:
     env = {f"NER_SITE_{model}_PER_{window.upper()}": "0" for model in ("OPUS", "SONNET")}
-    s = _open_site(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS="", **env)
+    s = _open_site(cache_dir, tmp_path, **off, **env)
     result = _ask(s, claude=_no_claude)
     assert _error(result) == (429, "visitor_limit_reached")
     assert "use your own" not in _json(result)["error"]["message"]
+
+
+def test_an_unreachable_limiter_names_no_own_key_while_own_keys_are_off(
+    cache_dir: Path, tmp_path: Path, visits: Any
+) -> None:
+    visits.fail = RuntimeError("database unavailable")
+    result = _ask(_open_site(cache_dir, tmp_path), claude=_no_claude)
+    assert _error(result) == (503, "limits_unavailable")
+    assert _json(result)["error"]["message"] == (
+        "the site cannot count requests right now; try again shortly"
+    )
 
 
 def test_outage_health_fixture_reports_uncounted_own_runs(
@@ -2448,14 +2478,14 @@ def test_own_error_scrubber_covers_response_headers_and_body(
         raise ServiceError("provider_error", OWN_KEY, status=502, headers={"X-Echo": OWN_KEY})
 
     monkeypatch.setattr(http_mod, "run", failed)
-    result = _ask(_settings(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
     assert _json(result)["error"]["message"] == result[1]["X-Echo"] == "[redacted]"
 
 
 def test_log_identifies_requested_provider_even_on_a_missing_credential(
     cache_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    s = _settings(cache_dir, tmp_path)
+    s = _own_only(cache_dir, tmp_path)
     assert _error(_ask(s, {"provider": "openai"})) == (400, "bad_credential")
     record = _last_log(capsys)
     assert (record["provider"], record["credential"]) == ("openai", "visitor")
@@ -2487,6 +2517,94 @@ def test_json_escaped_provider_echo_cannot_enter_the_mention_regex_cache(
         return Client([_answer((credential.token(), "other", 0, 1))], model=model)
 
     monkeypatch.setattr(providers, "own_llm", build)
-    result = _ask(_settings(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
+    result = _ask(_own_only(cache_dir, tmp_path), {"provider": "openai"}, headers=OWN_HEADERS)
     assert result[0] == 200
     assert seen and set(seen) == {"[redacted]"}
+
+
+# --- own keys are off unless providers are listed (final review, A1 and A2) ------------
+
+BASIC = "Basic dXNlcjpwYXNzd29yZA=="
+
+
+def _before_own_keys(cache_dir: Path, tmp_path: Path, **env: str) -> Settings:
+    """The deployment from before this feature: the OpenRouter key, a passcode, explicit
+    model lists, the bundled backend, and a ``DATABASE_URL`` some integration left."""
+    return _settings(
+        cache_dir,
+        tmp_path,
+        OPENROUTER_API_KEY=SENTINEL_KEY,
+        NER_SITE_PASSCODE=PASSCODE,
+        NER_SITE_MODELS="google/gemini-3.1-flash-lite,openai/gpt-6-luna",
+        NER_SITE_SELECTORS="jev,google/gemini-3.1-flash-lite",
+        **{"DATABASE_URL": "file:./dev.db", **env},
+    )
+
+
+def test_own_keys_are_off_by_default(cache_dir: Path, tmp_path: Path) -> None:
+    s = _settings(cache_dir, tmp_path)
+    assert _health_of(s)["own_keys"] == {"enabled": False, "providers": []}
+    for provider in ("anthropic", "openai", "openrouter"):
+        result = _post(s, {"text": "x", "provider": provider}, headers=OWN_HEADERS)
+        assert _error(result) == (400, "bad_credential")
+        assert OWN_KEY not in result[2].decode()
+
+
+def test_the_deployment_from_before_own_keys_loads_without_a_database(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    s = _before_own_keys(cache_dir, tmp_path)
+    assert s.database_url is None and s.own_providers == ()
+    health = _health_of(s)
+    assert health["own_keys"] == {"enabled": False, "providers": []} and "visitor" not in health
+
+
+@pytest.mark.parametrize("provider", [None, "site"])
+@pytest.mark.parametrize(
+    "authorization", [BASIC, "Bearer proxy-token-0123456789abcdef", "", [BASIC, BASIC]]
+)
+def test_authorization_on_a_site_request_is_ignored_while_own_keys_are_off(
+    provider: str | None,
+    authorization: Any,
+    cache_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """HTTP basic auth, ``curl -u`` and an auth proxy in front of the site all add the
+    header; before own keys nothing looked at it."""
+    s = _before_own_keys(cache_dir, tmp_path)
+    headers: dict[str, Any] = {**POST_HEADERS, "x-passcode": PASSCODE}
+    headers["Authorization"] = authorization
+    payload = {"text": "nothing", **({} if provider is None else {"provider": provider})}
+    result = http_mod.handle(
+        "POST",
+        "/api/ner",
+        headers,
+        json.dumps(payload).encode(),
+        settings=s,
+        llm_factory=_fake('{"entities": []}'),
+    )
+    assert result[0] == 200, result[2]
+    out = _json(result)
+    assert (out["provider"], out["credential_source"]) == ("site", "site")
+    line = capsys.readouterr().err
+    assert "dXNlcjpwYXNzd29yZA" not in line and "proxy-token" not in line
+    assert "dXNlcjpwYXNzd29yZA" not in result[2].decode()
+
+
+def test_naming_an_own_provider_is_refused_while_own_keys_are_off(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    s = _before_own_keys(cache_dir, tmp_path)
+    headers = {**OWN_HEADERS, "x-passcode": PASSCODE}
+    result = _post(s, {"text": "x", "provider": "openai"}, headers=headers, llm_factory=_never)
+    assert _error(result) == (400, "bad_credential")
+
+
+def test_authorization_on_a_site_request_is_refused_while_own_keys_are_on(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    s = _before_own_keys(cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS="openai", DATABASE_URL="")
+    headers = {**POST_HEADERS, "x-passcode": PASSCODE, "Authorization": BASIC}
+    result = _post(s, {"text": "x"}, headers=headers, llm_factory=_never)
+    assert _error(result) == (400, "bad_credential")

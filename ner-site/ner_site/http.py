@@ -812,13 +812,19 @@ def _dispatch(
         log.update(provider=providers.SITE, credential="site")
     elif request.provider in providers.OWN_PROVIDERS:
         log.update(provider=request.provider, credential="visitor")
-    credential = providers.read_credential(
-        request.provider,
-        raw_headers,
-        enabled=tuple(info.id for info in settings.own_providers),
-        text=request.text,
-        prompt=request.prompt,
-    )
+    credential: providers.Credential | None = None
+    # A deployment without own keys looks at no Authorization header on a request for
+    # the site's models, as before there were own keys: HTTP basic auth, `curl -u` and
+    # an authenticating proxy all add one. A request that names an own provider is
+    # still refused there, and with own keys on a site request must not carry a key.
+    if settings.own_providers or request.provider not in (None, providers.SITE):
+        credential = providers.read_credential(
+            request.provider,
+            raw_headers,
+            enabled=tuple(info.id for info in settings.own_providers),
+            text=request.text,
+            prompt=request.prompt,
+        )
     if credential is not None:
         key = credential.token()
         extra_secrets.append(key)

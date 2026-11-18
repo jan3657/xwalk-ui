@@ -195,7 +195,9 @@ def read_credential(
     Raises 400 ``bad_credential`` with a fixed message, which never contains the key or
     the ``provider`` field, when:
 
-    - a site request carries an ``Authorization`` header at all;
+    - a site request carries an ``Authorization`` header at all (the caller does not ask
+      on a deployment without own keys: there a site request's header is none of the
+      site's business, ``http._dispatch``);
     - the provider is not an own provider, or not enabled here;
     - the header is missing, repeated, or not ``Bearer <key>``;
     - the key is not ``KEY_MIN`` to ``KEY_MAX`` printable ASCII characters without spaces;

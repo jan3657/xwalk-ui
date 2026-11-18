@@ -718,6 +718,7 @@ ANTHROPIC_KEY = "sk-ant-SENTINEL-feedbeef-9191"
 OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5-5"
 GEMINI, LUNA = "google/gemini-3.1-flash-lite", "openai/gpt-6-luna"
 DB_URL = "postgresql://owner:npg_SENTINELpw0123@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
+ALL_OWN = "anthropic,openai,openrouter"
 
 
 def test_claude_leads_the_defaults_when_both_keys_are_set() -> None:
@@ -874,9 +875,10 @@ def test_the_database_url_is_ignored_where_nothing_uses_it(env: dict[str, str]) 
     platform integration may have put anything in ``DATABASE_URL``: as before Claude,
     it is neither read nor validated."""
     for value in ("mysql://u:p@h/db", "not a url", DB_URL):
-        s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "", **env, "DATABASE_URL": value})
-        assert s.backend == "bundled" and s.database_url is None
-        assert value not in s.secrets() and s.index_settings().database_url is None
+        for off in ({}, {"NER_SITE_OWN_PROVIDERS": ""}):
+            s = Settings.from_env({**off, **env, "DATABASE_URL": value})
+            assert s.backend == "bundled" and s.database_url is None
+            assert value not in s.secrets() and s.index_settings().database_url is None
 
 
 def test_every_new_variable_is_part_of_the_settings_cache_key() -> None:
@@ -1629,7 +1631,7 @@ def test_new_allowance_settings(field: str) -> None:
     [
         ("NER_SITE_OWN_PROVIDERS", "openai,site"),
         ("NER_SITE_OWN_MODELS_OPENAI", "gpt-6-luna,"),
-        ("NER_SITE_OWN_MODELS_OPENROUTER", " "),
+        ("NER_SITE_OWN_MODELS_OPENROUTER", ","),
         ("NER_SITE_OWN_MODELS_ANTHROPIC", "openai/gpt-6-luna"),
         ("NER_SITE_OWN_MODELS_ANTHROPIC", "claude-invented"),
         ("NER_SITE_OWN_MODELS_OPENAI", "jev"),
@@ -1639,11 +1641,13 @@ def test_new_allowance_settings(field: str) -> None:
 def test_invalid_own_settings(name: str, value: str) -> None:
     assert name in service.ENV_NAMES
     with pytest.raises(SettingsError, match=name):
-        Settings.from_env({name: value})
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": ALL_OWN, name: value})
 
 
 def test_own_models_resolve_per_provider_at_validation() -> None:
-    s = Settings.from_env({"NER_SITE_OWN_MODELS_OPENAI": " second, first,second "})
+    s = Settings.from_env(
+        {"NER_SITE_OWN_PROVIDERS": "openai", "NER_SITE_OWN_MODELS_OPENAI": " second, first,second "}
+    )
     req = validate_request(NerRequest(provider="openai", text="sample"), s)
     assert (req.model, req.selector, req.provider) == ("second", "retrieval", "openai")
     for options, code in (
@@ -1653,7 +1657,10 @@ def test_own_models_resolve_per_provider_at_validation() -> None:
         with pytest.raises(ServiceError) as exc:
             validate_request(NerRequest(provider="openai", text="sample", **options), s)
         assert exc.value.code == code
-    assert Settings.from_env({"DATABASE_URL": DB_URL}).database_url == DB_URL
+    # Own keys alone make the database (their flood limit) part of the deployment.
+    assert Settings.from_env({"DATABASE_URL": DB_URL}).database_url is None
+    listed = {"NER_SITE_OWN_PROVIDERS": "openai", "DATABASE_URL": DB_URL}
+    assert Settings.from_env(listed).database_url == DB_URL
 
 
 @pytest.mark.parametrize(
@@ -1683,7 +1690,7 @@ def test_own_extraction_failures_are_fixed(
         asyncio.run(
             run(
                 NerRequest(text="x", provider="openai"),
-                settings=Settings.from_env({}),
+                settings=Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai"}),
                 indexes={},
                 llm=Fails([]),
             )
@@ -1719,3 +1726,71 @@ def test_only_the_adapter_signal_produces_a_server_notice(
     assert [n.stage for n in out.fallbacks] == (["extract", "select"] if flag else [])
     assert out.model == answered and out.entities[0].pick.selector == answered
     assert len(out.notices) == (2 if flag else 0)
+
+
+# --- own keys are off unless providers are listed (final review, A1 to A4) -------------
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", ",", " , ,"])
+def test_own_keys_are_off_unless_providers_are_listed(value: str | None) -> None:
+    env = {} if value is None else {"NER_SITE_OWN_PROVIDERS": value}
+    assert Settings.from_env(env).own_providers == ()
+    assert Settings().own_providers == ()
+    assert not service.uses_database(env)
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(provider="openai", text="sample"), Settings.from_env(env))
+    assert (exc.value.status, exc.value.code) == (400, "bad_credential")
+
+
+@pytest.mark.parametrize("database", ["mysql://u:p@h/db", "not a url", "file:./dev.db"])
+def test_an_openrouter_passcode_deployment_does_not_read_the_database_url(database: str) -> None:
+    """What ran before own keys: only the OpenRouter key, a passcode and the bundled
+    backend. A platform integration may have put anything in ``DATABASE_URL``."""
+    env = {
+        "OPENROUTER_API_KEY": SENTINEL_KEY,
+        "NER_SITE_PASSCODE": "correct horse",
+        "NER_SITE_MODELS": "google/gemini-3.1-flash-lite,openai/gpt-6-luna",
+        "NER_SITE_SELECTORS": "jev,google/gemini-3.1-flash-lite",
+        "DATABASE_URL": database,
+    }
+    s = Settings.from_env(env)
+    assert s.database_url is None and s.own_providers == ()
+    assert not service.uses_database(env)
+    assert database not in s.secrets()
+
+
+@pytest.mark.parametrize(
+    ("raw", "enabled"),
+    [
+        ("Anthropic, openrouter,", ("anthropic", "openrouter")),
+        (" OPENAI ", ("openai",)),
+        ("openai,,OpenAI,anthropic", ("openai", "anthropic")),
+    ],
+)
+def test_own_providers_are_parsed_tolerantly(raw: str, enabled: tuple[str, ...]) -> None:
+    env = {"NER_SITE_OWN_PROVIDERS": raw}
+    assert tuple(p.id for p in Settings.from_env(env).own_providers) == enabled
+    assert service.uses_database(env)
+
+
+@pytest.mark.parametrize("raw", ["openai,site", "Anthropic,bogus", "all"])
+def test_an_unknown_own_provider_is_still_refused(raw: str) -> None:
+    with pytest.raises(SettingsError, match="NER_SITE_OWN_PROVIDERS"):
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": raw})
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_own_model_list_is_unset(value: str) -> None:
+    # With own keys off (Vercel keeps a variable that was emptied), and with them on.
+    assert Settings.from_env({"NER_SITE_OWN_MODELS_OPENAI": value}).own_providers == ()
+    s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", "NER_SITE_OWN_MODELS_OPENAI": value})
+    assert s.own_providers[0].models == ("gpt-6-luna",)
+
+
+def test_only_enabled_providers_have_their_model_lists_validated() -> None:
+    bad = {"NER_SITE_OWN_MODELS_ANTHROPIC": "claude-invented", "NER_SITE_OWN_MODELS_OPENAI": "jev"}
+    assert Settings.from_env(bad).own_providers == ()
+    s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openrouter", **bad})
+    assert [p.id for p in s.own_providers] == ["openrouter"]
+    with pytest.raises(SettingsError, match="NER_SITE_OWN_MODELS_OPENAI"):
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", **bad})
