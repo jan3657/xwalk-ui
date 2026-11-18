@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex">
+  <title>xwalk NER demo: usage</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234338ca'/%3E%3Cpath d='M4 5l8 6M12 5l-8 6' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/stats.css">
+  <script src="/stats.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <header class="intro">
+      <p class="eyebrow">xwalk demo</p>
+      <h1>Usage and spend</h1>
+      <p class="caveat">Private page for the site's operator. Every day here is a UTC day.</p>
+    </header>
+
+    <form id="stats-form" class="panel stats-form" novalidate>
+      <div class="field">
+        <label for="stats-passcode">Stats passcode</label>
+        <input id="stats-passcode" type="password" autocomplete="current-password"
+          spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="message">
+      </div>
+      <div class="field narrow">
+        <label for="days">Period</label>
+        <select id="days">
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+      </div>
+      <div class="stats-actions">
+        <button type="submit" id="show" class="primary" aria-busy="false">
+          <span class="spinner" aria-hidden="true"></span><span>Show</span>
+        </button>
+        <button type="button" id="forget" class="ghost" hidden>Forget passcode</button>
+      </div>
+    </form>
+
+    <div id="message" class="alert" role="alert" hidden><p id="message-text"></p></div>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <div id="empty" class="panel empty-state" hidden>
+      <h2>No runs yet</h2>
+      <p id="empty-text"></p>
+    </div>
+
+    <div id="dashboard" hidden>
+      <section class="tiles" aria-label="Headline numbers">
+        <div class="tile tile-lead">
+          <p class="tile-label">Estimated spend</p>
+          <p class="tile-value" id="t-usd"></p>
+          <p class="tile-note" id="t-usd-note"></p>
+        </div>
+        <div class="tile">
+          <p class="tile-label">Stepped down</p>
+          <p class="tile-value" id="t-step"></p>
+          <p class="tile-note" id="t-step-note"></p>
+        </div>
+        <div class="tile">
+          <p class="tile-label">Runs</p>
+          <p class="tile-value" id="t-runs"></p>
+          <p class="tile-note" id="t-runs-note"></p>
+        </div>
+        <div class="tile">
+          <p class="tile-label">Successful runs</p>
+          <p class="tile-value" id="t-ok"></p>
+          <p class="tile-note" id="t-ok-note"></p>
+        </div>
+        <div class="tile">
+          <p class="tile-label">Visitor-days</p>
+          <p class="tile-value" id="t-visitors"></p>
+          <p class="tile-note">Distinct visitors per day, added up.</p>
+        </div>
+      </section>
+
+      <p id="unpriced" class="unpriced" hidden></p>
+      <p class="estimate-note">
+        Dollars are an estimate from token counts and list prices, for runs on the site's
+        keys only. A run that stepped down is priced at the model that answered the
+        extraction. The Anthropic Console is the bill.
+      </p>
+
+      <section class="charts" aria-label="Charts">
+        <figure class="panel chart-panel">
+          <figcaption>
+            <h2>Runs per day by tier</h2>
+            <p class="readout" id="runs-readout" aria-live="polite"></p>
+          </figcaption>
+          <div class="chart" id="runs-chart"></div>
+          <ul class="chart-legend" id="runs-legend" aria-label="Tiers, in stacking order from the bottom"></ul>
+        </figure>
+        <figure class="panel chart-panel">
+          <figcaption>
+            <h2>Estimated dollars per day</h2>
+            <p class="readout" id="usd-readout" aria-live="polite"></p>
+          </figcaption>
+          <div class="chart" id="usd-chart"></div>
+          <p class="chart-hint">
+            Point at a day, tap it, or use the arrow keys on a chart to read it. Every
+            number is also in the "By day" table.
+          </p>
+        </figure>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="h-model">
+        <h2 id="h-model">By model</h2>
+        <table class="data data-models">
+          <thead>
+            <tr>
+              <th scope="col">Model</th>
+              <th scope="col">Key</th>
+              <th scope="col" class="num">Runs</th>
+              <th scope="col" class="num">Tokens in</th>
+              <th scope="col" class="num">Tokens out</th>
+              <th scope="col" class="num">Est. $</th>
+            </tr>
+          </thead>
+          <tbody id="rows-model"></tbody>
+        </table>
+        <p class="table-note">
+          Key: "site" runs are paid by you, "visitor" runs by the visitor's own key and
+          cost you nothing for the model.
+        </p>
+      </section>
+
+      <div class="table-grid">
+        <section class="panel table-panel" aria-labelledby="h-code">
+          <h2 id="h-code">By error code</h2>
+          <table class="data">
+            <thead>
+              <tr>
+                <th scope="col">Code</th>
+                <th scope="col" class="num">Runs</th>
+                <th scope="col" class="num">Share</th>
+              </tr>
+            </thead>
+            <tbody id="rows-code"></tbody>
+          </table>
+        </section>
+        <section class="panel table-panel" aria-labelledby="h-fallback">
+          <h2 id="h-fallback">By step-down reason</h2>
+          <table class="data">
+            <thead>
+              <tr>
+                <th scope="col">Reason</th>
+                <th scope="col" class="num">Runs</th>
+                <th scope="col" class="num">Share</th>
+              </tr>
+            </thead>
+            <tbody id="rows-fallback"></tbody>
+          </table>
+        </section>
+        <section class="panel table-panel" aria-labelledby="h-country">
+          <h2 id="h-country">By country</h2>
+          <table class="data">
+            <thead>
+              <tr>
+                <th scope="col">Country</th>
+                <th scope="col" class="num">Runs</th>
+                <th scope="col" class="num">Share</th>
+              </tr>
+            </thead>
+            <tbody id="rows-country"></tbody>
+          </table>
+        </section>
+      </div>
+      <p class="table-note grid-note">Share is the share of all runs in the period.</p>
+
+      <section class="panel table-panel" aria-labelledby="h-day">
+        <h2 id="h-day">By day</h2>
+        <p class="table-note">
+          UTC days, newest first. p50 and p95 are the median and the 95th percentile of
+          the time a run took, in seconds.
+        </p>
+        <div class="table-scroll" tabindex="0" role="group" aria-labelledby="h-day">
+          <table class="data data-days">
+            <thead>
+              <tr>
+                <th scope="col">Day</th>
+                <th scope="col" class="num">Runs</th>
+                <th scope="col" class="num">OK</th>
+                <th scope="col" class="num">Est. $</th>
+                <th scope="col" class="num">Stepped down</th>
+                <th scope="col" class="num">Visitors</th>
+                <th scope="col" class="num">Opus</th>
+                <th scope="col" class="num">Sonnet</th>
+                <th scope="col" class="num">Other</th>
+                <th scope="col" class="num">Own key</th>
+                <th scope="col" class="num">p50</th>
+                <th scope="col" class="num">p95</th>
+              </tr>
+            </thead>
+            <tbody id="rows-day"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

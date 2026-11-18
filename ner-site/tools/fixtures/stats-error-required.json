@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "stats_passcode_required",
+    "message": "this page needs the stats passcode in the X-Stats-Passcode header"
+  }
+}

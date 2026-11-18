@@ -1,0 +1,450 @@
+/* The private stats page (/stats). Loaded after app.css, whose tokens, panels, fields
+   and buttons it reuses; only dashboard rules live here. */
+
+:root {
+  /* Chart series, one per tier, in stacking order. Checked for colour-blind separation
+     against --surface in each theme; "own key" is also hatched. */
+  --tier-opus: #2a78d6;
+  --tier-sonnet: #eb6834;
+  --tier-other: #1baf7a;
+  --tier-own: #eda100;
+  --tier-none: #a9a59d;
+  --grid: #e6e5df;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tier-opus: #3987e5;
+    --tier-sonnet: #d95926;
+    --tier-other: #199e70;
+    --tier-own: #c98500;
+    --tier-none: #6b7078;
+    --grid: #2a2e35;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tier-opus: #3987e5;
+  --tier-sonnet: #d95926;
+  --tier-other: #199e70;
+  --tier-own: #c98500;
+  --tier-none: #6b7078;
+  --grid: #2a2e35;
+}
+
+/* ---------- passcode and period ---------- */
+
+.stats-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 16px;
+}
+
+.stats-form .field {
+  flex: 1 1 14rem;
+}
+
+.stats-form .field.narrow {
+  flex: 0 1 11rem;
+}
+
+.stats-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.empty-state {
+  margin-top: 16px;
+}
+
+.empty-state p {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+/* ---------- headline numbers ---------- */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+  min-width: 0;
+}
+
+.tile p {
+  margin: 0;
+}
+
+.tile-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.tile-value {
+  margin-top: 2px;
+  font-size: 1.7rem;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-note {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.tile-lead {
+  border-color: var(--accent);
+}
+
+.estimate-note,
+.unpriced {
+  max-width: 48rem;
+  margin: 12px 2px 0;
+  font-size: 0.875rem;
+}
+
+.estimate-note {
+  color: var(--muted);
+}
+
+.unpriced {
+  padding: 8px 12px;
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-radius: var(--radius-sm);
+}
+
+/* ---------- charts ---------- */
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.chart-panel {
+  margin: 0;
+  min-width: 0;
+  padding: 16px 16px 14px;
+}
+
+.chart-panel h2,
+.table-panel h2 {
+  font-size: 1rem;
+}
+
+.readout {
+  margin: 2px 0 8px;
+  min-height: 2.8em;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+.readout.picked {
+  color: var(--text);
+}
+
+.chart svg {
+  display: block;
+  overflow: visible;
+  border-radius: 4px;
+}
+
+.chart text {
+  fill: var(--muted);
+  font-family: var(--font);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart .grid-line {
+  stroke: var(--grid);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart .base-line {
+  stroke: var(--muted);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart .bar {
+  shape-rendering: crispEdges;
+}
+
+.tier-opus { fill: var(--tier-opus); }
+.tier-sonnet { fill: var(--tier-sonnet); }
+.tier-other { fill: var(--tier-other); }
+.tier-own { fill: var(--tier-own); }
+.tier-none { fill: var(--tier-none); }
+.bar-usd { fill: var(--accent); }
+
+.hatch-line {
+  stroke: var(--surface);
+  stroke-width: 1.5;
+}
+
+.chart .band {
+  fill: var(--accent-soft);
+  visibility: hidden;
+}
+
+.chart .band.on {
+  visibility: visible;
+}
+
+.chart .hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.chart-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chart-legend svg {
+  flex: none;
+  border-radius: 2px;
+}
+
+.chart-hint {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* ---------- tables ---------- */
+
+.table-panel {
+  margin-top: 12px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.table-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.table-note {
+  max-width: 48rem;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.grid-note {
+  margin: 8px 2px 0;
+}
+
+.data {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.table-scroll .data {
+  margin-top: 0;
+}
+
+.data th,
+.data td {
+  padding: 6px 14px 6px 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.data th:last-child,
+.data td:last-child {
+  padding-right: 0;
+}
+
+.data thead th {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  vertical-align: bottom;
+}
+
+.data tbody th {
+  font-weight: 400;
+}
+
+.data tbody tr:last-child th,
+.data tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.data .code {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  overflow-wrap: break-word;
+}
+
+.data .quiet {
+  color: var(--muted);
+}
+
+.data .none td,
+.data .none th {
+  color: var(--muted);
+}
+
+.data-days th:first-child {
+  white-space: nowrap;
+}
+
+.data-days tbody th {
+  font-variant-numeric: tabular-nums;
+}
+
+.data .no-rows {
+  color: var(--muted);
+}
+
+/* ---------- narrow screens ---------- */
+
+@media (max-width: 860px) {
+  .tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tile-lead {
+    grid-column: 1 / -1;
+  }
+
+  .charts,
+  .table-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .table-grid .table-panel + .table-panel {
+    margin-top: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .stats-form .field.narrow {
+    flex: 1 1 100%;
+  }
+
+  .chart-panel,
+  .table-panel {
+    padding: 14px;
+  }
+
+  .data th,
+  .data td {
+    padding-right: 10px;
+  }
+
+  /* By model: each model is a block, its name on a line of its own and the five
+     values under it, each with its column name. */
+  .data-models thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .data-models,
+  .data-models tbody {
+    display: block;
+  }
+
+  .data-models tr {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .data-models tr:last-child {
+    border-bottom: 0;
+  }
+
+  .data-models tbody th {
+    grid-column: 1 / -1;
+    font-weight: 600;
+  }
+
+  .data-models th,
+  .data-models td,
+  .data-models .num {
+    padding: 0;
+    border: 0;
+    text-align: left;
+    white-space: normal;
+  }
+
+  /* Key, runs and dollars on the first line; the two token counts under them. */
+  .data-models td:nth-child(4),
+  .data-models td:nth-child(5) {
+    order: 1;
+  }
+
+  .data-models td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+
+  /* The day stays in view while the wide table scrolls sideways. */
+  .data-days th:first-child {
+    position: sticky;
+    left: 0;
+    background: var(--surface);
+  }
+}
