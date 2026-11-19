@@ -107,6 +107,14 @@
     pipeFind: $("pipe-find"),
     pipeSearch: $("pipe-search"),
     pipeDecide: $("pipe-decide"),
+    guideToggle: $("guide-toggle"),
+    guideChips: $("guide-chips"),
+    guidePlay: $("guide-play"),
+    guidePlayIcon: $("guide-play-icon"),
+    guidePlayLabel: $("guide-play-label"),
+    guideHint: $("guide-hint"),
+    guidePanel: $("guide-panel"),
+    guideToken: $("guide-token"),
     modelHint: $("model-hint"),
     progress: $("progress"),
     progressTime: $("progress-time"),
@@ -1538,6 +1546,7 @@
       el.results.hidden = true;
       state.shown = null;
       syncStale();
+      guideReset();
       if (state.prefilled && !state.touched && el.text.value === state.example.text) {
         el.text.value = "";
         updateCounter();
@@ -2223,6 +2232,8 @@
     state.shown = { text, data, example };
     el.results.hidden = false;
     syncStale();
+    // The figure follows the result on display, from its first mention again.
+    guideReset();
   }
 
   // A result belongs to the text it was made from. Once the box holds another text the
@@ -2238,6 +2249,592 @@
         ? 'This result is for the example text. Press "Map this text" to map yours.'
         : "These results are for the earlier text. Run again to map the text that is in the box now.";
     el.stale.hidden = !stale;
+  }
+
+  // ---------- the guide: the figure that plays ----------
+
+  // #pipe, expanded, is a figure of the pipeline. It follows one mention of the result
+  // on display (the recorded example, then the visitor's latest run) from box to box,
+  // and shows in its panel what each box did with it. Everything it shows is read from
+  // that response; nothing is requested and nothing is stored. A mention visits only
+  // the boxes that ran for it: one with no ontology stops at the Reader, one the search
+  // found nothing for stops at the Retriever, one the selector did not answer for stops
+  // at the Selector. The dashed boxes are the rest of the xwalk loop, which this demo
+  // does not run: they explain themselves and are never visited.
+  const GUIDE_DEMO = ["reader", "retriever", "selector", "result"];
+  const GUIDE_NAMES = { reader: "Reader", retriever: "Retriever", selector: "Selector", result: "Result" };
+  const GUIDE_SUBS = { retriever: "two searches, merged", selector: "picks one, or none", result: "with the reason" };
+  const GUIDE_LIB = {
+    scorer: ["Scorer", "The selector answers “which of these is best”. The best of several wrong answers can still look confident. The scorer asks a different question, “is this choice actually correct for the whole sentence”, and gives its own confidence."],
+    verifier: ["Verifier", "Runs only when the score lands in a doubtful band. It takes a second look at the choice and can object to it."],
+    policy: ["Policy", "Turns the attempt into one outcome, or decides it is not good enough yet and asks for another attempt."],
+    rewriter: ["Rewriter", "Proposes a new search query for the mention, as the preprint’s synonym generator does, and sends it back to the retriever for another round."],
+    ledger: ["Ledger", "Records every attempt with its candidates, the choice and the reason, so a run can be inspected, reviewed and resumed."],
+  };
+  const GUIDE_LIB_NOTE = "In the xwalk library. Not run by this demo.";
+  const GUIDE_OUTCOMES = ["matched", "needs review", "unmatched", "failed"];
+  const GUIDE_LANES = { bm25: "Keyword search", dense: "Meaning search" };
+  const GUIDE_LANE_WORDS = { bm25: "keyword", dense: "meaning" };
+  const GUIDE_RESULT_HELP = "Each mention ends with the ID of a real ontology term, or with a plain statement that no term fits. The ID always comes from the ontology; the model never writes one.";
+  const GUIDE_TAP = "Tap any box above, including the dashed ones, to see what it does.";
+  const GUIDE_SHORT = 4; // candidates shown per lane
+
+  const guide = {
+    nodes: {}, // data-k -> the box's button
+    at: -1, // index of the mention being followed in the shown result's entities; -1: none
+    box: null, // the box whose panel is on show
+    timers: [],
+    pos: null, // where the travelling label is, relative to #pipe
+  };
+
+  function guideOpen() {
+    return el.pipe.getAttribute("data-view") === "expanded";
+  }
+
+  function guideCalm() {
+    return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
+  function guideEntities() {
+    const data = state.shown && state.shown.data;
+    return data && Array.isArray(data.entities) ? data.entities.filter((e) => e && typeof e === "object") : [];
+  }
+
+  function guideLater(ms, fn) {
+    guide.timers.push(setTimeout(fn, ms));
+  }
+
+  // Ends a play where it is. Nothing of the run under way, if there is one, is touched.
+  function guideStop() {
+    for (const t of guide.timers) clearTimeout(t);
+    guide.timers = [];
+    guide.pos = null;
+    const token = el.guideToken;
+    token.classList.remove("is-on");
+    if (typeof token.getAnimations === "function") for (const a of token.getAnimations()) a.cancel();
+    guideMark(null);
+    if (el.pipe.getAttribute("data-play") === "playing") el.pipe.setAttribute("data-play", "idle");
+  }
+
+  function guideMark(active) {
+    for (const [k, node] of Object.entries(guide.nodes)) node.classList.toggle("is-active", k === active);
+  }
+
+  // Which box the panel is about. Said to a screen reader only while the figure is
+  // open: collapsed, the boxes are three ways to open it and nothing is "pressed".
+  function guidePressed() {
+    const open = guideOpen();
+    for (const [k, node] of Object.entries(guide.nodes)) {
+      node.classList.toggle("is-sel", k === guide.box);
+      if (open) node.setAttribute("aria-pressed", k === guide.box ? "true" : "false");
+      else node.removeAttribute("aria-pressed");
+    }
+  }
+
+  function guideSetOpen(open) {
+    if (guideOpen() === open) return;
+    if (!open) guideStop();
+    el.pipe.setAttribute("data-view", open ? "expanded" : "collapsed");
+    el.guideToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    el.guideToggle.textContent = open ? "Close" : "How it works";
+    guidePressed();
+  }
+
+  // The mention a visitor is shown first: one where the selector overruled the search,
+  // else one it declined, else the first with a term, else the first.
+  function guideDefault(entities) {
+    const outcomes = entities.map(outcomeOf);
+    const tries = [
+      entities.findIndex((e) => isOverride(e)),
+      outcomes.findIndex((o) => o === "declined" || o === "unsure"),
+      outcomes.findIndex((o) => o === "matched" || o === "check" || o === "search"),
+    ];
+    const found = tries.find((i) => i >= 0);
+    return found === undefined ? (entities.length ? 0 : -1) : found;
+  }
+
+  function guideWords(text, n, fromEnd) {
+    const cut = text.length > 90;
+    const piece = fromEnd ? text.slice(-90) : text.slice(0, 90);
+    const words = piece.match(fromEnd ? /\S+\s*/g : /\s*\S+/g) || [];
+    if (cut && words.length) {
+      if (fromEnd) words.shift();
+      else words.pop();
+    }
+    const kept = (fromEnd ? words.slice(-n) : words.slice(0, n)).join("").replace(/\s+/g, " ");
+    const more = kept.trim().length < text.replace(/\s+/g, " ").trim().length;
+    return fromEnd ? (more ? "…" : "") + kept : kept + (more ? "…" : "");
+  }
+
+  // The mention with a few words either side, cut from the submitted text by the
+  // server's code-point offsets. If the offsets do not hold, the mention alone.
+  function guideSnippet(text, e) {
+    const mention = String(e.text);
+    const cps = Array.from(typeof text === "string" ? text : "");
+    const ok = Number.isInteger(e.start) && Number.isInteger(e.end) && e.start >= 0 && e.end <= cps.length && e.start < e.end && cps.slice(e.start, e.end).join("") === mention;
+    if (!ok) return ["", mention, ""];
+    return [guideWords(cps.slice(0, e.start).join(""), 4, true), mention, guideWords(cps.slice(e.end).join(""), 4, false)];
+  }
+
+  // Everything the figure says about one mention, read from the response.
+  function guideJourney(e) {
+    const outcome = outcomeOf(e);
+    const p = e.pick && typeof e.pick === "object" ? e.pick : null;
+    const all = (Array.isArray(e.matches) ? e.matches : []).concat(Array.isArray(e.more) ? e.more : []).filter((m) => m && typeof m === "object");
+    const label = (m) => String(m.label || m.id || "-");
+    const term = outcome === "matched" || outcome === "check" ? p : outcome === "search" ? all[0] : null;
+
+    // One lane per retriever that ranked a candidate: its own top four, by its own rank.
+    const keys = [];
+    for (const m of all) for (const k of Object.keys(m.retrievers || {})) if (!keys.includes(k)) keys.push(k);
+    const first = (k) => ["bm25", "dense"].indexOf(k.split("-")[0]);
+    keys.sort((a, b) => (first(a) < 0 ? 9 : first(a)) - (first(b) < 0 ? 9 : first(b)));
+    const lanes = keys.map((k) => ({
+      base: k.split("-")[0],
+      title: GUIDE_LANES[k.split("-")[0]] || `${k} search`,
+      items: all
+        .filter((m) => Number.isFinite(m.retrievers[k]))
+        .sort((a, b) => a.retrievers[k] - b.retrievers[k])
+        .slice(0, GUIDE_SHORT)
+        .map((m) => ({ n: m.retrievers[k], id: m.id, label: label(m) })),
+    }));
+    const merged = all.slice(0, GUIDE_SHORT).map((m, i) => ({ n: i + 1, id: m.id, label: label(m) }));
+
+    // What the selector panel lists: the head of the merged order, and the chosen term
+    // in the last place when it sits lower.
+    const short = merged.map((item) => ({ ...item }));
+    let pickAt = -1;
+    if (term) {
+      const at = all.findIndex((m) => m.id === term.id);
+      if (at >= 0 && at < short.length) pickAt = at;
+      else {
+        const item = { n: at >= 0 ? at + 1 : null, id: term.id, label: label(term), gap: true };
+        if (short.length >= GUIDE_SHORT) short[short.length - 1] = item;
+        else short.push(item);
+        pickAt = short.length - 1;
+      }
+    }
+
+    const stops = ["reader"];
+    if (e.ontology) stops.push("retriever");
+    if (e.ontology && (p || all.length)) stops.push("selector");
+    if (["matched", "check", "search", "declined", "unsure"].includes(outcome)) stops.push("result");
+
+    const mention = String(e.text);
+    let ended = "";
+    if (outcome === "unsearched") ended = `“${mention}” did not get this far: this demo has no ontology for its type, so it was not looked up.`;
+    else if (outcome === "none") ended = `“${mention}” did not get this far: the search found no term for it.`;
+    else if (outcome === "failed") ended = `“${mention}” did not get this far: the selector did not answer, so there is no ID.`;
+
+    const who = p ? selectorName(p.selector) : "";
+    const why = p && p.explanation && outcome !== "failed" ? String(p.explanation) : "";
+    return {
+      e,
+      mention,
+      type: typeLabel(e.type),
+      onto: e.ontology ? state.ontologyNames[e.ontology] || String(e.ontology) : "",
+      outcome,
+      p,
+      all,
+      term,
+      lanes,
+      merged,
+      short,
+      pickAt,
+      stops,
+      ended,
+      who,
+      why,
+      jev: Boolean(p) && p.selector === "jev",
+      override: isOverride(e),
+      notes: [...new Set((Array.isArray(e.notes) ? e.notes : []).map(entityNote).filter(Boolean))],
+      // What the result box is named once the journey is over.
+      resultName: term ? String(term.id) : OUTCOME_TEXT[outcome] || "Ontology ID",
+    };
+  }
+
+  function guideCurrent() {
+    const e = guideEntities()[guide.at];
+    return e ? guideJourney(e) : null;
+  }
+
+  // The short lines under the box names, true for the mention being followed.
+  function guideSubs(j, finished) {
+    const sub = (k, text) => {
+      guide.nodes[k].querySelector(".guide-ns").textContent = text;
+    };
+    for (const k of GUIDE_DEMO) guide.nodes[k].classList.toggle("is-skipped", Boolean(j) && !j.stops.includes(k));
+    const result = guide.nodes.result;
+    const name = result.querySelector(".guide-nn");
+    if (!j) {
+      sub("retriever", GUIDE_SUBS.retriever);
+      sub("selector", GUIDE_SUBS.selector);
+      sub("result", GUIDE_SUBS.result);
+      name.textContent = "Ontology ID";
+      result.removeAttribute("data-outcome");
+      return;
+    }
+    const one = j.lanes.length === 1 ? GUIDE_LANE_WORDS[j.lanes[0].base] : null;
+    if (!j.all.length) sub("retriever", j.e.ontology ? "found no term" : GUIDE_SUBS.retriever);
+    else if (j.lanes.length > 1) sub("retriever", `${j.lanes.length === 2 ? "two" : j.lanes.length} searches, merged`);
+    else sub("retriever", one ? `${one} search only` : "search results");
+    if (j.outcome === "search") sub("selector", "top search result, no model");
+    else if (j.jev) sub("selector", "Jev picks one, or none");
+    else sub("selector", GUIDE_SUBS.selector);
+
+    name.textContent = finished ? j.resultName : "Ontology ID";
+    if (finished && !j.term) result.setAttribute("data-outcome", "none");
+    else result.removeAttribute("data-outcome");
+    let said = GUIDE_SUBS.result;
+    if (finished) {
+      if (j.outcome === "search") said = "the top search result";
+      else if (j.outcome === "failed") said = "the selector did not answer";
+      else if (j.outcome === "none") said = "the search found nothing";
+      else if (j.outcome === "unsearched") said = "no ontology for its type";
+      else if (!j.why) said = j.term ? `chosen by ${j.who}` : `said by ${j.who}`;
+    }
+    sub("result", said);
+  }
+
+  function guideChipsOf(lane, items, target, on) {
+    return items.map((item) => {
+      if (item.gap) lane.append(h("span", { class: "guide-gap", "aria-hidden": "true", text: "…" }));
+      const chip = h("span", { class: `guide-c${item.id === target ? " is-same" : ""}${on ? " is-on" : ""}`, text: `${item.n === null ? "" : `${item.n}. `}${item.label}` });
+      lane.append(chip);
+      return chip;
+    });
+  }
+
+  // The reason as the response gives it. Every word is in the panel from the start;
+  // a play only reveals them, so the text is exposed to a screen reader once, whole.
+  function guideBubble(text, on) {
+    const bubble = h("p", { class: "guide-bubble" });
+    const words = text.split(/\s+/).filter(Boolean).map((w) => h("span", { class: `guide-w${on ? " is-on" : ""}`, text: `${w} ` }));
+    bubble.append(...words);
+    return { bubble, words };
+  }
+
+  function guideSelectorTitle(j) {
+    if (j.outcome === "search") return "Selector · no model chose here: the top search result is taken as it is";
+    if (j.jev) return "Selector · Jev, a small trained ranking model, picks from the shortlist";
+    return `Selector · ${j.who || "the model"} reads the shortlist against the sentence`;
+  }
+
+  function guideReaderName(data) {
+    if (data.mode === "offline") return "the offline stand-in";
+    return typeof data.model === "string" && data.model ? modelName(data.model) : "the model";
+  }
+
+  // Fills the panel for one box. `full` shows the finished state; otherwise the parts a
+  // play reveals are returned. `quiet`: the page wrote this itself (a new result), so
+  // it is not announced; the next thing a visitor asks for is.
+  function guideShow(k, full, quiet) {
+    const panel = el.guidePanel;
+    const j = guideCurrent();
+    const data = state.shown && state.shown.data;
+    const v = {};
+    guide.box = k;
+    guidePressed();
+    if (k) el.pipe.setAttribute("data-at", k);
+    else el.pipe.removeAttribute("data-at");
+    panel.setAttribute("aria-live", quiet ? "off" : "polite");
+    clear(panel);
+
+    if (!k) {
+      panel.append(
+        h("h3", { text: "What happens to your text" }),
+        h("p", { text: "The three boxes with faces run in this demo: one finds the mentions, one searches the ontology, one picks a term. The dashed boxes are the rest of the xwalk loop." }),
+        h("p", { class: "guide-meta", text: GUIDE_TAP }),
+      );
+      return v;
+    }
+    if (GUIDE_LIB[k]) {
+      panel.append(h("h3", { text: GUIDE_LIB[k][0] }), h("p", { text: GUIDE_LIB[k][1] }));
+      if (k === "policy") panel.append(h("div", { class: "guide-outcomes" }, ...GUIDE_OUTCOMES.map((o) => h("span", { text: o }))));
+      panel.append(h("span", { class: "guide-libnote", text: GUIDE_LIB_NOTE }));
+      return v;
+    }
+    // What the box does in general, in the words the page already uses for this
+    // deployment: said when there is no mention to follow, or when the mention being
+    // followed did not reach the box.
+    const general = { reader: el.pipeFind.textContent, retriever: el.pipeSearch.textContent, selector: el.pipeDecide.textContent, result: GUIDE_RESULT_HELP }[k];
+    if (!j || !data) {
+      panel.append(h("h3", { text: GUIDE_NAMES[k] }), h("p", { text: general }), h("p", { class: "guide-meta", text: "There is no result on the page yet. Map a text, then press Play to follow one of its mentions through these boxes." }));
+      return v;
+    }
+    if (!j.stops.includes(k)) {
+      panel.append(h("h3", { text: GUIDE_NAMES[k] }), h("p", { text: j.ended }), h("p", { class: "guide-meta", text: general }));
+      return v;
+    }
+    const on = full ? " is-on" : "";
+
+    if (k === "reader") {
+      panel.append(h("h3", { text: `Reader · ${guideReaderName(data)} reads the whole text and marks the mentions` }));
+      const [before, mention, after] = guideSnippet(state.shown.text, j.e);
+      v.snip = h("div", { class: "guide-snip" }, before, h("strong", { text: mention }), after);
+      const kind = j.type === "other" ? "is marked as another kind of mention" : `is a ${j.type}`;
+      v.out = h("span", { class: `guide-c guide-out${on}`, text: `“${j.mention}” ${kind}${j.onto ? `, so it goes to ${j.onto}` : ""}` });
+      panel.append(v.snip, v.out);
+      if (!j.e.ontology) {
+        v.end = h("p", { class: `guide-c guide-out${on}`, text: "Recognised, but this demo has no ontology for it." });
+        panel.append(v.end);
+      }
+    } else if (k === "retriever") {
+      const count = plural(j.all.length, "candidate");
+      v.lanes = [];
+      if (!j.all.length) {
+        panel.append(h("h3", { text: `Retriever · xwalk searched ${j.onto} and found no term for this mention` }));
+      } else if (j.lanes.length > 1) {
+        panel.append(h("h3", { text: `Retriever · xwalk searches ${j.onto} ${j.lanes.length === 2 ? "two" : "several"} ways and merges the rankings` }));
+      } else {
+        const only = j.lanes.length ? GUIDE_LANE_WORDS[j.lanes[0].base] : null;
+        panel.append(h("h3", { text: `Retriever · xwalk searched ${j.onto}${only ? `; only ${only} search ranked candidates for this mention` : ""}` }));
+      }
+      if (j.all.length) {
+        const lanes = h("div", { class: "guide-lanes" });
+        // One retriever: its ranking is the shortlist. One lane, not two and a merge.
+        const shown = j.lanes.length > 1 ? j.lanes.concat([{ title: `Merged, ${count}`, items: j.merged }]) : [{ title: `${j.lanes.length ? j.lanes[0].title : "Search"}, ${count}`, items: j.lanes.length ? j.lanes[0].items : j.merged }];
+        for (const lane of shown) {
+          const box = h("div", { class: "guide-lane" }, h("h4", { text: lane.title }));
+          v.lanes.push(guideChipsOf(box, lane.items, j.term ? j.term.id : null, full));
+          lanes.append(box);
+        }
+        panel.append(lanes);
+      }
+      for (const note of j.notes) panel.append(h("p", { class: "guide-meta", text: note }));
+    } else if (k === "selector") {
+      panel.append(h("h3", { text: guideSelectorTitle(j) }));
+      const lane = h("div", { class: "guide-lane" });
+      v.short = guideChipsOf(lane, j.short, null, true);
+      const done = (chip, i) => {
+        chip.classList.toggle("is-picked", i === j.pickAt);
+        chip.classList.toggle("is-passed", j.pickAt < 0 ? j.outcome !== "failed" : i < j.pickAt);
+      };
+      v.done = () => v.short.forEach((chip, i) => {
+        chip.classList.remove("is-consider");
+        done(chip, i);
+      });
+      if (j.pickAt >= 0) v.short[j.pickAt].append(h("span", { class: "visually-hidden", text: " (chosen)" }));
+      if (full) v.done();
+      if (v.short.length) panel.append(lane);
+      if (j.all.length > j.short.length) panel.append(h("p", { class: "guide-meta", text: `These are ${j.short.length} of the ${plural(j.all.length, "candidate")} it was given.` }));
+      let verdict = "";
+      if (j.outcome === "declined") verdict = "None of these fits";
+      else if (j.outcome === "unsure") verdict = "Not sure that any of these fits";
+      else if (j.outcome === "failed") verdict = `${j.jev ? "Jev" : j.who || "The selector"} could not answer for this mention, so no term was chosen`;
+      if (verdict) {
+        v.verdict = h("span", { class: `guide-c guide-verdict${on}`, text: verdict });
+        panel.append(v.verdict);
+      }
+      if (j.why) {
+        const made = guideBubble(j.why, full);
+        v.words = made.words;
+        panel.append(made.bubble);
+      }
+    } else {
+      panel.append(h("h3", { text: "Result" }));
+      const line = h("p", null, h("strong", { text: j.mention }), " → ");
+      if (j.term) {
+        const href = safeHref(j.term.url);
+        line.append(href ? h("a", { class: "guide-id", href, target: "_blank", rel: "noopener noreferrer", text: String(j.term.id) }) : h("span", { class: "guide-id", text: String(j.term.id) }));
+        if (j.term.label) line.append(` ${j.term.label}`);
+      } else line.append(OUTCOME_TEXT[j.outcome] || "");
+      panel.append(line);
+      const said = [];
+      if (j.term === j.p && j.p && typeof j.p.confidence === "number") said.push(`Confidence ${j.p.confidence.toFixed(2)}: the model's own, not a measured accuracy.`);
+      if (j.outcome === "check") said.push(`${j.who} marked it as needing a check.`);
+      if (j.outcome === "search") said.push("The top search result. No model chose, so there is no reason and no confidence.");
+      else if (j.term) said.push(j.override ? "Not the top search hit: the selector overruled the ranking." : "Also the top search hit.");
+      else if (j.outcome === "declined") said.push(`${j.who} looked at ${plural(j.all.length, "candidate")} and declined to pick one.`);
+      else if (j.outcome === "unsure") said.push(`${j.who} looked at ${plural(j.all.length, "candidate")} and was not sure that any of them fits.`);
+      if (said.length) panel.append(h("p", { class: "guide-meta", text: said.join(" ") }));
+      if (j.why) panel.append(guideBubble(j.why, true).bubble);
+      panel.append(h("p", { class: "guide-meta", text: GUIDE_TAP }));
+    }
+    return v;
+  }
+
+  // Moves the travelling label to a box. It is positioned from script (the CSSOM, which
+  // the page's style policy allows) and kept inside #pipe, so it never widens the page.
+  function guideFly(node, text) {
+    const token = el.guideToken;
+    if (text) token.textContent = text;
+    const frame = el.pipe.getBoundingClientRect();
+    const r = node.getBoundingClientRect();
+    const x = Math.round(Math.max(0, Math.min(r.left - frame.left + 10, frame.width - token.offsetWidth - 2)));
+    const y = Math.round(Math.max(0, r.top - frame.top - 17));
+    const from = guide.pos || [x, y];
+    token.classList.add("is-on");
+    const to = `translate(${x}px, ${y}px)`;
+    if (typeof token.animate === "function") {
+      token.animate([{ transform: `translate(${from[0]}px, ${from[1]}px)` }, { transform: to }], { duration: guide.pos ? 520 : 1, easing: "cubic-bezier(.3,1.3,.5,1)", fill: "forwards" });
+    } else token.style.transform = to;
+    guide.pos = [x, y];
+  }
+
+  function guideChips() {
+    const entities = guideEntities();
+    clear(el.guideChips);
+    el.guideChips.hidden = entities.length === 0;
+    if (!entities.length) return;
+    el.guideChips.append(h("span", { class: "guide-chips-label", id: "guide-chips-label", text: "Follow a mention:" }));
+    entities.forEach((e, i) => {
+      const t = typeLabel(e.type);
+      const chip = h("button", { type: "button", class: `guide-men type-${t}`, "aria-pressed": i === guide.at ? "true" : "false" }, String(e.text), h("span", { class: "visually-hidden", text: ` (${t})` }));
+      chip.classList.toggle("is-current", i === guide.at);
+      chip.addEventListener("click", () => guidePlay(i));
+      el.guideChips.append(chip);
+    });
+  }
+
+  function guideChip(i) {
+    return el.guideChips.querySelectorAll(".guide-men")[i] || null;
+  }
+
+  function guideFollow(i) {
+    guide.at = i;
+    el.guideChips.querySelectorAll(".guide-men").forEach((chip, n) => {
+      chip.classList.toggle("is-current", n === i);
+      chip.setAttribute("aria-pressed", n === i ? "true" : "false");
+    });
+  }
+
+  function guidePlayLabel(again) {
+    el.guidePlayIcon.textContent = again ? "↻" : "▶";
+    el.guidePlayLabel.textContent = again ? "Play again" : "Play";
+  }
+
+  function guideHint(j) {
+    if (j) el.guideHint.textContent = `Following “${j.mention}”. Tap a box to see what it does.`;
+    else if (state.shown) el.guideHint.textContent = "This result has no mention to follow. Tap a box to see what it does.";
+    else el.guideHint.textContent = "Map a text to follow one of its mentions here. Tap a box to see what it does.";
+  }
+
+  // The finished figure for the mention being followed: where its journey ended.
+  function guideFinish(j, quiet) {
+    guideMark(null);
+    el.guideToken.classList.remove("is-on");
+    guideSubs(j, true);
+    guideShow(j.stops[j.stops.length - 1], true, quiet);
+  }
+
+  // A result arrived, or left: the figure is that result's, at rest, from its first
+  // mention. Nothing plays, nothing is announced, nothing scrolls.
+  function guideReset() {
+    guideStop();
+    const entities = guideEntities();
+    guide.at = guideDefault(entities);
+    guideChips();
+    const j = guideCurrent();
+    el.guidePlay.disabled = !j;
+    guidePlayLabel(false);
+    guideHint(j);
+    el.pipe.setAttribute("data-play", "idle");
+    if (j) guideFinish(j, true);
+    else {
+      guideSubs(null, false);
+      guideShow(null, true, true);
+    }
+  }
+
+  // A tap on a box: what it did with the mention, finished. A play under way ends.
+  function guideTap(k) {
+    guideStop();
+    guideSetOpen(true);
+    const j = guideCurrent();
+    if (j) guideSubs(j, true);
+    guideShow(k, true);
+  }
+
+  // Follows one mention through the boxes that ran for it. With reduced motion there
+  // is no travel: the finished figure is shown.
+  function guidePlay(i) {
+    guideStop();
+    if (!guideEntities()[i]) return;
+    guideSetOpen(true);
+    guideFollow(i);
+    const j = guideCurrent();
+    guideHint(j);
+    if (guideCalm()) {
+      guideFinish(j);
+      el.pipe.setAttribute("data-play", "done");
+      guidePlayLabel(true);
+      return;
+    }
+    guidePlayLabel(false);
+    guideSubs(j, false);
+    el.pipe.setAttribute("data-play", "playing");
+    const chip = guideChip(i);
+    const node = guide.nodes;
+    let t = 100;
+    let v;
+    guideLater(t, () => {
+      if (chip) guideFly(chip, j.mention);
+    });
+    guideLater((t += 350), () => {
+      v = guideShow("reader");
+      guideFly(node.reader, j.mention);
+      guideMark("reader");
+      v.snip.classList.add("is-scan");
+    });
+    guideLater((t += 1100), () => {
+      v.out.classList.add("is-on");
+      if (v.end) guideLater(450, () => v.end.classList.add("is-on"));
+    });
+    t += 900;
+    if (j.stops.includes("retriever")) {
+      const lanes = j.all.length ? (j.lanes.length > 1 ? j.lanes.length + 1 : 1) : 0;
+      guideLater(t, () => {
+        v = guideShow("retriever");
+        guideFly(node.retriever);
+        guideMark("retriever");
+        v.lanes.forEach((chips, lane) => chips.forEach((c, n) => guideLater(250 + lane * 650 + n * 130, () => c.classList.add("is-on"))));
+      });
+      t += 1250 + lanes * 650;
+    }
+    if (j.stops.includes("selector")) {
+      // The ones above the chosen term are considered first; a term at the top is
+      // settled at once. With no term chosen, every one listed is considered.
+      const looks = j.pickAt > 0 ? j.pickAt + 1 : j.pickAt === 0 || j.outcome === "failed" ? 0 : j.short.length;
+      const words = j.why ? j.why.split(/\s+/).filter(Boolean).length : 0;
+      const pace = words ? Math.min(55, 3500 / words) : 0;
+      const settle = 500 + looks * 650;
+      guideLater(t, () => {
+        v = guideShow("selector");
+        guideFly(node.selector);
+        guideMark("selector");
+        for (let n = 0; n < looks; n += 1) {
+          guideLater(500 + n * 650, () =>
+            v.short.forEach((c, at) => {
+              c.classList.toggle("is-consider", at === n);
+              c.classList.toggle("is-passed", at < n);
+            }),
+          );
+        }
+        guideLater(settle, () => {
+          v.done();
+          if (v.verdict) v.verdict.classList.add("is-on");
+        });
+        (v.words || []).forEach((w, n) => guideLater(settle + 250 + n * pace, () => w.classList.add("is-on")));
+      });
+      t += settle + 250 + words * pace + 650;
+    }
+    if (j.stops.includes("result")) {
+      guideLater(t, () => {
+        guide.nodes.result.querySelector(".guide-nn").textContent = j.resultName;
+        if (!j.term) guide.nodes.result.setAttribute("data-outcome", "none");
+        guideFly(node.result, j.resultName);
+        guideMark("result");
+      });
+      t += 900;
+    }
+    guideLater(t, () => {
+      guide.timers = [];
+      guide.pos = null;
+      guideFinish(j);
+      el.pipe.setAttribute("data-play", "done");
+      guidePlayLabel(true);
+    });
   }
 
   // ---------- run ----------
@@ -2306,8 +2903,9 @@
     };
     tick();
     progressTimer = setInterval(tick, 1000);
-    // On a phone the steps can be below the screen's edge.
-    reveal(el.pipe, "nearest");
+    // On a phone the steps can be below the screen's edge. With the figure open, the
+    // bar and the clock are what has to be seen: the figure is taller than a screen.
+    reveal(guideOpen() ? el.progress : el.pipe, "nearest");
   }
 
   function reveal(node, block) {
@@ -2606,6 +3204,22 @@
 
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
   $("shortcut-key").textContent = isMac ? "⌘" : "Ctrl";
+
+  for (const node of el.pipe.querySelectorAll(".guide-node")) {
+    guide.nodes[node.getAttribute("data-k")] = node;
+    node.addEventListener("click", () => guideTap(node.getAttribute("data-k")));
+  }
+  // "How it works" is the visitor asking to see it: open the figure, bring it into view
+  // and play the chosen mention once. During a run it only opens.
+  el.guideToggle.addEventListener("click", () => {
+    const opening = !guideOpen();
+    guideSetOpen(opening);
+    if (!opening) return;
+    reveal(el.pipe, "start");
+    if (!state.running && guideEntities()[guide.at]) guidePlay(guide.at);
+  });
+  el.guidePlay.addEventListener("click", () => guidePlay(guide.at));
+  guideReset();
 
   fillTopK(DEFAULT_LIMITS.top_k_max);
   el.topK.value = "5";

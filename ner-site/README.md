@@ -45,8 +45,26 @@ One page, in this order from the top:
   model). Options opens itself when something in it needs the visitor, for example a
   restored own-key choice or a refused key. Problems with the text or a key are said at
   that field.
-- The three steps of a run (Find, Search, Decide). During a run they show what each
-  step does, a moving bar and a clock. No step is ticked: the API answers once.
+- How a run works (`#pipe`). Collapsed, which is how it arrives at every width, it is
+  one row: the three agents this demo runs (Reader, Retriever, Selector) and a **How it
+  works** button. During a run the same row says what each agent does, with a moving
+  bar and a clock; the three faces move, and no step is ticked, because the API answers
+  once. **How it works**, or a tap on an agent, opens the figure: the demo's row
+  (Reader, Retriever, Selector, Ontology ID), the rest of the xwalk loop in dashed boxes
+  (Scorer, Verifier, Policy, Rewriter, Ledger; not run by this demo), a link to the
+  FoodOntoRAG preprint, a chip per mention, **Play** and a panel. Play follows one
+  mention of the result on display (the recorded example, then the visitor's latest
+  run) from box to box, and the panel shows what each box did with it: the words around
+  it, the top four of each search and of the merged ranking, the candidates the
+  selector passed over, its choice and its reason. All of it is read from the response
+  the page already holds; nothing is requested or stored. A mention visits only what
+  ran for it: one with no ontology stops at the Reader, one the search found nothing
+  for at the Retriever, one the selector did not answer for at the Selector; with the
+  top search result or Jev as the selector the Selector box says so, and no reason is
+  shown where the response has none. Nothing plays by itself, the page never scrolls or
+  moves the focus for the figure, and a new result puts it back at rest on that result.
+  With reduced motion Play shows the finished figure. Under 700 px the boxes stack and
+  the panel sits under the box it is about.
 - One box for a run that failed, with a title, what to do and one action. Used-up
   limits are worded per network ("The free runs for your network this hour are
   used"), because the limit is counted per IP address.
@@ -2125,6 +2143,37 @@ failed as the review describes, and then against the page. Run as above:
 Not verified: session storage that is full or unreadable is simulated by replacing
 `Storage.prototype.setItem` and `getItem`, and the restore by firing the browser's
 `pageshow` event with `persisted`; no real quota, private mode or phone was used.
+
+### The figure that plays, 19 November 2026 (branch `feat/agent-guide`, not deployed)
+
+`#pipe` became the "How it works" figure described under "The page"; the API did not
+change. Run against `tools/serve_local.py --offline`, in the installed Chrome, with
+health, the example and the run answers supplied by the harness:
+
+- `tools/page_smoke.mjs`: 54 states (ten new `guide-*` ones) at 390 and 1280 px, light
+  and dark: all 108 passed in each scheme. The new states cover: collapsed on arrival
+  with the example and nothing playing; a play to the end for a mention the selector
+  overruled and for one that was the top hit; a declined pick; a mention with no
+  ontology; the top search result and Jev as the selector; one retriever; the dashed
+  boxes and a page with no result; a run started while the figure is open; a new result
+  arriving in the middle of a play; reduced motion. During the plays the harness records
+  that the panel (a live region) is rewritten once per box and never retyped, and that
+  the travelling label neither widens the page nor leaves the figure.
+  `tools/fixtures/guide-run.json` is a run recorded from production that day, with its
+  text.
+- The example result starts 803 px down at 390x844 with the figure collapsed (787 px
+  before), 825 px at 360x640 (809), 856 px at 1280x800 (855).
+- `tools/screenshot.mjs` at 390 px, at 1280 px `--dark`, and with
+  `--text "" --expect error`: exit 0. `/stats` renders as before (same screenshot,
+  byte for byte, at 390 and 1280 px).
+- `node --check` on `public/app.js`, `tools/page_smoke.mjs`, `tools/screenshot.mjs`.
+- `.venv/bin/python -m pytest -q`: 1966 passed, 35 skipped. `.venv/bin/ruff check .`:
+  clean.
+
+Not verified: no phone, no Safari or Firefox, and no screen reader was used (what a
+screen reader is given was checked in the DOM: roles, names, `aria-live`, and that the
+panel's text is not changed while it is revealed). The figure was not run against
+production, and no live run was made; every response came from a recording.
 
 ### For the operator after deploying
 
