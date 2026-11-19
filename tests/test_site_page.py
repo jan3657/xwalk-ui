@@ -105,3 +105,26 @@ def test_the_policy_refuses_every_form_submission() -> None:
     directives = [d.strip() for d in policy.split(";")]
     assert "form-action 'none'" in directives
     assert "default-src 'self'" in directives
+
+
+# ---------- the footer's statements ----------
+#
+# "How this site handles data" promises only what holds for every run: each statement
+# carries its condition, and none says that every run is recorded or that nothing is
+# kept. tools/page_smoke.mjs ("production") reads the same lines in a browser.
+
+
+def test_the_footer_states_its_conditions() -> None:
+    footer = re.search(r"<footer class=\"footer\" id=\"privacy\">.*?</footer>", _index(), re.DOTALL)
+    assert footer, "the footer is gone from index.html"
+    text = footer.group(0)
+    assert (
+        "<li>This site is built not to keep your text, prompt or results: its logs and its "
+        "database hold run metadata only, for example time, model, token counts and country, "
+        "and a visitor hash that changes every day.</li>"
+    ) in text
+    assert "<li>When embedding search is used, the mentions found in your text are sent" in text
+    assert "<li>When run recording is enabled, this site attempts to save" in text
+    assert "<li>Runs on this site's own models are limited per network" in text
+    for promise in ("writes no text", "Each run is recorded", "stores no", "not saved"):
+        assert promise not in text
