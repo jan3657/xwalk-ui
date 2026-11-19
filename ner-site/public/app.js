@@ -16,7 +16,10 @@
   // 19 Nov 2026). The text above stays the example for offline and sample modes.
   const EXAMPLE_FULL =
     "Aspirin relieved her fever after a meal of hummus. She takes metformin for type 2 diabetes, " +
-    "has high blood pressure, and drank green tea every morning.";
+    "has high blood pressure, and drank green tea every morning. " +
+    "Last winter she was given amoxicillin for pneumonia and told to eat more salmon, lentils and " +
+    "olive oil while cutting back on table sugar. " +
+    "Her brother has asthma, uses salbutamol, and gets migraines after red wine or dark chocolate.";
 
   const TYPES = ["chemical", "disease", "gene", "food", "other"];
   const DEFAULT_LIMITS = { max_chars: 5000, max_prompt_chars: 4000, max_entities: 25, top_k_max: 10 };

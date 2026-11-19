@@ -1475,7 +1475,8 @@ const STATES = {
     s.check(seen.stale === null, "the example is marked as for another text on arrival");
     s.check(seen.banner === null, `a banner is shown for the example: ${JSON.stringify(seen.banner)}`);
     s.check(/ChEBI · 219k terms/.test(seen.legend), `the legend has no term counts: ${JSON.stringify(seen.legend)}`);
-    await s.expectText("#results-summary", /^7 mentions found: 7 matched\.$/);
+    const nEx = EXAMPLE_FILE.response.entities.length;
+    await s.expectText("#results-summary", new RegExp(`^${nEx} mentions found: ${nEx} matched\\.$`));
     await s.expectHidden("#notices", "'About this run' for the example");
     s.check(!(await s.page.evaluate(() => document.getElementById("run-details").open)), "the recorded run's details are open");
     if (s.width === 390) {
@@ -2457,7 +2458,7 @@ const STATES = {
     await s.page.waitForFunction(() => document.getElementById("pipe").getAttribute("data-play") === "done", null, { timeout: 25000 });
     await s.page.waitForTimeout(300);
     g = await s.guide();
-    s.check(g.chips.length === 7 && g.chips.filter((c) => c.current).map((c) => c.text).join() === "metformin", `the mentions to follow are ${JSON.stringify(g.chips)}`);
+    s.check(g.chips.length === EXAMPLE_FILE.response.entities.length && g.chips.filter((c) => c.current).map((c) => c.text).join() === "metformin", `the mentions to follow are ${JSON.stringify(g.chips)}`);
     s.check(g.chips.every((c) => c.tag === "BUTTON" && /\((chemical|disease|food)\)$/.test(c.name)), "a mention chip is not a button named with its type");
     // At rest: the finished figure for the mention where the selector overruled the search.
     s.check(g.nodes.result.label === "CHEBI:6801" && /^Result/.test(g.panel), `at rest the figure shows ${g.nodes.result.label}: ${JSON.stringify(g.panel.slice(0, 60))}`);
@@ -2728,7 +2729,7 @@ const STATES = {
     s.check(during.awake.every((a) => a === "guide-bob") && during.asleep === "none", `during a run the faces are ${during.awake.join(",")}; a library box is ${during.asleep}`);
     s.check(/^\d+ s$/.test(during.time), `the clock says ${JSON.stringify(during.time)}`);
     let g = await s.guide();
-    s.check(g.view === "expanded" && g.chips.length === 7 && !g.playDisabled, "the figure of the example is not there during the run");
+    s.check(g.view === "expanded" && g.chips.length === EXAMPLE_FILE.response.entities.length && !g.playDisabled, "the figure of the example is not there during the run");
     s.check(!Object.values(g.nodes).some((n) => n.done), "a box is ticked during a run");
     // The example can be played while waiting, and boxes tapped: the run goes on.
     await s.page.click("#guide-play");
