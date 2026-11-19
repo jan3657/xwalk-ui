@@ -124,7 +124,12 @@ def test_the_footer_states_its_conditions() -> None:
         "and country, "
         "and a visitor hash that changes every day.</li>"
     ) in text
-    assert "<li>When embedding search is used, the mentions found in your text are sent" in text
+    assert (
+        "<li>When embedding search is used, the mentions found in your text are sent to OpenRouter "
+        "to compute search embeddings. The server may keep recent mentions, search results and "
+        "answers in memory for a few hours so that it does not compute them twice; none of that "
+        "is written to its database.</li>"
+    ) in text
     assert "<li>When run recording is enabled, this site attempts to save" in text
     assert "<li>Runs on this site's own models are limited per network" in text
     for promise in ("writes no text", "Each run is recorded", "stores no", "not saved"):

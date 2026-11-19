@@ -288,6 +288,9 @@
           <p id="results-cap" class="results-cap" hidden></p>
           <p id="results-takeaway" class="takeaway" hidden></p>
           <p id="status" class="status"></p>
+          <!-- "Map this text" on the untouched example: the recorded result, and this
+               line in place of a run. app.js shows it. -->
+          <p id="recorded-note" class="recorded-note" hidden><span id="recorded-text">This is the recorded result for the example, so nothing was sent.</span> <button type="button" id="run-live" class="secondary small">Run it live</button></p>
         </div>
         <div id="no-entities" class="no-entities" hidden>
           <p class="no-entities-title"><strong id="no-entities-title">No chemicals, diseases or foods found in this text.</strong></p>
@@ -332,18 +335,29 @@
       <h2 class="footer-title">How this site handles data</h2>
       <ul>
         <li>Your text is sent to the model provider to find the mentions and choose the terms: Anthropic by default; OpenRouter, and the model host it routes to, if the run falls back or you choose it; the provider of your own key if you use one.</li>
-        <li>When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory for a while so it does not compute them twice.</li>
+        <li>When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings. The server may keep recent mentions, search results and answers in memory for a few hours so that it does not compute them twice; none of that is written to its database.</li>
         <li>This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day.</li>
         <li>When run recording is enabled, this site attempts to save one row of that metadata for each run.</li>
         <li>Runs on this site's own models are limited per network, and runs with your own key are counted the same way, using a salted hash of the IP address. Entries older than a day are deleted by a clean-up that runs from time to time.</li>
         <li>Visits are counted without cookies.</li>
         <li>If you use your own API key, it stays in this browser tab's session storage and is sent only with your runs.</li>
       </ul>
-      <p>Built with <a href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">xwalk</a>.
-        Developed at the <a href="https://csd.ijs.si/" target="_blank" rel="noopener">Computer Systems Department (E7)</a>,
-        Jožef Stefan Institute, Ljubljana.</p>
+      <p>Built with <a href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">xwalk</a>, developed at the Computer Systems Department (E7) of the Jožef Stefan Institute, Ljubljana.</p>
+      <div class="partners" aria-label="Supporting organisations">
+        <a class="partner" href="https://csd.ijs.si/" target="_blank" rel="noopener">
+          <img src="logos/ijs.png" alt="" width="31" height="40" loading="lazy">
+          <span>Jožef Stefan Institute<br>Computer Systems Department (E7)</span>
+        </a>
+        <a class="partner" href="https://autolearnsi.eu/" target="_blank" rel="noopener">
+          <img src="logos/autolearn-si.png" alt="AutoLearn-SI" width="158" height="40" loading="lazy">
+        </a>
+        <span class="partner">
+          <img src="logos/eu-flag.svg" alt="" width="60" height="40" loading="lazy">
+          <span>Funded by<br>the European Union</span>
+        </span>
+      </div>
       <p id="funding">Supported by the European Union through the Horizon Europe project
-        <a href="https://autolearnsi.eu/" target="_blank" rel="noopener">AutoLearn-SI</a> (grant agreement 101187010).
+        AutoLearn-SI (grant agreement 101187010).
         Views and opinions expressed are those of the authors only and do not necessarily reflect those of the
         European Union. Neither the European Union nor the granting authority can be held responsible for them.</p>
     </footer>

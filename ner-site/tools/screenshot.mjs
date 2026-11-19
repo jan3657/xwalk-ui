@@ -81,6 +81,10 @@ async function main() {
     await page.click("#load-example");
     if (opts.text !== null) await page.fill("#text", opts.text);
     await page.click("#run");
+    // On a full-catalog site "Map this text" on the untouched example sends nothing and
+    // shows the recorded result with a "Run it live" button. A run is what this tool
+    // is for, so it presses that.
+    if (opts.text === null && opts.expect === "results" && (await page.isVisible("#run-live"))) await page.click("#run-live");
 
     if (opts.expect === "results") {
       await Promise.race([

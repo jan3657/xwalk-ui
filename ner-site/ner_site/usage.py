@@ -445,7 +445,15 @@ def run_of(
     under the model the request asked for, so that a failure that was paid for is
     priced. The tokens are the sum over every model the chain tried, and nothing says
     which model used which; the chain only steps down to cheaper models, so the
-    requested model's price can overstate such a run and never understate it."""
+    requested model's price can overstate such a run and never understate it.
+
+    A request answered from the response cache (``log["cache"]["response"] == "hit"``)
+    gets a row too, so that it is counted as a request and its visitor as a visitor,
+    and the row says what it cost: nothing. Its ``model`` is null (no model was reached,
+    as for a request that was refused), its calls are zero, its tokens and its cost are
+    null, and so are its timings, so that the lookup's millisecond does not pull the
+    median run time down. Such a row adds no dollars and no unpriced run to the
+    statistics: it is in the ``by_model`` row whose model is null."""
     known = _MODELS | frozenset(models)
     status = _whole(log.get("status")) or 0
     requested = _model_of(log.get("model"), known)
@@ -460,7 +468,13 @@ def run_of(
     cost = log.get("selector_cost_usd")
     custom = log.get("custom_prompt")
     tier = log.get("tier")
+    cache = log.get("cache")
+    cached = isinstance(cache, Mapping) and cache.get("response") == "hit"
+    if cached:
+        timing = {}
     ran = _model_of(log.get("ran"), known) or (requested if status == 200 else None)
+    if cached:
+        ran = None
     calls = _whole(log.get("llm_calls"))
     prompt_tokens = _whole(log.get("prompt_tokens"))
     completion_tokens = _whole(log.get("completion_tokens"))

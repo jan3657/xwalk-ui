@@ -22,7 +22,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -46,6 +46,8 @@ from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
 from ner_site import providers
+from ner_site.cache import ON as CACHE_ON
+from ner_site.cache import Caches, CacheSettings
 from ner_site.claude import (
     CLAUDE_MODELS,
     DISPLAY_NAMES,
@@ -70,9 +72,10 @@ from ner_site.indexes import (
     summarise_status,
 )
 from ner_site.limits import Allowance
-from ner_site.mapping import MapStats, map_entities
+from ner_site.mapping import OTHER_NOTE, MapStats, map_entities
 from ner_site.ontologies import FULL_ROUTES, ROUTES
 from ner_site.schema import (
+    CacheInfo,
     FallbackNote,
     Limits,
     Mode,
@@ -170,6 +173,15 @@ _OWN_MODELS = {
     "openai": ("gpt-6-luna",),
     "openrouter": (DEFAULT_FALLBACK_MODEL, "openai/gpt-6-luna"),
 }
+# (env name, CacheSettings field, highest). 0 turns that cache off (for the time limit:
+# all three). The highest values keep a warm instance's memory within reason: a stored
+# response is about 100 KB, the candidates of one mention about 40 KB, a pick under 1 KB.
+_CACHE_ENV: tuple[tuple[str, str, int], ...] = (
+    ("NER_SITE_CACHE_RESPONSES", "responses", 2000),
+    ("NER_SITE_CACHE_RETRIEVAL", "retrieval", 20000),
+    ("NER_SITE_CACHE_PICKS", "picks", 100000),
+    ("NER_SITE_CACHE_TTL_S", "ttl_s", 7 * 86400),
+)
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 ENV_NAMES = (
@@ -196,6 +208,8 @@ ENV_NAMES = (
     *(f"NER_SITE_OWN_MODELS_{p.upper()}" for p in providers.OWN_PROVIDERS),
     "NER_SITE_VISITOR_SALT",
     "NER_SITE_STATS_PASSCODE",
+    "NER_SITE_CACHE",
+    *(name for name, _, _ in _CACHE_ENV),
 )
 
 
@@ -335,6 +349,10 @@ class Settings:
     visitor_salt: str | None = field(default=None, repr=False)
     # Set: runs are recorded and GET /api/stats answers to it. Unset: neither exists.
     stats_passcode: str | None = field(default=None, repr=False)
+    # The in-memory caches (``ner_site.cache``). Off for a ``Settings`` built in code;
+    # ``from_env`` turns them on with the default sizes unless the environment says
+    # otherwise (``NER_SITE_CACHE=off``, or a size of 0).
+    cache: CacheSettings = CacheSettings()
 
     # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
     own_providers: tuple[providers.ProviderInfo, ...] = ()
@@ -424,6 +442,27 @@ class Settings:
                 raise SettingsError(f"{name} must be a whole number from {low} to {high}")
             numbers[attr] = int(raw)
 
+        cache_raw = get("NER_SITE_CACHE").lower()
+        if cache_raw and cache_raw not in _TRUE | _FALSE:
+            raise SettingsError("NER_SITE_CACHE must be on or off (or 1/0, true/false, yes/no)")
+        cache_sizes: dict[str, int] = {}
+        for name, attr, maximum in _CACHE_ENV:
+            raw = get(name)
+            if not raw:
+                continue
+            if (
+                len(raw) > len(str(maximum))
+                or not re.fullmatch(r"[0-9]+", raw)
+                or int(raw) > maximum
+            ):
+                raise SettingsError(f"{name} must be a whole number from 0 to {maximum}")
+            cache_sizes[attr] = int(raw)
+        cache_settings = (
+            CacheSettings()
+            if cache_raw and cache_raw in _FALSE
+            else CacheSettings(**{**asdict(CACHE_ON), **cache_sizes})
+        )
+
         backend = get("NER_SITE_BACKEND").lower() or "bundled"
         if backend not in {"bundled", "neon"}:
             raise SettingsError("NER_SITE_BACKEND must be bundled or neon")
@@ -503,6 +542,7 @@ class Settings:
             own_providers=own_providers,
             visitor_salt=get("NER_SITE_VISITOR_SALT") or None,
             stats_passcode=stats_passcode,
+            cache=cache_settings,
         )
         if not settings.offered_models:
             raise SettingsError(
@@ -570,6 +610,30 @@ class Settings:
         """Whether ``/api/ner`` can run: offline, or a key to call a provider with
         (OpenRouter's or Anthropic's)."""
         return self.offline or self.api_key is not None or self.anthropic_api_key is not None
+
+    @property
+    def cache_scope(self) -> tuple[Any, ...]:
+        """What tells this deployment's answers from another's in the same process, for
+        ``cache.caches_for``: two settings that differ in any of these never share a
+        cached value. The database is named by a digest, and no key or passcode is
+        here at all (only whether each key is set)."""
+        database = self.database_url or ""
+        return (
+            self.mode,
+            self.base_url,
+            self.backend,
+            self.catalog,
+            self.neon_schema,
+            self.neon_dimensions,
+            str(self.dense_dir),
+            str(self.cache_dir),
+            self.limits,
+            self.claude_effort,
+            self.fallback_model,
+            hashlib.sha256(database.encode("utf-8")).hexdigest() if database else "",
+            self.api_key is not None,
+            self.anthropic_api_key is not None,
+        )
 
     @property
     def claude_offered(self) -> bool:
@@ -1219,6 +1283,12 @@ def _dense_outcome(
     )
 
 
+def _unavailable_note(kind: str) -> str:
+    """The warning of a response whose matches lack one retriever."""
+    other = "BM25 only" if kind == "dense" else "dense only"
+    return f"{kind} retrieval unavailable; matches use {other}"
+
+
 def _ms(seconds: float) -> int:
     return round(seconds * 1000)
 
@@ -1236,8 +1306,13 @@ async def run(
     admitted: Sequence[FallbackNote] = (),
     allowance_window: str = "hour",
     claude_blocked: str | None = None,
+    caches: Caches | None = None,
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
+
+    With ``caches`` (``ner_site.cache``) the mapping and the selection reuse what this
+    instance has already retrieved and picked, and the response says how often
+    (``cache``); the whole-response cache is the handler's (``ner_site.http``).
 
     The selection step runs when the request's selector is not ``retrieval``: Jev with
     ``decider``, any other selector with ``select_llm`` (``ner_site.http`` builds them
@@ -1340,6 +1415,7 @@ async def run(
         stats=stats,
         clean=lambda note: _clean(note, settings, extra_secrets),
         routes=settings.routes,
+        cache=None if caches is None else caches.retrieval,
     )
     mapped = time.monotonic()
 
@@ -1380,6 +1456,9 @@ async def run(
             llm=select_llm,
             own_key=own,
             deadline=max(MIN_SELECT_BUDGET_S, REQUEST_DEADLINE_S - (mapped - began)),
+            cache=None if caches is None else caches.picks,
+            payer=req.provider or providers.SITE,
+            clean=lambda note: _clean(note, settings, extra_secrets),
         )
         results = [
             r.model_copy(
@@ -1419,8 +1498,7 @@ async def run(
     for kind in ("bm25", "dense"):
         status = retrieval.get(kind)
         if routed and status is not None and status.status != "ok":
-            fallback = "BM25 only" if kind == "dense" else "dense only"
-            notes.append(f"{kind} retrieval unavailable; matches use {fallback}")
+            notes.append(_unavailable_note(kind))
     timing = {"extract": _ms(extracted - started), "map": _ms(mapped - extracted)}
     if picked is not None:
         timing["select"] = _ms(selected - mapped)
@@ -1452,7 +1530,45 @@ async def run(
                 )
             )
         ),
+        cache=None
+        if caches is None
+        else CacheInfo(
+            response="miss" if caches.responses.enabled else "off",
+            retrieval_hits=stats.cache_hits,
+            pick_hits=0 if picked is None else picked.cache_hits,
+        ),
     )
+
+
+def cacheable(data: Mapping[str, Any], *, offline: bool = False) -> bool:
+    """Whether a 200 response (as JSON data) may be kept in the response cache: only
+    when a fresh identical run would be allowed to return the same thing. So never
+    with a step-down or a notice, a warning, a pick that failed, a retriever that was
+    not ``ok``, or a routed entity that carries a note (a search that failed, timed
+    out or was cut off).
+
+    One exception, for the offline stand-in only: it never has dense retrieval (it
+    requests no embeddings, by design), says so in every response with one fixed
+    warning, and would say the same again. That status and that warning do not keep an
+    offline response out; anything else does there too."""
+    if data.get("ok") is not True or data.get("fallbacks") or data.get("notices"):
+        return False
+    allowed = {_unavailable_note("dense")} if offline else set()
+    if any(warning not in allowed for warning in data.get("warnings") or ()):
+        return False
+    for kind, status in (data.get("retrieval") or {}).items():
+        if status.get("status") != "ok" and not (offline and kind == "dense"):
+            return False
+    for entity in data.get("entities") or ():
+        pick = entity.get("pick")
+        if pick is not None and pick.get("status") == "failed":
+            return False
+        notes = entity.get("notes") or []
+        if entity.get("ontology") is not None and notes:
+            return False
+        if entity.get("ontology") is None and notes != [OTHER_NOTE]:
+            return False
+    return True
 
 
 __all__ = [
@@ -1460,6 +1576,7 @@ __all__ = [
     "SELECT",
     "ClaudeFactory",
     "DEFAULT_BASE_URL",
+    "cacheable",
     "DEFAULT_MODELS",
     "ENV_NAMES",
     "OFFLINE_MODEL",
