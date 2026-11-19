@@ -35,6 +35,13 @@
 // restored page with an older health answer than the tab's saved payer, what a result
 // claims about picks and search hits, and what is written back to the payer entry.
 //
+// The guide-* states cover the figure that #pipe expands into: collapsed on arrival;
+// played to the end for a mention the selector overruled and one that was the top hit;
+// a declined pick; a mention with no ontology; retrieval alone and Jev; one retriever;
+// the dashed boxes and a page with no result; a run started while it is open; a new
+// result resetting it; and reduced motion. They answer the API from the recorded example
+// (public/example.json) and from fixtures/guide-run.json, a recorded production run.
+//
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
 
@@ -54,6 +61,10 @@ const EXAMPLE_FULL_START = "Aspirin relieved her fever";
 const EXAMPLE_SAMPLE_START = "Clinic note";
 const EXAMPLE_FILE = JSON.parse(readFileSync(path.join(HERE, "..", "public", "example.json"), "utf8"));
 const EXAMPLE_NOTE = /^Recorded from a real run on 19 Nov 2026\.$/;
+// A real run recorded from production on 19 Nov 2026, with the text it was made from:
+// ten mentions, two the selector declined, one of a type with no ontology, and one
+// that only one of the two searches found candidates for. The guide-* states use it.
+const GUIDE_RUN = JSON.parse(readFileSync(path.join(FIXTURES, "guide-run.json"), "utf8"));
 const EXAMPLE_STALE = /^This result is for the example text\. Press "Map this text" to map yours\.$/;
 
 function loadPlaywright() {
@@ -562,6 +573,145 @@ class Session {
       },
       [selector, pseudo || null],
     );
+  }
+
+  // ---------- the guide (the figure of the pipeline in #pipe) ----------
+
+  // What the figure shows, read in one go.
+  guide() {
+    return this.page.evaluate(() => {
+      const pipe = document.getElementById("pipe");
+      const panel = document.getElementById("guide-panel");
+      const seen = (n) => Boolean(n) && n.getClientRects().length > 0;
+      const words = (n) => n.innerText.replace(/\s+/g, " ").trim();
+      const nodes = {};
+      for (const n of pipe.querySelectorAll(".guide-node")) {
+        nodes[n.dataset.k] = {
+          tag: n.tagName,
+          seen: seen(n),
+          name: words(n),
+          label: n.querySelector(".guide-nn").textContent,
+          sub: n.querySelector(".guide-ns").textContent,
+          skipped: n.classList.contains("is-skipped"),
+          pressed: n.getAttribute("aria-pressed"),
+          done: n.hasAttribute("data-status"),
+        };
+      }
+      const token = document.getElementById("guide-token");
+      return {
+        view: pipe.dataset.view,
+        play: pipe.dataset.play,
+        at: pipe.dataset.at || null,
+        height: Math.round(pipe.getBoundingClientRect().height),
+        toggle: document.getElementById("guide-toggle").textContent,
+        expanded: document.getElementById("guide-toggle").getAttribute("aria-expanded"),
+        nodes,
+        active: [...pipe.querySelectorAll(".guide-node.is-active")].map((n) => n.dataset.k),
+        facesHidden: [...pipe.querySelectorAll(".guide-face")].every((f) => f.getAttribute("aria-hidden") === "true"),
+        chipsSeen: seen(document.getElementById("guide-chips")),
+        chips: [...pipe.querySelectorAll(".guide-men")].map((c) => ({ text: c.firstChild.textContent, name: words(c), tag: c.tagName, current: c.classList.contains("is-current") && c.getAttribute("aria-pressed") === "true" })),
+        playSeen: seen(document.getElementById("guide-play")),
+        playDisabled: document.getElementById("guide-play").disabled,
+        playLabel: document.getElementById("guide-play-label").textContent,
+        hint: document.getElementById("guide-hint").textContent,
+        panelSeen: seen(panel),
+        panel: seen(panel) ? words(panel) : "",
+        live: panel.getAttribute("aria-live"),
+        lanes: [...panel.querySelectorAll(".guide-lanes h4")].map((n) => n.textContent),
+        laneItems: [...panel.querySelectorAll(".guide-lanes .guide-lane")].map((lane) => [...lane.querySelectorAll(".guide-c")].map((c) => c.textContent)),
+        ids: [...panel.querySelectorAll(".guide-id")].map((n) => n.textContent),
+        bubbles: panel.querySelectorAll(".guide-bubble").length,
+        // Parts of the panel that a play has still to reveal.
+        hiddenParts: panel.querySelectorAll(".guide-c:not(.is-on), .guide-w:not(.is-on)").length,
+        token: seen(token) && token.classList.contains("is-on"),
+      };
+    });
+  }
+
+  // Starts a record of what the figure does from now on: which boxes become active, in
+  // order; which candidates are considered, picked or revealed; how often the panel (a
+  // live region) is rewritten, and whether any of its text is retyped; what the
+  // travelling label reads, and whether it ever leaves the page or widens it.
+  guideWatch() {
+    return this.page.evaluate(() => {
+      if (window.__guide) window.__guide.stop();
+      const pipe = document.getElementById("pipe");
+      const panel = document.getElementById("guide-panel");
+      const token = document.getElementById("guide-token");
+      const log = { active: [], chips: [], writes: 0, retyped: 0, live: [], tokens: [], overflow: 0, tokenOut: 0 };
+      const had = (r, cls) => (r.oldValue || "").split(/\s+/).includes(cls);
+      const observer = new MutationObserver((records) => {
+        let wrote = false;
+        for (const r of records) {
+          const t = r.target;
+          if (r.type === "characterData" && panel.contains(t)) log.retyped += 1;
+          else if (r.type === "childList" && panel.contains(t)) wrote = true;
+          else if (r.type === "childList" && t === token && token.textContent && log.tokens[log.tokens.length - 1] !== token.textContent) log.tokens.push(token.textContent);
+          else if (r.type === "attributes" && t.classList.contains("guide-node")) {
+            // Several records of one step all see the class as it is now: said once.
+            if (t.classList.contains("is-active") && !had(r, "is-active") && log.active[log.active.length - 1] !== t.dataset.k) log.active.push(t.dataset.k);
+          } else if (r.type === "attributes" && t.classList.contains("guide-c") && panel.contains(t)) {
+            const text = t.firstChild ? t.firstChild.textContent : "";
+            for (const [cls, name] of [["is-consider", "consider"], ["is-picked", "picked"], ["is-on", "on"]]) {
+              if (t.classList.contains(cls) && !had(r, cls) && log.chips[log.chips.length - 1] !== `${name}:${text}`) log.chips.push(`${name}:${text}`);
+            }
+          }
+        }
+        if (wrote) {
+          log.writes += 1;
+          log.live.push(panel.getAttribute("aria-live"));
+        }
+      });
+      observer.observe(pipe, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["class"], attributeOldValue: true });
+      const timer = setInterval(() => {
+        if (document.documentElement.scrollWidth > document.documentElement.clientWidth) log.overflow += 1;
+        if (!token.classList.contains("is-on")) return;
+        const r = token.getBoundingClientRect();
+        const frame = pipe.getBoundingClientRect();
+        // The label eases a little past its place; it may not leave the figure by more.
+        if (r.left < frame.left - 16 || r.right > Math.min(frame.right + 16, window.innerWidth) || r.top < frame.top - 16 || r.bottom > frame.bottom + 16) log.tokenOut += 1;
+      }, 50);
+      log.stop = () => {
+        observer.disconnect();
+        clearInterval(timer);
+      };
+      window.__guide = log;
+    });
+  }
+
+  guideLog() {
+    return this.page.evaluate(() => {
+      const { stop, ...log } = window.__guide;
+      stop();
+      return log;
+    });
+  }
+
+  // A play has run to its end.
+  async guidePlayed(what) {
+    await this.page.waitForSelector('#pipe[data-play="done"]', { timeout: 45000 }).catch(() => {
+      this.failures.push(`the play of ${what} never ended`);
+    });
+  }
+
+  // Chooses a mention to follow by its chip, which plays it.
+  async follow(mention) {
+    const chips = await this.page.locator("#guide-chips .guide-men").all();
+    for (const chip of chips) {
+      if ((await chip.evaluate((c) => c.firstChild.textContent)) === mention) return chip.click();
+    }
+    this.failures.push(`no chip for ${mention}`);
+    return null;
+  }
+
+  // Runs the recorded production text against the recorded production answer.
+  async runGuide() {
+    this.health = productionHealth();
+    this.ner = { body: GUIDE_RUN.response };
+    await this.open();
+    await this.page.fill("#text", GUIDE_RUN.text);
+    await this.run();
+    return this.expectResults();
   }
 
   async chooseOwnKey(providerId) {
@@ -2260,6 +2410,426 @@ const STATES = {
     await s.page.click("#payer-site");
     await s.expectHidden("#payer", "the payer hold after choosing the site");
     s.check((await entry()) === null, "choosing the site left a payer entry");
+  },
+
+  // ---------- the guide: the figure of the pipeline ----------
+
+  // On arrival with the recorded example: one compact row, nothing playing, nothing
+  // moved, and the example result no lower on a phone than the row allows.
+  async "guide-arrival"(s) {
+    s.health = productionHealth();
+    await s.open();
+    await s.expectExample("on arrival");
+    await s.page.waitForTimeout(1200); // anything that played by itself would have started
+    const g = await s.guide();
+    s.check(g.view === "collapsed" && g.toggle === "How it works" && g.expanded === "false", `on arrival the figure is ${g.view}, its button ${JSON.stringify(g.toggle)} (${g.expanded})`);
+    s.check(g.play === "idle" && g.active.length === 0 && !g.token, `something plays on arrival: ${g.play}, ${g.active.join(",")}`);
+    for (const k of ["reader", "retriever", "selector"]) s.check(g.nodes[k].seen && g.nodes[k].tag === "BUTTON" && g.nodes[k].pressed === null, `the ${k} agent is not a plain button in the collapsed row`);
+    s.check(/^Reader finds the mentions/.test(g.nodes.reader.name) && /^Retriever /.test(g.nodes.retriever.name) && /^Selector /.test(g.nodes.selector.name), `the agents are named ${JSON.stringify([g.nodes.reader.name, g.nodes.retriever.name, g.nodes.selector.name])}`);
+    s.check(!g.nodes.result.seen && !g.nodes.scorer.seen && !g.panelSeen && !g.playSeen, "collapsed, the row shows more than the three agents");
+    s.check(g.facesHidden, "a face is exposed to assistive technology");
+    s.check(g.height <= (s.phone ? 60 : 48), `the collapsed row is ${g.height}px tall`);
+    const seen = await s.shown();
+    s.check(seen.scrollY === 0 && seen.focus === "BODY", `the page moved on arrival: scrollY ${seen.scrollY}, focus ${seen.focus}`);
+    // 787px before the figure replaced the three steps (390x844).
+    if (s.width === 390) s.check(seen.top <= 787 + 40, `the example result starts at ${seen.top}px on a phone, more than 40px lower than before`);
+    await s.expectHidden("#progress", "the progress bar");
+    await s.expectHidden("#pipe .pipe-desc", "what each agent does, while idle");
+  },
+
+  // Expand, and follow three mentions of the example to the end: one where the selector
+  // overruled the search, one that was the top hit, and what the boxes say afterwards.
+  async "guide-play"(s) {
+    s.health = productionHealth();
+    await s.open();
+    await s.expectExample("before the figure is opened");
+    const entity = (text) => EXAMPLE_FILE.response.entities.find((e) => e.text === text);
+    await s.page.focus("#guide-toggle");
+    const before = await s.shown();
+    await s.page.keyboard.press("Enter");
+    await s.page.waitForTimeout(700);
+    let g = await s.guide();
+    s.check(g.view === "expanded" && g.toggle === "Close" && g.expanded === "true", `after "How it works" the figure is ${g.view}, its button ${JSON.stringify(g.toggle)}`);
+    s.check(g.play === "idle" && g.active.length === 0, "opening the figure started a play");
+    const opened = await s.shown();
+    s.check(opened.scrollY === before.scrollY && opened.focus === "guide-toggle", `opening the figure moved the page: scrollY ${opened.scrollY}, focus ${opened.focus}`);
+    s.check(g.chips.length === 7 && g.chips.filter((c) => c.current).map((c) => c.text).join() === "metformin", `the mentions to follow are ${JSON.stringify(g.chips)}`);
+    s.check(g.chips.every((c) => c.tag === "BUTTON" && /\((chemical|disease|food)\)$/.test(c.name)), "a mention chip is not a button named with its type");
+    // At rest: the finished figure for the mention where the selector overruled the search.
+    s.check(g.nodes.result.label === "CHEBI:6801" && /^Result/.test(g.panel), `at rest the figure shows ${g.nodes.result.label}: ${JSON.stringify(g.panel.slice(0, 60))}`);
+    s.check(g.hint === "Following “metformin”. Tap a box to see what it does.", `the hint says ${JSON.stringify(g.hint)}`);
+    for (const k of Object.keys(g.nodes)) s.check(g.nodes[k].seen && g.nodes[k].tag === "BUTTON" && /\S/.test(g.nodes[k].name), `the ${k} box is not a visible, named button`);
+    s.check(g.live === "off" || g.live === "polite", `the panel's aria-live is ${g.live}`);
+    await s.expectText(".guide-rowlabel", /^The xwalk library continues the loop \(not run by this demo\)$/, "the label of the dashed rows");
+    await s.expectText(".guide-loop", /^The full loop is described in the FoodOntoRAG preprint\.$/, "the line under the dashed rows");
+    const link = await s.page.evaluate(() => {
+      const a = document.querySelector(".guide-loop a");
+      return [a.href, a.target, a.rel];
+    });
+    s.check(link.join() === "https://arxiv.org/abs/2603.09758,_blank,noopener", `the preprint link is ${link.join(" ")}`);
+
+    // Overruled: the one above is considered first, then the choice; the reason is
+    // revealed, not retyped, so the panel is rewritten once per box and no more.
+    await s.guideWatch();
+    await s.page.click("#guide-play");
+    await s.guidePlayed("metformin");
+    let log = await s.guideLog();
+    g = await s.guide();
+    s.check(log.active.join() === "reader,retriever,selector,result", `the mention visited ${log.active.join(",")}`);
+    const first = entity("metformin").matches[0].label;
+    s.check(log.chips.indexOf(`consider:1. ${first}`) >= 0 && log.chips.indexOf(`consider:1. ${first}`) < log.chips.indexOf("picked:2. metformin"), `the selector did not consider the top hit before its choice: ${log.chips.join(" | ")}`);
+    s.check(log.writes <= 4 && log.retyped === 0, `the panel was rewritten ${log.writes} times and retyped ${log.retyped} times during one play`);
+    s.check(log.live.every((v) => v === "polite"), `the panel was ${log.live.join(",")} while it played`);
+    s.check(log.overflow === 0 && log.tokenOut === 0, `the travelling label widened the page (${log.overflow}) or left the figure (${log.tokenOut})`);
+    s.check(log.tokens.includes("metformin") && log.tokens.includes("CHEBI:6801"), `the travelling label read ${log.tokens.join(", ")}`);
+    s.check(g.play === "done" && g.playLabel === "Play again" && g.active.length === 0 && !g.token, `after the play: ${g.play}, ${JSON.stringify(g.playLabel)}, label shown ${g.token}`);
+    s.check(g.nodes.result.label === "CHEBI:6801" && g.at === "result", `the journey ended at ${g.at} with ${g.nodes.result.label}`);
+    s.check(/metformin → CHEBI:6801 metformin/.test(g.panel) && /Confidence 0\.93: the model's own, not a measured accuracy\. Not the top search hit: the selector overruled the ranking\./.test(g.panel), `the result panel says ${JSON.stringify(g.panel)}`);
+    s.check(g.panel.includes(entity("metformin").pick.explanation), "the result panel does not carry the model's reason as the response gives it");
+
+    // The boxes afterwards: the finished state of each.
+    await s.page.click('.guide-node[data-k="reader"]');
+    g = await s.guide();
+    s.check(/^Reader · Claude Opus 5\.5 reads the whole text and marks the mentions/.test(g.panel) && /…of hummus\. She takes metformin for type 2 diabetes,…/.test(g.panel) && /“metformin” is a chemical, so it goes to ChEBI/.test(g.panel), `the Reader panel says ${JSON.stringify(g.panel)}`);
+    s.check(g.nodes.reader.pressed === "true" && g.nodes.result.pressed === "false" && g.live === "polite", "the Reader box is not marked as the one on show");
+    await s.page.click('.guide-node[data-k="retriever"]');
+    g = await s.guide();
+    s.check(/^Retriever · xwalk searches ChEBI two ways and merges the rankings/.test(g.panel), `the Retriever panel says ${JSON.stringify(g.panel.slice(0, 90))}`);
+    s.check(g.lanes.join(" | ") === "Keyword search | Meaning search | Merged, 21 candidates", `the lanes are ${g.lanes.join(" | ")}`);
+    const ranks = (key) => [...entity("metformin").matches, ...entity("metformin").more].filter((m) => key in m.retrievers).sort((a, b) => a.retrievers[key] - b.retrievers[key]).slice(0, 4).map((m) => `${m.retrievers[key]}. ${m.label}`);
+    s.check(g.laneItems[0].join("|") === ranks("bm25").join("|") && g.laneItems[1].join("|") === ranks("dense-qwen3").join("|"), `the lanes do not hold each search's own top four: ${JSON.stringify(g.laneItems)}`);
+    s.check(g.laneItems[2].join("|") === entity("metformin").matches.slice(0, 4).map((m, i) => `${i + 1}. ${m.label}`).join("|"), `the merged lane is ${JSON.stringify(g.laneItems[2])}`);
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/^Selector · Claude Opus 5\.5 reads the shortlist against the sentence/.test(g.panel) && /2\. metformin \(chosen\)/.test(g.panel) && /These are 4 of the 21 candidates it was given\./.test(g.panel), `the Selector panel says ${JSON.stringify(g.panel)}`);
+    if (s.shot) await s.shot("selector");
+
+    // The top hit: settled at once, nothing above it to consider.
+    await s.guideWatch();
+    await s.follow("Aspirin");
+    await s.guidePlayed("Aspirin");
+    log = await s.guideLog();
+    g = await s.guide();
+    s.check(!log.chips.some((c) => c.startsWith("consider:")) && log.chips.includes(`picked:1. ${entity("Aspirin").matches[0].label}`), `the top hit was not settled at once: ${log.chips.join(" | ")}`);
+    s.check(g.nodes.result.label === "CHEBI:15365" && /Also the top search hit\./.test(g.panel) && !/overruled/.test(g.panel), `the top-hit result says ${JSON.stringify(g.panel)}`);
+    s.check(g.chips.filter((c) => c.current).map((c) => c.text).join() === "Aspirin" && g.hint.startsWith("Following “Aspirin”."), "the figure does not say that it follows Aspirin");
+    s.check(log.overflow === 0 && log.tokenOut === 0, `the travelling label widened the page (${log.overflow}) or left the figure (${log.tokenOut})`);
+
+    // A disease goes to the disease ontology, by the name health gives it.
+    await s.follow("fever");
+    await s.page.click('.guide-node[data-k="retriever"]');
+    g = await s.guide();
+    s.check(g.play !== "playing" && g.active.length === 0, "a tap on a box did not end the play");
+    s.check(/^Retriever · xwalk searches CTD diseases \/ MeSH two ways/.test(g.panel), `the Retriever panel for a disease says ${JSON.stringify(g.panel.slice(0, 80))}`);
+
+    // Keyboard focus is visible on a box, a chip and Play.
+    await s.page.keyboard.press("Tab");
+    for (const sel of ['.guide-node[data-k="scorer"]', "#guide-chips .guide-men", "#guide-play"]) {
+      await s.page.focus(sel);
+      const ring = await s.page.evaluate((q) => {
+        const style = getComputedStyle(document.querySelector(q));
+        return `${style.outlineStyle} ${style.outlineWidth}`;
+      }, sel);
+      s.check(ring === "solid 3px", `${sel} shows ${ring} as its focus ring`);
+    }
+    if (s.shot) await s.shot("finished");
+    await s.page.click("#guide-toggle");
+    g = await s.guide();
+    s.check(g.view === "collapsed" && g.toggle === "How it works" && !g.panelSeen, "Close did not collapse the figure");
+    const end = await s.shown();
+    s.check(end.stored.length === 0 && s.posts.length === 0, `the figure stored something or cost a request: ${end.stored.join(",")}, ${s.posts.length} posts`);
+  },
+
+  // A declined pick: the selector considers the shortlist and settles on none. And a
+  // mention that only one of the two searches found candidates for has one lane.
+  async "guide-declined"(s) {
+    const entity = (text) => GUIDE_RUN.response.entities.find((e) => e.text === text);
+    await s.runGuide();
+    await s.page.click("#guide-toggle");
+    await s.guideWatch();
+    await s.follow("oily fish");
+    await s.page.waitForSelector(".guide-node.is-active[data-k='selector']", { timeout: 15000 }).catch(() => s.failures.push("the declined mention never reached the Selector"));
+    if (s.shot) await s.shot("considering");
+    await s.guidePlayed("oily fish");
+    const log = await s.guideLog();
+    let g = await s.guide();
+    const short = entity("oily fish").matches.slice(0, 4).map((m, i) => `${i + 1}. ${m.label}`);
+    s.check(short.every((c) => log.chips.includes(`consider:${c}`)) && !log.chips.some((c) => c.startsWith("picked:")), `the selector did not consider the four and pick none: ${log.chips.join(" | ")}`);
+    s.check(log.chips.includes("on:None of these fits"), "the verdict 'None of these fits' was never shown");
+    s.check(log.active.join() === "reader,retriever,selector,result", `the declined mention visited ${log.active.join(",")}`);
+    s.check(g.nodes.result.label === "no term fits" && g.at === "result", `the journey ended at ${g.at} with ${JSON.stringify(g.nodes.result.label)}`);
+    s.check(/oily fish → no term fits/.test(g.panel) && /Claude Opus 5\.5 looked at 30 candidates and declined to pick one\./.test(g.panel) && g.panel.includes(entity("oily fish").pick.explanation), `the result panel says ${JSON.stringify(g.panel)}`);
+    s.check(g.ids.length === 0 && !/Confidence/.test(g.panel), `a declined pick shows an ID or a confidence: ${g.ids.join(",")}`);
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/None of these fits/.test(g.panel) && !/\(chosen\)/.test(g.panel) && g.panel.includes(entity("oily fish").pick.explanation), `the Selector panel says ${JSON.stringify(g.panel)}`);
+
+    // HbA1c: keyword search ranked none of its candidates. One lane, labelled.
+    await s.follow("HbA1c");
+    await s.page.click('.guide-node[data-k="retriever"]');
+    g = await s.guide();
+    s.check(g.lanes.join(" | ") === "Meaning search, 20 candidates", `the lanes for a mention one search found are ${g.lanes.join(" | ")}`);
+    s.check(/only meaning search ranked candidates for this mention/.test(g.panel) && !/two ways|Merged/.test(g.panel), `the Retriever panel says ${JSON.stringify(g.panel.slice(0, 120))}`);
+    s.check(g.nodes.retriever.sub === "meaning search only", `the Retriever box says ${JSON.stringify(g.nodes.retriever.sub)}`);
+  },
+
+  // A mention of a type with no ontology: the journey ends after the Reader.
+  async "guide-unmapped"(s) {
+    await s.runGuide();
+    await s.page.click("#guide-toggle");
+    await s.guideWatch();
+    await s.follow("BRCA1");
+    await s.guidePlayed("BRCA1");
+    const log = await s.guideLog();
+    let g = await s.guide();
+    s.check(log.active.join() === "reader", `a mention with no ontology visited ${log.active.join(",")}`);
+    s.check(g.at === "reader" && /Recognised, but this demo has no ontology for it\./.test(g.panel) && /“BRCA1” is marked as another kind of mention/.test(g.panel), `the journey ended at ${g.at}: ${JSON.stringify(g.panel)}`);
+    s.check(!/goes to/.test(g.panel), "the Reader sends a mention with no ontology to one");
+    s.check(["retriever", "selector", "result"].every((k) => g.nodes[k].skipped) && !g.nodes.reader.skipped, "the boxes the mention did not reach are not marked");
+    s.check(g.nodes.result.label === "not looked up" && g.ids.length === 0, `the result box says ${JSON.stringify(g.nodes.result.label)}`);
+    if (s.shot) await s.shot("ended");
+    for (const k of ["retriever", "selector", "result"]) {
+      await s.page.click(`.guide-node[data-k="${k}"]`);
+      g = await s.guide();
+      s.check(/“BRCA1” did not get this far: this demo has no ontology for its type, so it was not looked up\./.test(g.panel), `the ${k} panel for a mention that never reached it says ${JSON.stringify(g.panel)}`);
+      s.check(g.ids.length === 0 && !/Claude|candidates/.test(g.panel), `the ${k} panel invents a step for a mention that never reached it`);
+    }
+  },
+
+  // Retrieval alone ranked, and Jev: the Selector box says what actually chose, and no
+  // reason is shown where the response has none.
+  async "guide-retrieval-only"(s) {
+    await s.runShaped(shapedResponse(SHAPED_TEXT, [["Aspirin", "chemical", null, null], ["BRCA1", "other", null, null]], { selector: "retrieval", requested_selector: "retrieval", model: "claude-sonnet-5-5" }));
+    await s.page.click("#guide-toggle");
+    await s.guideWatch();
+    await s.page.click("#guide-play");
+    await s.guidePlayed("Aspirin");
+    const log = await s.guideLog();
+    let g = await s.guide();
+    s.check(!log.chips.some((c) => c.startsWith("consider:")) && log.chips.includes("picked:1. Aspirin (salt)"), `with no model the top result was not simply taken: ${log.chips.join(" | ")}`);
+    s.check(g.nodes.selector.sub === "top search result, no model" && g.nodes.result.sub === "the top search result", `the boxes say ${JSON.stringify([g.nodes.selector.sub, g.nodes.result.sub])}`);
+    s.check(/Aspirin → CHEBI:100 Aspirin \(salt\)/.test(g.panel) && /The top search result\. No model chose, so there is no reason and no confidence\./.test(g.panel), `the result panel says ${JSON.stringify(g.panel)}`);
+    s.check(g.bubbles === 0 && !/Confidence \d/.test(g.panel), "a reason or a confidence is shown where no model chose");
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/^Selector · no model chose here: the top search result is taken as it is/.test(g.panel) && g.bubbles === 0 && !/Claude|Opus|Sonnet|reads the shortlist/.test(g.panel), `the Selector panel says ${JSON.stringify(g.panel)}`);
+    // Who read is named from the response, not from the page's defaults.
+    await s.page.click('.guide-node[data-k="reader"]');
+    g = await s.guide();
+    s.check(/^Reader · Claude Sonnet 5\.5 reads the whole text/.test(g.panel), `the Reader panel says ${JSON.stringify(g.panel.slice(0, 80))}`);
+
+    // Jev chose, and gave no reason for one of them.
+    const jev = shapedResponse(SHAPED_TEXT, [["Aspirin", "chemical", "match", 1], ["metformin", "chemical", "no_match", null]]);
+    for (const e of jev.entities) e.pick = { ...e.pick, selector: "jev", explanation: e.text === "Aspirin" ? "" : "same 0.10" };
+    s.ner = { body: jev };
+    await s.run();
+    await s.settled();
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/^Selector · Jev, a small trained ranking model, picks from the shortlist/.test(g.panel) && /2\. aspirin \(chosen\)/.test(g.panel), `the Selector panel for Jev says ${JSON.stringify(g.panel)}`);
+    s.check(g.bubbles === 0 && g.nodes.selector.sub === "Jev picks one, or none" && g.nodes.result.sub === "chosen by Jev", `Jev's pick without a reason shows one: ${g.bubbles} bubbles, ${JSON.stringify([g.nodes.selector.sub, g.nodes.result.sub])}`);
+    s.check(!/Claude|Opus|Sonnet/.test(g.panel), "a pick by Jev is credited to a language model");
+    await s.follow("metformin");
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/None of these fits/.test(g.panel) && /same 0\.10/.test(g.panel) && g.bubbles === 1, `Jev's declined pick says ${JSON.stringify(g.panel)}`);
+  },
+
+  // Only one retriever available: one lane, labelled, with the server's note in plain
+  // words. And a mention the search found nothing for stops at the Retriever.
+  async "guide-one-retriever"(s) {
+    s.health = fixture("health-degraded");
+    s.ner = { body: fixture("ner-degraded") };
+    await s.open();
+    await s.runExample();
+    await s.expectResults();
+    await s.page.click('.guide-node[data-k="retriever"]');
+    let g = await s.guide();
+    s.check(g.view === "expanded", "a tap on an agent did not open the figure");
+    s.check(g.lanes.length === 1 && /^Keyword search, 1 candidate$/.test(g.lanes[0]), `with one retriever the lanes are ${g.lanes.join(" | ")}`);
+    s.check(/only keyword search ranked candidates for this mention/.test(g.panel) && /Found by keyword search only; matching by meaning was unavailable\./.test(g.panel) && !/Meaning search|Merged|two ways/.test(g.panel), `the Retriever panel says ${JSON.stringify(g.panel)}`);
+    s.check(g.nodes.retriever.sub === "keyword search only", `the Retriever box says ${JSON.stringify(g.nodes.retriever.sub)}`);
+    await s.page.click('.guide-node[data-k="reader"]');
+    g = await s.guide();
+    s.check(/^Reader · the offline stand-in reads the whole text/.test(g.panel) && !/Claude|Opus/.test(g.panel), `the Reader panel offline says ${JSON.stringify(g.panel.slice(0, 80))}`);
+    if (s.shot) await s.shot("one-lane");
+
+    await s.guideWatch();
+    await s.follow("aspirin");
+    await s.guidePlayed("aspirin");
+    const log = await s.guideLog();
+    g = await s.guide();
+    s.check(log.active.join() === "reader,retriever", `a mention the search found nothing for visited ${log.active.join(",")}`);
+    s.check(g.at === "retriever" && /found no term for this mention/.test(g.panel) && g.lanes.length === 0, `its journey ended at ${g.at}: ${JSON.stringify(g.panel)}`);
+    s.check(g.nodes.result.label === "no term found" && g.nodes.selector.skipped && g.nodes.result.skipped, `the result box says ${JSON.stringify(g.nodes.result.label)}`);
+  },
+
+  // No result and no example (a sample deployment before a run): Play is unavailable
+  // and every box still explains itself. The dashed boxes carry their tag.
+  async "guide-dashed"(s) {
+    s.health = fixture("health");
+    await s.open();
+    await s.expectNoExample("a sample deployment");
+    await s.page.click('.guide-node[data-k="reader"]');
+    let g = await s.guide();
+    s.check(g.view === "expanded" && g.playDisabled && g.chips.length === 0 && !g.chipsSeen, `with no result: ${g.view}, Play disabled ${g.playDisabled}, ${g.chips.length} chips`);
+    s.check(g.hint === "Map a text to follow one of its mentions here. Tap a box to see what it does.", `the hint says ${JSON.stringify(g.hint)}`);
+    const find = await s.page.evaluate(() => document.getElementById("pipe-find").textContent);
+    s.check(g.panel.startsWith("Reader") && g.panel.includes(find) && /There is no result on the page yet/.test(g.panel) && !/Claude|Opus|Sonnet/.test(g.panel), `the Reader panel with no result says ${JSON.stringify(g.panel)}`);
+    s.check(g.nodes.result.label === "Ontology ID" && !Object.values(g.nodes).some((n) => n.skipped), "with no result a box is marked as not reached");
+    for (const [k, name] of [["scorer", "Scorer"], ["verifier", "Verifier"], ["policy", "Policy"], ["rewriter", "Rewriter"], ["ledger", "Ledger"]]) {
+      await s.page.click(`.guide-node[data-k="${k}"]`);
+      g = await s.guide();
+      s.check(g.panel.startsWith(name) && /In the xwalk library\. Not run by this demo\.$/.test(g.panel) && g.panel.length > name.length + 80, `the ${name} panel says ${JSON.stringify(g.panel)}`);
+      s.check(g.nodes[k].pressed === "true" && g.at === k && g.play === "idle" && g.active.length === 0, `a tap on ${name} did more than show its panel`);
+      if (k === "policy") {
+        s.check(/matched\s*needs review\s*unmatched\s*failed/.test(g.panel), `the Policy panel lists ${JSON.stringify(g.panel)}`);
+        if (s.shot) await s.shot("policy");
+      }
+    }
+    for (const k of ["retriever", "selector", "result"]) {
+      await s.page.click(`.guide-node[data-k="${k}"]`);
+      g = await s.guide();
+      s.check(g.panel.length > 60 && !/Claude|Opus|Sonnet|undefined|null/.test(g.panel), `the ${k} panel with no result says ${JSON.stringify(g.panel)}`);
+    }
+    await s.page.click("#guide-play", { force: true }).catch(() => {});
+    g = await s.guide();
+    s.check(g.play === "idle" && g.active.length === 0, "Play did something with no result on the page");
+  },
+
+  // A run started while the figure is open: the bar and the clock show, the three
+  // agents are awake, the figure can still be played, and none of it touches the run.
+  async "guide-running"(s) {
+    s.health = productionHealth();
+    const gate = s.gate();
+    s.ner = { gate: gate.promise, body: GUIDE_RUN.response };
+    await s.open();
+    await s.expectExample("before the run");
+    await s.page.click("#guide-toggle");
+    await s.page.fill("#text", GUIDE_RUN.text);
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar with the figure open");
+    await s.page.waitForTimeout(800); // the page scrolls the bar into view smoothly
+    const during = await s.page.evaluate(() => {
+      const r = document.getElementById("progress").getBoundingClientRect();
+      const name = (q) => getComputedStyle(document.querySelector(q)).animationName;
+      return {
+        seen: r.top >= 0 && r.bottom <= window.innerHeight,
+        awake: ["reader", "retriever", "selector"].map((k) => name(`.guide-node[data-k="${k}"] .guide-face`)),
+        asleep: name('.guide-node[data-k="scorer"] .guide-face'),
+        time: document.getElementById("progress-time").textContent,
+      };
+    });
+    s.check(during.seen, "the progress bar is off screen during a run with the figure open");
+    s.check(during.awake.every((a) => a === "guide-bob") && during.asleep === "none", `during a run the faces are ${during.awake.join(",")}; a library box is ${during.asleep}`);
+    s.check(/^\d+ s$/.test(during.time), `the clock says ${JSON.stringify(during.time)}`);
+    let g = await s.guide();
+    s.check(g.view === "expanded" && g.chips.length === 7 && !g.playDisabled, "the figure of the example is not there during the run");
+    s.check(!Object.values(g.nodes).some((n) => n.done), "a box is ticked during a run");
+    // The example can be played while waiting, and boxes tapped: the run goes on.
+    await s.page.click("#guide-play");
+    await s.page.waitForSelector(".guide-node.is-active", { timeout: 5000 }).catch(() => s.failures.push("Play did nothing during a run"));
+    await s.page.click('.guide-node[data-k="policy"]');
+    await s.follow("hummus");
+    if (s.shot) await s.shot("running");
+    s.check((await s.page.getAttribute("#run", "aria-busy")) === "true" && s.posts.length === 1, "the figure interrupted the run");
+    await s.expectText("#run .run-label", /^Mapping…$/, "the Run label while the figure plays");
+    gate.release();
+    await s.expectResults();
+    await s.expectHidden("#progress", "the progress bar after the run");
+    await s.page.waitForTimeout(1500); // a play left running would move on in this time
+    g = await s.guide();
+    s.check(g.view === "expanded" && g.play === "idle" && g.active.length === 0 && !g.token, `after the run the figure is ${g.view}, ${g.play}, active ${g.active.join(",")}`);
+    s.check(g.chips.length === 10 && g.chips.filter((c) => c.current).map((c) => c.text).join() === "Metformin" && g.playLabel === "Play", `the figure does not follow the new result: ${JSON.stringify(g.chips.map((c) => c.text))}`);
+    s.check(s.posts.length === 1, `${s.posts.length} runs were sent`);
+  },
+
+  // A new result resets the figure to that result, whatever it was doing; and a pick
+  // that failed ends at the Selector with no ID.
+  async "guide-new-result"(s) {
+    s.health = productionHealth();
+    const gate = s.gate();
+    const sonnet = shaped({ model: "claude-sonnet-5-5" });
+    for (const e of sonnet.entities) if (e.pick) e.pick.selector = "claude-sonnet-5-5";
+    s.ner = { gate: gate.promise, body: sonnet };
+    await s.open();
+    await s.expectExample("before the run");
+    await s.page.click("#guide-toggle");
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.follow("green tea");
+    await s.page.waitForSelector(".guide-node.is-active[data-k='retriever']", { timeout: 10000 }).catch(() => s.failures.push("the play never reached the Retriever"));
+    gate.release();
+    await s.expectResults();
+    let g = await s.guide();
+    s.check(g.play === "idle" && g.active.length === 0 && !g.token, `the play of the old result went on: ${g.play}, ${g.active.join(",")}`);
+    s.check(g.chips.map((c) => c.text).join() === "Aspirin,metformin,oily fish,BRCA1,warfarin,garlic,cumin", `the chips are ${g.chips.map((c) => c.text).join()}`);
+    s.check(g.chips.filter((c) => c.current).map((c) => c.text).join() === "metformin" && g.nodes.result.label === "CHEBI:201" && /metformin → CHEBI:201/.test(g.panel), `the figure rests on ${g.nodes.result.label}: ${JSON.stringify(g.panel.slice(0, 80))}`);
+    s.check(g.live === "off", "the page announced the figure of a new result by itself");
+    s.check(!/green tea|FOODON:00005515/.test(g.panel + g.hint), "the figure still shows the old result");
+    await s.page.waitForTimeout(2500); // timers of the old play would fire in this time
+    const later = await s.guide();
+    s.check(later.panel === g.panel && later.active.length === 0 && later.play === "idle", "a timer of the old play changed the figure of the new result");
+    const focus = await s.shown();
+    s.check(focus.focus === "results-heading", `after the run the focus is on ${focus.focus}`);
+    // Who read and who picked are the ones this response names.
+    await s.page.click('.guide-node[data-k="reader"]');
+    g = await s.guide();
+    s.check(/^Reader · Claude Sonnet 5\.5 reads/.test(g.panel) && g.live === "polite", `the Reader panel says ${JSON.stringify(g.panel.slice(0, 60))}`);
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(/^Selector · Claude Sonnet 5\.5 reads the shortlist/.test(g.panel) && !/Opus/.test(g.panel), `the Selector panel says ${JSON.stringify(g.panel.slice(0, 80))}`);
+
+    // A pick that failed: the selector could not answer; no ID, and no raw reason.
+    await s.guideWatch();
+    await s.follow("warfarin");
+    await s.guidePlayed("warfarin");
+    const log = await s.guideLog();
+    g = await s.guide();
+    s.check(log.active.join() === "reader,retriever,selector", `a failed pick visited ${log.active.join(",")}`);
+    s.check(g.at === "selector" && /Claude Sonnet 5\.5 could not answer for this mention, so no term was chosen/.test(g.panel), `the journey of a failed pick ended at ${g.at}: ${JSON.stringify(g.panel)}`);
+    s.check(g.ids.length === 0 && g.bubbles === 0 && !/deadline|\(chosen\)/.test(g.panel) && g.nodes.result.label === "could not be matched" && g.nodes.result.skipped, `a failed pick shows an ID, a reason or a choice: ${JSON.stringify(g.nodes.result.label)}`);
+    // "Needs a check" is said where the selector marked it.
+    await s.follow("garlic");
+    await s.page.click('.guide-node[data-k="result"]');
+    g = await s.guide();
+    s.check(/garlic → FOODON:600/.test(g.panel) && /Claude Sonnet 5\.5 marked it as needing a check\./.test(g.panel), `the result panel of a pick to check says ${JSON.stringify(g.panel)}`);
+  },
+
+  // Reduced motion: no travel, no bobbing; Play shows the finished state at once.
+  async "guide-reduced-motion"(s) {
+    await s.page.emulateMedia({ reducedMotion: "reduce" });
+    s.health = productionHealth();
+    const gate = s.gate();
+    s.ner = { gate: gate.promise, body: GUIDE_RUN.response };
+    await s.open();
+    await s.expectExample("with reduced motion");
+    await s.page.click("#guide-toggle");
+    await s.guideWatch();
+    await s.page.click("#guide-play");
+    await s.page.waitForTimeout(250);
+    let g = await s.guide();
+    let log = await s.guideLog();
+    s.check(g.play === "done" && g.playLabel === "Play again" && g.at === "result" && g.nodes.result.label === "CHEBI:6801", `with reduced motion Play shows ${g.play} at ${g.at}: ${g.nodes.result.label}`);
+    s.check(log.active.length === 0 && log.tokens.length === 0 && !g.token && log.writes === 1, `with reduced motion something travelled: ${log.active.join(",")} ${log.tokens.join(",")}, ${log.writes} writes`);
+    s.check(/metformin → CHEBI:6801 metformin/.test(g.panel) && g.hiddenParts === 0, "the finished state is not all on show");
+    await s.guideWatch();
+    await s.follow("green tea");
+    await s.page.waitForTimeout(250);
+    g = await s.guide();
+    log = await s.guideLog();
+    s.check(g.play === "done" && g.nodes.result.label === "FOODON:00005515" && log.active.length === 0, `a chip with reduced motion shows ${g.play}: ${g.nodes.result.label}`);
+    await s.page.click('.guide-node[data-k="selector"]');
+    g = await s.guide();
+    s.check(g.hiddenParts === 0 && /\(chosen\)/.test(g.panel), "a tapped box does not show its finished state");
+    // During a run nothing bobs either.
+    await s.page.fill("#text", GUIDE_RUN.text);
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar");
+    const still = await s.page.evaluate(() => ["reader", "retriever", "selector"].map((k) => getComputedStyle(document.querySelector(`.guide-node[data-k="${k}"] .guide-face`)).animationName));
+    s.check(still.every((a) => a === "none"), `with reduced motion the faces are ${still.join(",")} during a run`);
+    gate.release();
+    await s.expectResults();
   },
 };
 
