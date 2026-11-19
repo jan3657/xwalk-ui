@@ -71,7 +71,8 @@ async function main() {
 
     if (opts.expect === "results") {
       await Promise.race([
-        page.waitForSelector("#results:not([hidden]) .card", { timeout: 130000 }),
+        // The recorded example a full-catalog site shows on arrival has cards too.
+        page.waitForSelector('#results[data-kind="run"]:not([hidden]) .card', { timeout: 130000 }),
         page.waitForSelector("#error:not([hidden])", { timeout: 130000 }).then(async () => {
           throw new Error(`run failed: ${await page.textContent("#error-message")}`);
         }),

@@ -18,6 +18,11 @@
 // response built here in the shape production answers: a pick per entity, one where the
 // model overruled the search, one it declined, one that failed, one not looked up.
 //
+// The arrival states (example-*) cover the recorded example of public/example.json:
+// shown on a full-catalog deployment, removed on any other, never over typed text, and
+// correct whether /api/health answers before it, after it, with an error, or never.
+// closing-panel covers the panel after the cards.
+//
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
 
@@ -35,6 +40,9 @@ const OWN_KEY_ENTRY = "xwalk-ner-own-key";
 const PAYER_ENTRY = "xwalk-ner-payer";
 const EXAMPLE_FULL_START = "Aspirin relieved her fever";
 const EXAMPLE_SAMPLE_START = "Clinic note";
+const EXAMPLE_FILE = JSON.parse(readFileSync(path.join(HERE, "..", "public", "example.json"), "utf8"));
+const EXAMPLE_NOTE = /^Recorded from a real run on 19 Nov 2026\.$/;
+const EXAMPLE_STALE = /^This result is for the example text\. Press "Map this text" to map yours\.$/;
 
 function loadPlaywright() {
   const local = createRequire(import.meta.url);
@@ -174,7 +182,9 @@ class Session {
     this.posts = []; // every POST /api/ner the page sent: { body, authorization }
     this.strayAuthorization = []; // any other request that carried an Authorization header
     this.health = "pass";
+    this.healthGate = null; // a promise /api/health waits for before it answers
     this.ner = "pass";
+    this.example = "pass"; // example.json: "pass", "missing" (404), "garbage", or { gate }
     this.failedLoads = false; // a state that cuts the connection expects net::ERR_FAILED
   }
 
@@ -198,6 +208,7 @@ class Session {
       const status = /status of (\d{3})/.exec(text);
       if (status && where.includes("/api/") && this.expectedStatuses.has(Number(status[1]))) return;
       if (this.failedLoads && /net::ERR_FAILED/.test(text) && where.includes("/api/ner")) return;
+      if (this.example === "missing" && where.includes("/example.json")) return;
       this.failures.push(`console error: ${text} (${where})`);
     });
     page.on("request", (request) => {
@@ -215,7 +226,15 @@ class Session {
         this.strayAuthorization.push(`${request.method()} ${url.pathname}`);
       }
     });
+    await page.route("**/example.json", async (route) => {
+      const example = this.example;
+      if (example === "missing") return route.fulfill({ status: 404, contentType: "text/plain", body: "not found" });
+      if (example === "garbage") return route.fulfill({ status: 200, contentType: "application/json", body: "<html>not json" });
+      if (example && example.gate) await example.gate;
+      return route.continue();
+    });
     await page.route("**/api/health", async (route) => {
+      if (this.healthGate) await this.healthGate;
       if (this.health === "pass") return route.continue();
       if (this.health === "fail") return route.fulfill({ status: 500, contentType: "text/plain", body: "down" });
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(this.health) });
@@ -234,6 +253,70 @@ class Session {
 
   async open() {
     await this.page.goto(this.base, { waitUntil: "networkidle" });
+  }
+
+  // For a state that holds a request back: "networkidle" would wait for it.
+  async openHeld() {
+    await this.page.goto(this.base, { waitUntil: "load" });
+    await this.page.waitForTimeout(400);
+  }
+
+  // What the results section is showing, read in one go.
+  shown() {
+    return this.page.evaluate(() => {
+      const $ = (id) => document.getElementById(id);
+      const seen = (id) => !$(id).hidden && $(id).getClientRects().length > 0;
+      const results = $("results");
+      return {
+        visible: seen("results"),
+        kind: results.getAttribute("data-kind"),
+        heading: $("results-heading").textContent,
+        note: seen("example-note") ? $("example-note").textContent : null,
+        stale: seen("stale") ? $("stale").textContent : null,
+        status: seen("status") ? $("status").textContent : null,
+        details: $("run-details-summary").textContent,
+        cards: document.querySelectorAll("#cards .card").length,
+        legend: $("legend").textContent,
+        next: seen("next") ? $("next-body").textContent : null,
+        text: $("text").value,
+        counter: $("text-counter").textContent,
+        banner: seen("banner") ? $("banner").textContent : null,
+        announce: $("announce").textContent,
+        focus: document.activeElement ? document.activeElement.id || document.activeElement.tagName : null,
+        scrollY: Math.round(window.scrollY),
+        top: Math.round(results.getBoundingClientRect().top + window.scrollY),
+        screen: window.innerHeight,
+        stored: Object.keys(window.sessionStorage).concat(Object.keys(window.localStorage)),
+      };
+    });
+  }
+
+  // The recorded example as it must look on arrival: labelled, complete, and quiet.
+  async expectExample(what, { text = EXAMPLE_FILE.text, counts = true } = {}) {
+    await this.expectVisible('#results[data-kind="example"] .card', `the example result (${what})`);
+    const seen = await this.shown();
+    this.check(seen.heading === "Example result", `${what}: the heading is ${JSON.stringify(seen.heading)}`);
+    this.check(EXAMPLE_NOTE.test(seen.note || ""), `${what}: the label is ${JSON.stringify(seen.note)}`);
+    this.check(seen.status === null, `${what}: a timing sentence is shown for the example: ${JSON.stringify(seen.status)}`);
+    this.check(seen.details === "Details of the recorded run", `${what}: the details are titled ${JSON.stringify(seen.details)}`);
+    this.check(seen.cards === EXAMPLE_FILE.response.entities.length, `${what}: ${seen.cards} cards`);
+    this.check(seen.text === text, `${what}: the text box holds ${JSON.stringify(seen.text.slice(0, 40))}`);
+    this.check(seen.announce === "", `${what}: the example was announced: ${JSON.stringify(seen.announce)}`);
+    this.check(/ChEBI/.test(seen.legend) && /FoodOn/.test(seen.legend), `${what}: the legend has no ontology names: ${JSON.stringify(seen.legend)}`);
+    if (counts) this.check(/searched 261,018 ontology terms by keyword and by meaning, and the model chose among real candidates/.test(seen.next || ""), `${what}: the closing panel says ${JSON.stringify(seen.next)}`);
+    this.check(this.posts.length === 0, `${what}: the example cost a request`);
+    this.check(seen.stored.length === 0, `${what}: the page stored something: ${seen.stored.join(", ")}`);
+    return seen;
+  }
+
+  // No example on show: the page as it was before there was one.
+  async expectNoExample(what, { text = "" } = {}) {
+    await this.page.waitForTimeout(300);
+    const seen = await this.shown();
+    this.check(!seen.visible, `${what}: results are shown (${seen.heading})`);
+    this.check(seen.text === text, `${what}: the text box holds ${JSON.stringify(seen.text.slice(0, 40))}`);
+    this.check(seen.counter.startsWith(`${text.length} /`), `${what}: the counter says ${JSON.stringify(seen.counter)}`);
+    return seen;
   }
 
   visible(selector) {
@@ -287,7 +370,8 @@ class Session {
 
   async expectResults() {
     const outcome = await Promise.race([
-      this.page.waitForSelector("#results:not([hidden]) .card", { state: "visible", timeout: 130000 }).then(() => "results"),
+      // The recorded example has cards too: only a run's own result counts.
+      this.page.waitForSelector('#results[data-kind="run"]:not([hidden]) .card', { state: "visible", timeout: 130000 }).then(() => "results"),
       this.page.waitForSelector("#error:not([hidden])", { state: "visible", timeout: 130000 }).then(() => "error"),
     ]).catch(() => "nothing");
     if (outcome === "error") this.failures.push(`run failed: ${await this.text("#error-title")} ${await this.text("#error-message")}`);
@@ -486,6 +570,12 @@ const STATES = {
     await s.expectError("The free runs for your network this hour are used.", { look: "notice", ownKey: true, body: /^You can run again in 23 minutes\.$/ });
     await s.expectHidden("#results", "results");
     s.check((await s.page.inputValue("#text")).length > 0, "the text was cleared by the error");
+    // The limit is said once: while the notice is up, the line beside Run steps aside.
+    await s.expectHidden("#allowance", "the free-runs line while the notice says the same");
+    await s.expectHidden("#use-own-key", "the second 'Use my own key'");
+    s.check((await s.page.locator("button:visible", { hasText: "Use my own key" }).count()) === 1, "'Use my own key' is not offered exactly once");
+    await s.page.click("#error-dismiss");
+    await s.expectVisible("#allowance", "the free-runs line after Dismiss");
     await s.page.click("#use-own-key");
     s.check(await s.optionsOpen(), "'Use my own key' did not open Options");
     await s.expectVisible("#provider", "the payer select");
@@ -502,6 +592,7 @@ const STATES = {
     await s.expectVisible("#use-own-key", "'Use my own key'");
     await s.runExample();
     await s.expectError("The free runs for your network today are used.", { look: "notice", ownKey: true, body: /^They come back at (.+ \()?midnight UTC\)?\.$/ });
+    await s.expectHidden("#allowance", "the free-runs line while the notice says the same");
     await s.page.click("#error-own-key");
     s.check(await s.optionsOpen(), "'Use my own key' in the error box did not open Options");
     await s.expectHidden("#error", "the error box after 'Use my own key'");
@@ -812,7 +903,7 @@ const STATES = {
     // declined, not looked up, failed, to check
     has(fish, /^Food · FoodOn oily fish → no term fits Why, and 7 candidates$/, "the declined card");
     s.check(!fish.open, "more than one card opened itself");
-    has(brca, /^Other BRCA1 → not looked up Recognised as an entity, but this demo has no ontology for it\. Genes, for example, are found but not mapped here\.$/, "the not-looked-up card");
+    has(brca, /^Other BRCA1 → not looked up The model marked this mention, but this demo has no ontology for its type\. Genes, for example, are found but not mapped here\.$/, "the not-looked-up card");
     s.check(brca.more === null, "the not-looked-up card has something to expand");
     s.check(!/no ontology for type/.test(brca.text), "the raw server note is shown");
     has(warfarin, /^Chemical · ChEBI warfarin → could not be matched 7 candidates$/, "the failed card");
@@ -1024,6 +1115,252 @@ const STATES = {
     const stored = await s.page.evaluate(() => Object.keys(window.sessionStorage).concat(Object.keys(window.localStorage)));
     s.check(stored.length === 0, `the page stored something: ${stored.join(", ")}`);
     s.check(!/aspirin|metformin/i.test(s.page.url()), "the text is in the URL");
+  },
+
+  // ---------- the recorded example on arrival ----------
+
+  // Health first (the usual order once the function is warm): the example is there on
+  // arrival, labelled, with no scroll, no focus and no request. Editing the text marks
+  // it as the example's; a real run replaces it entirely.
+  async "example-arrival"(s) {
+    s.health = productionHealth();
+    s.ner = { body: shaped() };
+    await s.open();
+    const seen = await s.expectExample("on arrival");
+    s.check(seen.scrollY === 0, `the page scrolled on arrival (${seen.scrollY})`);
+    s.check(seen.focus === "BODY", `something took the focus on arrival (#${seen.focus})`);
+    s.check(seen.stale === null, "the example is marked as for another text on arrival");
+    s.check(seen.banner === null, `a banner is shown for the example: ${JSON.stringify(seen.banner)}`);
+    s.check(/ChEBI · 219k terms/.test(seen.legend), `the legend has no term counts: ${JSON.stringify(seen.legend)}`);
+    await s.expectText("#results-summary", /^7 mentions found: 7 matched\.$/);
+    await s.expectHidden("#notices", "'About this run' for the example");
+    s.check(!(await s.page.evaluate(() => document.getElementById("run-details").open)), "the recorded run's details are open");
+    if (s.width === 390) {
+      // One short scroll: the result starts within a screen and a half.
+      s.check(seen.top <= seen.screen * 1.5, `the example result starts at ${seen.top}px of a ${seen.screen}px screen`);
+      const run = await s.page.evaluate(() => document.getElementById("run").getBoundingClientRect().bottom);
+      s.check(run <= seen.screen, `Run is below the first screen (${Math.round(run)})`);
+    }
+    if (s.shot) await s.shot("arrival");
+
+    // The visitor's own text: the result below is said to be the example's.
+    await s.page.fill("#text", "Warfarin and grapefruit juice.");
+    await s.expectVisible("#stale", "the line that says whose result this is");
+    await s.expectText("#stale", EXAMPLE_STALE);
+    const dim = await s.page.evaluate(() => Number(getComputedStyle(document.querySelector(".results-body")).opacity));
+    s.check(dim >= 0.85 && dim < 1, `an earlier result is dimmed to ${dim}; a light dim (0.85) is wanted`);
+    if (s.shot) await s.shot("edited");
+    await s.page.fill("#text", EXAMPLE_FILE.text);
+    await s.expectHidden("#stale", "the line once the box holds the example again");
+    await s.page.click("#clear-text");
+    await s.expectVisible("#stale", "the line after Clear");
+    s.check((await s.shown()).heading === "Example result", "Clear changed the heading");
+
+    // A failed run leaves the example where it is, still labelled.
+    s.ner = { status: 500, body: apiError("internal", "boom") };
+    s.expectedStatuses.add(500);
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectError("The demo hit an error on its side.", { action: "Try again" });
+    const kept = await s.shown();
+    s.check(kept.visible && kept.kind === "example" && EXAMPLE_NOTE.test(kept.note || "") && EXAMPLE_STALE.test(kept.stale || ""), "a failed run changed how the example is labelled");
+
+    // A real run replaces it: nothing of the example is left.
+    s.ner = { body: shaped() };
+    await s.page.click("#error-action");
+    await s.expectResults();
+    const real = await s.shown();
+    s.check(real.kind === "run" && real.heading === "Results", `after a run the heading is ${JSON.stringify(real.heading)}`);
+    s.check(real.note === null && real.stale === null, "the example's label is still shown after a run");
+    s.check(/^Done in /.test(real.status || ""), `after a run the status is ${JSON.stringify(real.status)}`);
+    s.check(real.details === "Run details", `after a run the details are titled ${JSON.stringify(real.details)}`);
+    s.check(real.cards === SHAPED_SPECS.length, `after a run there are ${real.cards} cards`);
+    s.check(!/Recorded|Example result/.test(await s.text("#results")), "the result of a run still mentions the example");
+    // A later health answer does not bring the example back.
+    await s.page.waitForTimeout(400);
+    s.check((await s.shown()).kind === "run", "the example came back after the run");
+  },
+
+  // example.json first, health later (a cold start): the example does not wait. When
+  // health then says full catalog it stays; a sample catalog or offline mode removes it.
+  async "example-health-late"(s) {
+    let gate = s.gate();
+    s.healthGate = gate.promise;
+    s.health = productionHealth();
+    await s.openHeld();
+    // The names and counts come from example.json until health answers.
+    await s.expectExample("before health answers");
+    await s.expectText("#caveat", /^Searches more than 260,000 real ontology terms\./, "the static trust line");
+    gate.release();
+    await s.page.waitForLoadState("networkidle");
+    await s.expectText("#caveat", /^Searches 261,018 real ontology terms\./, "the trust line after health");
+    const after = await s.expectExample("after health said full catalog");
+    s.check(after.scrollY === 0 && after.focus === "BODY", "health arriving moved the page or the focus");
+
+    for (const [what, health, start] of [
+      ["a sample catalog", fixture("health"), EXAMPLE_SAMPLE_START],
+      ["offline mode", { ...productionHealth(), mode: "offline" }, EXAMPLE_SAMPLE_START],
+    ]) {
+      gate = s.gate();
+      s.healthGate = gate.promise;
+      s.health = health;
+      await s.openHeld();
+      await s.expectExample(`before health says ${what}`);
+      gate.release();
+      await s.page.waitForLoadState("networkidle");
+      // Gone, and the text it put in the box with it: the old behaviour.
+      await s.expectNoExample(`after health said ${what}`);
+      await s.loadExample();
+      s.check((await s.page.inputValue("#text")).startsWith(start), `Example on ${what} loaded ${JSON.stringify((await s.page.inputValue("#text")).slice(0, 30))}`);
+    }
+
+    // Text the visitor typed over the example is theirs: it stays when the example goes.
+    gate = s.gate();
+    s.healthGate = gate.promise;
+    s.health = fixture("health");
+    await s.openHeld();
+    await s.expectExample("before health, about to type");
+    await s.page.fill("#text", "my own words");
+    gate.release();
+    await s.page.waitForLoadState("networkidle");
+    await s.expectNoExample("after health said sample, with typed text", { text: "my own words" });
+    s.healthGate = null;
+  },
+
+  // Health first, example.json later (a slow connection): typed text is never
+  // overwritten, nothing takes the focus or scrolls, and a deployment that is not the
+  // full catalog never shows it. A run started meanwhile is not covered by it either.
+  async "example-late"(s) {
+    let gate = s.gate();
+    s.example = { gate: gate.promise };
+    s.health = productionHealth();
+    s.ner = { body: shaped() };
+    await s.openHeld();
+    await s.expectNoExample("before example.json arrives");
+    await s.page.locator("#text").click();
+    await s.page.keyboard.type("Warfarin and");
+    const before = await s.shown();
+    gate.release();
+    await s.expectVisible('#results[data-kind="example"] .card', "the example once it arrives");
+    const late = await s.shown();
+    s.check(late.text === "Warfarin and", `typed text was overwritten: ${JSON.stringify(late.text.slice(0, 40))}`);
+    s.check(late.focus === "text" && late.scrollY === before.scrollY, `the example took the focus or scrolled (#${late.focus}, ${before.scrollY} -> ${late.scrollY})`);
+    s.check(EXAMPLE_STALE.test(late.stale || ""), `beside typed text the example is not marked as the example's: ${JSON.stringify(late.stale)}`);
+    s.check(late.heading === "Example result" && EXAMPLE_NOTE.test(late.note || ""), "the late example is not labelled");
+    await s.page.keyboard.type(" grapefruit");
+    s.check((await s.page.inputValue("#text")) === "Warfarin and grapefruit", "typing after the example arrived went wrong");
+
+    // Not the full catalog: it never appears, however late it arrives.
+    gate = s.gate();
+    s.example = { gate: gate.promise };
+    s.health = fixture("health");
+    await s.openHeld();
+    gate.release();
+    await s.page.waitForLoadState("networkidle");
+    await s.expectNoExample("on a sample catalog");
+
+    // A run started before it arrived: the run's result is not replaced or relabelled.
+    gate = s.gate();
+    s.example = { gate: gate.promise };
+    s.health = productionHealth();
+    await s.openHeld();
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    // (expectResults would wait for the network to go quiet, and example.json is held.)
+    await s.expectVisible('#results[data-kind="run"] .card', "the result of a run made before the example arrived");
+    gate.release();
+    await s.settled();
+    await s.page.waitForTimeout(300);
+    const ran = await s.shown();
+    s.check(ran.kind === "run" && ran.heading === "Results" && ran.note === null && ran.cards === SHAPED_SPECS.length, `the example replaced a run's result (${ran.heading}, ${ran.cards} cards)`);
+    s.example = "pass";
+  },
+
+  // Health fails, or never answers: nothing is known about the deployment, the static
+  // page is the production copy, and the example stays, labelled, with a working form.
+  async "example-no-health"(s) {
+    s.health = "fail";
+    s.expectedStatuses.add(500);
+    await s.open();
+    await s.expectVisible("#banner", "the banner about the status");
+    await s.expectExample("with health failing");
+    // The retry succeeds: the example is still there and now has health's counts.
+    s.health = productionHealth();
+    await s.page.click("#health-retry");
+    await s.page.waitForLoadState("networkidle");
+    await s.expectHidden("#banner", "the banner after the retry");
+    await s.expectExample("after the retry");
+
+    // Never: the request hangs for as long as the page lives.
+    s.healthGate = new Promise(() => {});
+    await s.openHeld();
+    const seen = await s.expectExample("with health never answering");
+    s.check(seen.banner === null, "a banner is shown while health is still loading");
+    s.ner = { body: shaped() };
+    await s.run();
+    await s.expectVisible('#results[data-kind="run"] .card', "the result of a run without health");
+    s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text, "Run did not send the example text");
+    s.check((await s.shown()).heading === "Results", "a run without health kept the example's heading");
+  },
+
+  // example.json missing or broken: the page is as it is without it.
+  async "example-missing"(s) {
+    for (const kind of ["missing", "garbage"]) {
+      s.example = kind;
+      s.health = productionHealth();
+      s.ner = { body: shaped() };
+      await s.open();
+      await s.expectNoExample(`example.json ${kind}`);
+      await s.expectText("#caveat", /^Searches 261,018 real ontology terms\./, "the trust line");
+      await s.loadExample();
+      s.check((await s.page.inputValue("#text")).startsWith(EXAMPLE_FULL_START), `Example did not load with example.json ${kind}`);
+      await s.page.fill("#text", SHAPED_TEXT);
+      await s.run();
+      await s.expectResults();
+      s.check((await s.shown()).heading === "Results", "the heading after a run");
+    }
+  },
+
+  // The panel after the cards: what that was and where the library is.
+  async "closing-panel"(s) {
+    await s.runShaped();
+    await s.expectVisible("#next", "the closing panel");
+    await s.expectText("#next-title", /^That lookup is xwalk$/);
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk searched 261,018 ontology terms by keyword and by meaning, and the model chose among real candidates\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/);
+    const link = await s.page.evaluate(() => {
+      const a = document.getElementById("next-github");
+      const order = document.getElementById("cards").compareDocumentPosition(document.getElementById("next")) & Node.DOCUMENT_POSITION_FOLLOWING;
+      return { text: a.textContent, href: a.getAttribute("href"), target: a.target, rel: a.rel, height: a.getBoundingClientRect().height, order, panels: document.querySelectorAll("#next").length };
+    });
+    s.check(link.text === "xwalk on GitHub" && link.href === "https://github.com/jan3657/xwalk?utm_source=xwalk.si", `the primary link is ${JSON.stringify(link)}`);
+    s.check(link.target === "_blank" && /noopener/.test(link.rel), "the GitHub link does not open in a new tab with rel noopener");
+    s.check(link.height >= 44, `the GitHub link is ${link.height}px tall`);
+    s.check(link.order !== 0, "the closing panel is not after the cards");
+    s.check(!/pip install|Built by/.test(await s.text("#next")), "the closing panel has an author or a pip line");
+    if (s.shot) {
+      await s.page.locator("#next").scrollIntoViewIfNeeded();
+      await s.shot("panel");
+    }
+    await s.page.click("#next-try");
+    await s.page.waitForTimeout(900);
+    const tried = await s.page.evaluate(() => {
+      const r = document.getElementById("text").getBoundingClientRect();
+      return { focus: document.activeElement && document.activeElement.id, inView: r.top >= 0 && r.top < window.innerHeight };
+    });
+    s.check(tried.focus === "text" && tried.inView, `'Try your own text' left the focus on #${tried.focus}, text box in view: ${tried.inView}`);
+
+    // Only what is true of the result: no model chose, and half the search was off.
+    s.ner = { body: shaped({ entities: shaped().entities.map((e) => ({ ...e, pick: null })), retrieval: { bm25: { status: "ok" }, dense: { status: "unavailable", reason: "no index" } } }) };
+    await s.run();
+    await s.settled();
+    await s.expectText("#next-body", /xwalk searched 261,018 ontology terms by keyword, and each mention shows the top search result\./, "the closing panel for a keyword-only run with no model");
+
+    // Nothing was looked up: there is no lookup to explain.
+    s.ner = { body: shaped({ entities: [] }) };
+    await s.run();
+    await s.settled();
+    await s.expectVisible("#no-entities", "the no-entities panel");
+    await s.expectHidden("#next", "the closing panel with no mentions");
   },
 
   // 25 entities is the per-run cap, and the page says so beside the summary.
