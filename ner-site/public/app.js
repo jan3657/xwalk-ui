@@ -70,6 +70,9 @@
     error: $("error"),
     errorMsg: $("error-message"),
     status: $("status"),
+    progress: $("progress"),
+    progressTime: $("progress-time"),
+    progressHint: $("progress-hint"),
     results: $("results"),
     summary: $("results-summary"),
     ranOn: $("results-models"),
@@ -998,6 +1001,43 @@
     el.run.setAttribute("aria-busy", on ? "true" : "false");
     el.results.setAttribute("aria-busy", on ? "true" : "false");
     el.run.querySelector(".run-label").textContent = on ? "Running…" : "Run";
+    showProgress(on);
+  }
+
+  // What a visitor sees while a run is under way: a moving bar, what is happening, and
+  // a clock, so half a minute of waiting does not look like a page that hung. The
+  // clock is hidden from screen readers; the status line announces the start once.
+  const PROGRESS_USUAL = "This usually takes 20 to 40 seconds. Keep this page open.";
+  const PROGRESS_SLOW = "Taking longer than usual. Long texts with many entities can need up to two minutes.";
+  let progressTimer = null;
+
+  function showProgress(on) {
+    if (progressTimer !== null) {
+      clearInterval(progressTimer);
+      progressTimer = null;
+    }
+    el.progress.hidden = !on;
+    if (!on) return;
+    const started = performance.now();
+    const tick = () => {
+      const s = Math.floor((performance.now() - started) / 1000);
+      el.progressTime.textContent = `${s} s`;
+      el.progressHint.textContent = s >= 45 ? PROGRESS_SLOW : PROGRESS_USUAL;
+    };
+    tick();
+    progressTimer = setInterval(tick, 1000);
+    // On a phone the block is below the Run button and off the screen.
+    reveal(el.progress, "nearest");
+  }
+
+  function reveal(node, block) {
+    if (typeof node.scrollIntoView !== "function") return;
+    const calm = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    node.scrollIntoView({ block, behavior: calm ? "auto" : "smooth" });
+  }
+
+  function revealResults() {
+    reveal(el.results, "start");
   }
 
   async function run() {
@@ -1055,12 +1095,14 @@
     if (provider) payload.provider = provider.id;
 
     setRunning(true);
-    setStatus(["Extracting entities, then matching them against the samples…"]);
+    setStatus(["Running…"]);
     const started = performance.now();
     try {
       // The key is read here, for this call, and held nowhere else.
       const data = await api("POST", "/api/ner", payload, provider ? el.ownKey.value.trim() : undefined);
       renderResults(text, data);
+      setRunning(false);
+      revealResults();
     } catch (err) {
       el.results.hidden = true;
       renderBanner(state.health && state.health.mode, state.health && state.health.retrieval);
