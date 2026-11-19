@@ -1401,7 +1401,7 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   where the text goes, that the mentions go to OpenRouter when embedding search is used
   and that the server may keep recently embedded mentions in memory (the query-vector
   cache of a warm instance, up to 4,096 entries), that the site is built not to keep
-  text, prompt or results (its logs and its database hold run metadata only, with time,
+  text, prompt or results (its logs and its database are designed to hold run metadata only, with time,
   model, token counts, country and the per-day visitor hash given as examples), that it
   attempts to save one row of that metadata per run when run recording is enabled, and
   that runs on the site's own models are limited per network, and runs with an own key

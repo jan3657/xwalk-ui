@@ -606,7 +606,7 @@ const STATES = {
     const footer = await s.text("#privacy");
     s.check(!/not saved|stores no|kept for one day|writes no text|Each run is recorded/i.test(footer), "the footer still promises more than the site does");
     await s.expectText("#privacy", /When embedding search is used, the mentions found in your text are sent to OpenRouter .* may keep recently embedded mentions in memory/, "the footer's line about the embedding cache");
-    s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
+    s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
     s.check(/When run recording is enabled, this site attempts to save/.test(footer), "the footer says runs are recorded without its condition");
     s.check(/Runs on this site's own models are limited per network/.test(footer), "the footer's line about limits has no condition");
     const described = await s.runDescription();

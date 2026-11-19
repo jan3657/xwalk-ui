@@ -241,7 +241,7 @@
       <ul>
         <li>Your text is sent to the model provider to find the mentions and choose the terms: Anthropic by default; OpenRouter, and the model host it routes to, if the run falls back or you choose it; the provider of your own key if you use one.</li>
         <li>When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory for a while so it does not compute them twice.</li>
-        <li>This site is built not to keep your text, prompt or results: its logs and its database hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day.</li>
+        <li>This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day.</li>
         <li>When run recording is enabled, this site attempts to save one row of that metadata for each run.</li>
         <li>Runs on this site's own models are limited per network, and runs with your own key are counted the same way, using a salted hash of the IP address. Entries older than a day are deleted by a clean-up that runs from time to time.</li>
         <li>Visits are counted without cookies.</li>
