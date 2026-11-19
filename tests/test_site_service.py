@@ -7,6 +7,7 @@ tmp_path and dense is always given an explicit directory (never the committed on
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from ner_site import fake, service
 from ner_site import indexes as indexes_mod
+from ner_site.claude import ClaudeResponse
 from ner_site.extract import DEFAULT_PROMPT, ExtractionError, extract
 from ner_site.schema import Limits, NerRequest, NerResponse, ServiceError
 from ner_site.service import Settings, SettingsError, make_llm, run, validate_request
@@ -41,9 +43,12 @@ EXAMPLE_TEXT = (
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
+    # The default selector is the first that can run (Jev with only an OpenRouter key);
+    # these tests are about the request without a selection step unless they say so.
     env = {
         "NER_SITE_CACHE_DIR": str(tmp_path / "cache"),
         "NER_SITE_DENSE_DIR": str(tmp_path / "no-dense"),
+        "NER_SITE_SELECTOR": "retrieval",
         **overrides,
     }
     return Settings.from_env(env)
@@ -77,11 +82,14 @@ def test_from_env_defaults() -> None:
     assert s.api_key is None and s.passcode is None and s.offline is False
     assert s.base_url == "https://openrouter.ai/api/v1"
     assert s.models == (
-        "openai/gpt-4o-mini",
-        "google/gemini-2.5-flash-lite",
-        "qwen/qwen3-next-80b-a3b-instruct",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "google/gemini-3.1-flash-lite",
+        "openai/gpt-6-luna",
     )
-    assert s.default_model == "openai/gpt-4o-mini" and s.offered_models == s.models
+    # No Anthropic key: the Claude ids are configured but not offered.
+    assert s.offered_models == s.models[2:]
+    assert s.default_model == "google/gemini-3.1-flash-lite"
     assert s.limits == Limits()
     assert s.dense_dir == PROJECT / "indexes"
     assert s.cache_dir == Path("/tmp/xwalk-ner-site")
@@ -251,8 +259,9 @@ def test_validate_request_resolves_defaults(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     got = validate_request(NerRequest(text="x" * 5000, prompt="  ", top_k=10), s)
     assert got.prompt == DEFAULT_PROMPT and got.model == s.default_model and got.top_k == 10
-    custom = validate_request(NerRequest(text="ok", prompt="only genes", model=s.models[1]), s)
-    assert custom.prompt == "only genes" and custom.model == s.models[1]
+    second = s.offered_models[1]
+    custom = validate_request(NerRequest(text="ok", prompt="only genes", model=second), s)
+    assert custom.prompt == "only genes" and custom.model == second
 
 
 def test_text_length_counts_code_points(tmp_path: Path) -> None:
@@ -266,7 +275,7 @@ def test_offline_accepts_only_the_offline_model(tmp_path: Path) -> None:
     s = _settings(tmp_path, NER_SITE_OFFLINE="1")
     assert validate_request(NerRequest(text="ok", model="offline"), s).model == "offline"
     with pytest.raises(ServiceError) as exc:
-        validate_request(NerRequest(text="ok", model="openai/gpt-4o-mini"), s)
+        validate_request(NerRequest(text="ok", model="google/gemini-3.1-flash-lite"), s)
     assert exc.value.code == "unknown_model"
 
 
@@ -285,7 +294,9 @@ def test_run_end_to_end_with_fake_llm(tmp_path: Path, bm25_only: Any) -> None:
     s = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
     out = asyncio.run(run(NerRequest(text=text, top_k=2), settings=s, llm=llm, indexes=bm25_only))
     assert isinstance(out, NerResponse)
-    assert out.model == "openai/gpt-4o-mini" and out.mode == "live"
+    assert out.model == "google/gemini-3.1-flash-lite" and out.mode == "live"
+    assert out.requested_model == out.model and out.requested_selector == "retrieval"
+    assert out.fallbacks == [] and out.notices == []
     first, second = out.entities
     assert (first.text, first.start, first.end) == ("haloperidol", 9, 20)  # relocated
     assert text[first.start : first.end] == first.text
@@ -521,7 +532,7 @@ def test_selectors_are_offered_and_validated(tmp_path: Path) -> None:
 
     plain = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY)
     assert plain.offered_selectors[0] == RETRIEVAL_ONLY and JEV in plain.offered_selectors
-    assert plain.default_selector == RETRIEVAL_ONLY
+    assert plain.default_selector == RETRIEVAL_ONLY  # the helper's NER_SITE_SELECTOR
     assert validate_request(NerRequest(text="ok"), plain).selector == RETRIEVAL_ONLY
     jev = _settings(tmp_path, OPENROUTER_API_KEY=SENTINEL_KEY, NER_SITE_SELECTOR="jev")
     assert jev.default_selector == JEV
@@ -700,3 +711,1276 @@ def test_a_key_check_that_cannot_reach_openrouter_is_not_an_outage(tmp_path: Pat
     assert status is not None and status.status == "ok"
     assert status.reason is not None and "not checked" in status.reason
     assert service.check_key(_settings(tmp_path), transport=httpx.MockTransport(down)) is None
+
+
+# --- Claude as the default provider (spec 2026-11-18, section 4) ----------------------
+
+ANTHROPIC_KEY = "sk-ant-SENTINEL-feedbeef-9191"
+OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5-5"
+GEMINI, LUNA = "google/gemini-3.1-flash-lite", "openai/gpt-6-luna"
+DB_URL = "postgresql://owner:npg_SENTINELpw0123@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
+ALL_OWN = "anthropic,openai,openrouter"
+
+
+def test_claude_leads_the_defaults_when_both_keys_are_set() -> None:
+    from ner_site.limits import Allowance
+
+    s = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY})
+    assert s.anthropic_api_key == ANTHROPIC_KEY and s.configured
+    assert s.models == service.DEFAULT_MODELS == (OPUS, SONNET, GEMINI, LUNA)
+    assert s.offered_models == (OPUS, SONNET, GEMINI, LUNA) and s.default_model == OPUS
+    assert s.selectors == service.DEFAULT_SELECTORS == (OPUS, SONNET, "jev", GEMINI, LUNA)
+    assert s.offered_selectors == ("retrieval", OPUS, SONNET, "jev", GEMINI, LUNA)
+    assert s.default_selector == OPUS
+    assert s.claude_effort == "low" and s.fallback_model == GEMINI
+    assert s.allowance == Allowance(opus_per_hour=10, sonnet_per_hour=20)
+    assert s.visitor_salt is None and s.database_url is None
+
+
+def test_without_the_anthropic_key_nothing_about_claude_is_offered() -> None:
+    s = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY})
+    assert s.offered_models == (GEMINI, LUNA) and s.default_model == GEMINI
+    assert s.offered_selectors == ("retrieval", "jev", GEMINI, LUNA)
+    assert s.default_selector == "jev" and s.configured
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", model=OPUS, selector="retrieval"), s)
+    assert exc.value.code == "unknown_model"
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", selector=SONNET), s)
+    assert exc.value.code == "unknown_selector"
+    # No key at all: not configured, and what is listed is what an OpenRouter key would
+    # offer, as before.
+    bare = Settings.from_env({})
+    assert not bare.configured and bare.offered_models == (GEMINI, LUNA)
+    assert bare.default_selector == "jev"
+
+
+def test_without_the_openrouter_key_only_claude_is_offered() -> None:
+    s = Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY})
+    assert s.configured and s.api_key is None
+    assert s.offered_models == (OPUS, SONNET) and s.default_model == OPUS
+    assert s.offered_selectors == ("retrieval", OPUS, SONNET) and s.default_selector == OPUS
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(text="ok", selector="jev"), s)
+    assert exc.value.code == "unknown_selector"
+
+
+def test_offline_offers_no_claude_even_with_the_key() -> None:
+    s = Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_OFFLINE": "1"})
+    assert s.offered_models == ("offline",) and s.offered_selectors == ("retrieval", "jev")
+    assert s.default_selector == "jev"
+
+
+def test_a_configured_selector_is_the_default_while_it_is_offered() -> None:
+    both = {"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY}
+    assert Settings.from_env({**both, "NER_SITE_SELECTOR": "jev"}).default_selector == "jev"
+    kept = Settings.from_env({**both, "NER_SITE_SELECTOR": "retrieval"})
+    assert kept.default_selector == "retrieval"
+    # Named, but its key is missing: the first selector that can run, not a 503.
+    lost = Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_SELECTOR": OPUS})
+    assert lost.default_selector == "jev"
+    with pytest.raises(SettingsError, match="NER_SITE_SELECTOR"):
+        Settings.from_env({**both, "NER_SITE_SELECTOR": "nobody"})
+
+
+def test_the_claude_effort_and_the_fallback_model_are_read_and_checked() -> None:
+    s = Settings.from_env({"NER_SITE_CLAUDE_EFFORT": " High ", "NER_SITE_FALLBACK_MODEL": LUNA})
+    assert s.claude_effort == "high" and s.fallback_model == LUNA
+    for name, value in (
+        ("NER_SITE_CLAUDE_EFFORT", "max"),
+        ("NER_SITE_CLAUDE_EFFORT", "0"),
+        ("NER_SITE_FALLBACK_MODEL", SONNET),
+        ("NER_SITE_FALLBACK_MODEL", "retrieval"),
+        ("NER_SITE_FALLBACK_MODEL", "jev"),
+    ):
+        with pytest.raises(SettingsError) as exc:
+            Settings.from_env({name: value})
+        assert name in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["NER_SITE_OPUS_PER_HOUR", "NER_SITE_SONNET_PER_HOUR"])
+def test_the_allowance_is_read_and_refused_out_of_range(name: str) -> None:
+    from ner_site.limits import Allowance
+
+    low = Settings.from_env({name: "0"}).allowance
+    high = Settings.from_env({name: "1000"}).allowance
+    field = "opus_per_hour" if "OPUS" in name else "sonnet_per_hour"
+    assert getattr(low, field) == 0 and getattr(high, field) == 1000
+    assert Settings.from_env({name: " "}).allowance == Allowance()
+    for bad in ("1001", "-1", "ten", "2.5"):
+        with pytest.raises(SettingsError) as exc:
+            Settings.from_env({name: bad})
+        assert name in str(exc.value) and "0 to 1000" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["NER_SITE_MODELS", "NER_SITE_SELECTORS"])
+def test_an_unknown_claude_id_is_a_settings_error(name: str) -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({name: f"{OPUS}, claude-haiku-5-5"})
+    assert name in str(exc.value) and "claude-haiku-5-5" in str(exc.value)
+    # An OpenRouter id of an Anthropic model is not a Claude id of this site.
+    ok = Settings.from_env({name: f"anthropic/claude-haiku-5.5, {SONNET}"})
+    assert SONNET in (ok.models if name == "NER_SITE_MODELS" else ok.selectors)
+
+
+def test_a_model_list_that_no_key_can_run_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError, match="NER_SITE_MODELS"):
+        Settings.from_env({"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_MODELS": OPUS})
+    with pytest.raises(SettingsError, match="NER_SITE_MODELS"):
+        Settings.from_env({"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_MODELS": GEMINI})
+    assert Settings.from_env({"NER_SITE_MODELS": OPUS, "NER_SITE_OFFLINE": "1"}).offline
+
+
+def test_both_keys_and_the_salt_are_scrubbed_and_stay_out_of_repr() -> None:
+    s = Settings.from_env(
+        {
+            "OPENROUTER_API_KEY": SENTINEL_KEY,
+            "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+            "NER_SITE_VISITOR_SALT": "salt-SENTINEL-0001",
+        }
+    )
+    assert s.visitor_salt == "salt-SENTINEL-0001"
+    assert {SENTINEL_KEY, ANTHROPIC_KEY, "salt-SENTINEL-0001"} <= set(s.secrets())
+    for secret in (SENTINEL_KEY, ANTHROPIC_KEY, "salt-SENTINEL-0001"):
+        assert secret not in repr(s)
+    scrubbed = service.scrub(f"401 for {ANTHROPIC_KEY} and {SENTINEL_KEY}", s)
+    assert scrubbed == "401 for [redacted] and [redacted]"
+
+
+def test_the_database_url_is_read_for_the_limiter_on_any_backend() -> None:
+    s = Settings.from_env({"DATABASE_URL": DB_URL, "ANTHROPIC_API_KEY": ANTHROPIC_KEY})
+    assert s.backend == "bundled" and s.database_url == DB_URL
+    assert DB_URL in s.secrets() and "npg_SENTINELpw0123" in s.secrets()
+    assert "SENTINELpw" not in repr(s)
+    # The index backend choice is unchanged: bundled indexes never see the database.
+    assert s.index_settings().database_url is None and s.index_settings().backend == "bundled"
+    neon = Settings.from_env({"DATABASE_URL": DB_URL, "NER_SITE_BACKEND": "neon"})
+    assert neon.index_settings().database_url == DB_URL
+    for needed in ({"ANTHROPIC_API_KEY": ANTHROPIC_KEY}, {"NER_SITE_BACKEND": "neon"}):
+        with pytest.raises(SettingsError, match="DATABASE_URL"):
+            Settings.from_env({"DATABASE_URL": "mysql://u:p@h/db", **needed})
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        # Offline never asks for Claude, so nothing would count visitors there.
+        {"ANTHROPIC_API_KEY": ANTHROPIC_KEY, "NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["bare", "openrouter_only", "offline_with_the_anthropic_key"],
+)
+def test_the_database_url_is_ignored_where_nothing_uses_it(env: dict[str, str]) -> None:
+    """A bundled deployment that offers no Claude has no use for a database, and a
+    platform integration may have put anything in ``DATABASE_URL``: as before Claude,
+    it is neither read nor validated."""
+    for value in ("mysql://u:p@h/db", "not a url", DB_URL):
+        for off in ({}, {"NER_SITE_OWN_PROVIDERS": ""}):
+            s = Settings.from_env({**off, **env, "DATABASE_URL": value})
+            assert s.backend == "bundled" and s.database_url is None
+            assert value not in s.secrets() and s.index_settings().database_url is None
+
+
+def test_every_new_variable_is_part_of_the_settings_cache_key() -> None:
+    assert {
+        "ANTHROPIC_API_KEY",
+        "NER_SITE_CLAUDE_EFFORT",
+        "NER_SITE_FALLBACK_MODEL",
+        "NER_SITE_OPUS_PER_HOUR",
+        "NER_SITE_SONNET_PER_HOUR",
+        "NER_SITE_VISITOR_SALT",
+    } <= set(service.ENV_NAMES)
+
+
+# --- the fallback chain in a request (spec 2026-11-18, sections 5, 6 and 8) -----------
+
+TEXT = "She took haloperidol for a fever."
+EXTRACTED = _answer(("haloperidol", "chemical", 9, 20))
+PICK = '{"chosen_key": "C01", "confidence_score": 0.7, "explanation": "first"}'
+BOTH_KEYS = {"OPENROUTER_API_KEY": SENTINEL_KEY, "ANTHROPIC_API_KEY": ANTHROPIC_KEY}
+
+
+def _failing(reason: str, message: str = "upstream said no", *, retryable: bool = False) -> Any:
+    """An error as ``ner_site.claude`` raises it: an engine class plus ``reason``."""
+    from xwalk.llm.base import LLMRetryableError
+
+    kind = LLMRetryableError if retryable else LLMFatalError
+    error = kind(f"Anthropic: {message}", usage=Usage.unreported())
+    error.reason = reason  # type: ignore[attr-defined]
+    return error
+
+
+class _Fakes:
+    """Scripted clients standing in for Claude and for the OpenRouter fallback model,
+    one per (model, purpose); also the factories ``make_chain`` takes."""
+
+    def __init__(self, **scripts: Any) -> None:
+        # Keys: opus_extract, sonnet_select, other_extract ...; the default answers well.
+        self.scripts = scripts
+        self.made: dict[tuple[str, str], FakeLLM] = {}
+
+    def _fake(self, model: str, purpose: str) -> FakeLLM:
+        tier = {OPUS: "opus", SONNET: "sonnet"}.get(model, "other")
+        default = [EXTRACTED] if purpose == "extract" else None
+        script = self.scripts.get(f"{tier}_{purpose}", default)
+        llm = (
+            FakeLLM(handler=lambda request: PICK, model=model)
+            if script is None
+            else FakeLLM(script, model=model)
+            if isinstance(script, list)
+            else FakeLLM(handler=script, model=model)
+        )
+        self.made[(model, purpose)] = llm
+        return llm
+
+    def claude(self, settings: Settings, model: str, purpose: str) -> FakeLLM:
+        assert model in (OPUS, SONNET)
+        return self._fake(model, purpose)
+
+    def chain(self, settings: Settings, wanted: str = OPUS, **kw: Any) -> Any:
+        return service.make_chain(
+            settings,
+            wanted,
+            claude_factory=self.claude,
+            llm_factory=lambda s, m: self._fake(m, "extract"),
+            select_factory=lambda s, m: self._fake(m, "select"),
+            **kw,
+        )
+
+    def calls(self, model: str, purpose: str) -> int:
+        made = self.made.get((model, purpose))
+        return 0 if made is None else len(made.requests)
+
+
+def _run_chain(
+    tmp_path: Path, bm25_only: Any, fakes: _Fakes, *, wanted: str = OPUS, **kw: Any
+) -> NerResponse:
+    s = _settings(tmp_path, **{**BOTH_KEYS, "NER_SITE_SELECTOR": wanted, **kw.pop("env", {})})
+    chain = fakes.chain(s, wanted, start=kw.pop("start", 0))
+    request = kw.pop("request", NerRequest(text=TEXT, model=wanted))
+    return asyncio.run(
+        run(request, settings=s, llm=chain, select_llm=chain, indexes=bm25_only, **kw)
+    )
+
+
+def test_make_chain_steps_follow_the_wanted_model_and_the_keys(tmp_path: Path) -> None:
+    from ner_site.fallback import FallbackLLM
+
+    s = _settings(tmp_path, **BOTH_KEYS)
+    assert service.chain_models(s, OPUS) == (OPUS, SONNET, GEMINI)
+    assert service.chain_models(s, SONNET) == (SONNET, GEMINI)
+    alone = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    assert service.chain_models(alone, OPUS) == (OPUS, SONNET)
+    assert service.chain_models(alone, SONNET) == (SONNET,)
+    with pytest.raises(ValueError):
+        service.chain_models(s, GEMINI)
+
+    seen: list[tuple[str, str]] = []
+
+    def claude(settings: Settings, model: str, purpose: str) -> FakeLLM:
+        seen.append((model, purpose))
+        return FakeLLM(["x"], model=model)
+
+    chain = service.make_chain(s, OPUS, start=1, claude_factory=claude)
+    assert isinstance(chain, FallbackLLM) and chain.position == 1 and chain.model == SONNET
+    assert [(step.label, step.client.model) for step in chain.steps] == [
+        ("opus", OPUS),
+        ("sonnet", SONNET),
+        ("other", GEMINI),
+    ]
+    assert seen == []  # a client is built when the chain first reaches it
+    opus, _, other = (step.client for step in chain.steps)
+    assert isinstance(opus, service.StagedLLM) and opus.stages == ("extract", "select")
+    # Each Claude client has its own budget, with the limit of its OpenRouter twin.
+    extract_client, select_client = opus.client("extract"), opus.client("select")
+    assert seen == [(OPUS, "extract"), (OPUS, "select")]
+    assert opus.client("extract") is extract_client  # built once
+    assert isinstance(extract_client, BudgetedLLM) and isinstance(select_client, BudgetedLLM)
+    assert extract_client.budget is not select_client.budget
+    assert extract_client.budget.limit == 3 and select_client.budget.limit == 50
+    # The last step is what a request for that OpenRouter model gets today.
+    assert isinstance(other, service.StagedLLM)
+    last_extract, last_select = other.client("extract"), other.client("select")
+    assert isinstance(last_extract, BudgetedLLM) and isinstance(last_select, BudgetedLLM)
+    assert isinstance(last_extract.inner, OpenAICompatClient)
+    assert last_extract.budget.limit == 3 and last_select.budget.limit == 50
+    assert last_extract.generation_defaults == {"temperature": 0.0, "max_tokens": 2048}
+    assert last_select.generation_defaults == {"temperature": 0.0, "max_tokens": 600}
+    # The stage decides which of a step's clients answers.
+    service.enter_stage(chain, "select")
+    assert chain.stage == "select" and other.client() is last_select
+    service.enter_stage(chain, "extract")
+    assert other.client() is last_extract
+    asyncio.run(chain.aclose())
+
+    only_select = service.make_chain(s, SONNET, purposes=("select",), claude_factory=claude)
+    assert only_select.stage == "select" and len(only_select.steps) == 2
+    assert only_select.steps[0].client.stages == ("select",)  # type: ignore[attr-defined]
+    asyncio.run(only_select.aclose())
+
+
+def test_make_claude_configures_the_adapter_per_purpose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real adapter class is replaced: no SDK client is built in a test."""
+    built: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(service, "ClaudeClient", lambda model, **kw: built.append((model, kw)))
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_CLAUDE_EFFORT="medium")
+    service.make_claude(s, OPUS, "extract")
+    service.make_claude(s, SONNET, "select")
+    assert built == [
+        (
+            OPUS,
+            {"api_key": ANTHROPIC_KEY, "max_tokens": 16000, "effort": "medium", "timeout": 40.0},
+        ),
+        (
+            SONNET,
+            {"api_key": ANTHROPIC_KEY, "max_tokens": 8000, "effort": "medium", "timeout": 60.0},
+        ),
+    ]
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        service.make_claude(_settings(tmp_path), OPUS, "extract")
+    # Two Claude extraction attempts fit inside the extraction bound, with room to spare.
+    assert service.CLAUDE_EXTRACT_TIMEOUT_S == 40.0
+    assert 2 * service.CLAUDE_EXTRACT_TIMEOUT_S < service.EXTRACT_TIMEOUT_S
+
+
+def test_opus_answers_extraction_and_selection(tmp_path: Path, bm25_only: Any) -> None:
+    fakes = _Fakes()
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == OPUS and out.requested_model == OPUS
+    assert out.selector == OPUS and out.requested_selector == OPUS
+    assert out.fallbacks == [] and out.notices == []
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == OPUS
+    assert entity.pick.status == "match" and entity.pick.id == "CHEBI:5613"
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 1
+    assert out.usage.prompt_tokens == 100 and out.usage.selector_prompt_tokens == 100
+    # Extraction and selection went to their own clients of the one step.
+    assert fakes.calls(OPUS, "extract") == 1 and fakes.calls(OPUS, "select") == 1
+    assert fakes.calls(SONNET, "extract") == fakes.calls(GEMINI, "extract") == 0
+
+
+@pytest.mark.parametrize(
+    ("reason", "sentence"),
+    [
+        ("rate_limited", "Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5."),
+        ("overloaded", "Claude Opus 5.5 is overloaded; this ran on Claude Sonnet 5.5."),
+        ("refused", "Claude Opus 5.5 declined this text; this ran on Claude Sonnet 5.5."),
+    ],
+)
+def test_opus_failing_while_extracting_moves_the_whole_request_to_sonnet(
+    tmp_path: Path, bm25_only: Any, reason: str, sentence: str
+) -> None:
+    fakes = _Fakes(opus_extract=[_failing(reason, retryable=reason != "refused")])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == SONNET and out.requested_model == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": reason}
+    ]
+    assert out.notices == [sentence]
+    (entity,) = out.entities
+    # Sticky: selection never tries Opus again, and the pick names who made it.
+    assert entity.pick is not None and entity.pick.selector == SONNET
+    assert out.selector == OPUS and out.requested_selector == OPUS
+    assert fakes.calls(OPUS, "select") == 0 and fakes.calls(SONNET, "select") == 1
+    # The failed call is counted once (its tokens unknown), not twice and not dropped.
+    assert out.usage.llm_calls == 2 and out.usage.prompt_tokens is None
+    assert out.usage.selector_calls == 1 and out.usage.selector_prompt_tokens == 100
+
+
+def test_a_transient_failure_is_retried_once_before_stepping_down(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    flaky = _Fakes(opus_extract=[_failing("transient", retryable=True), EXTRACTED])
+    out = _run_chain(tmp_path, bm25_only, flaky)
+    assert out.model == OPUS and out.fallbacks == [] and out.usage.llm_calls == 2
+    down = _Fakes(opus_extract=[_failing("transient", retryable=True)] * 2)
+    out = _run_chain(tmp_path, bm25_only, down)
+    assert out.model == SONNET and out.usage.llm_calls == 3
+    assert out.notices == ["Claude Opus 5.5 did not answer; this ran on Claude Sonnet 5.5."]
+
+
+def test_a_timed_out_opus_extraction_answers_from_sonnet_after_one_opus_call(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """A timeout is not retried on the model that hung: one Opus call, then Sonnet."""
+    fakes = _Fakes(opus_extract=[_failing("timeout", "APITimeoutError", retryable=True)])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == SONNET and out.requested_model == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": SONNET, "reason": "timeout"}
+    ]
+    assert out.notices == ["Claude Opus 5.5 did not answer in time; this ran on Claude Sonnet 5.5."]
+    assert fakes.calls(OPUS, "extract") == 1 and fakes.calls(SONNET, "extract") == 1
+    assert out.usage.llm_calls == 2 and out.usage.prompt_tokens is None
+
+
+def test_sonnet_rate_limited_too_ends_on_the_openrouter_model(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    fakes = _Fakes(opus_extract=[limited], sonnet_extract=[limited])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == GEMINI
+    assert [(f.from_, f.to, f.reason) for f in out.fallbacks] == [
+        (OPUS, SONNET, "rate_limited"),
+        (SONNET, GEMINI, "rate_limited"),
+    ]
+    # Nothing ran on Sonnet, and the first sentence does not say it did.
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    ]
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == GEMINI
+    assert fakes.calls(GEMINI, "select") == 1
+
+
+def test_only_the_last_departure_of_a_stage_says_where_it_ran(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    from ner_site.schema import FallbackNote
+
+    limited = _failing("rate_limited", retryable=True)
+    # Twice while selecting.
+    out = _run_chain(tmp_path, bm25_only, _Fakes(opus_select=[limited], sonnet_select=[limited]))
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; the remaining picks ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter.",
+    ]
+    # Once while extracting and once while selecting: the extraction did run on Sonnet.
+    out = _run_chain(tmp_path, bm25_only, _Fakes(opus_extract=[limited], sonnet_select=[limited]))
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; the remaining picks ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter.",
+    ]
+    # Admitted on Sonnet, which then could not extract either: nothing ran there.
+    admitted = [FallbackNote(stage="admit", from_=OPUS, to=SONNET, reason="opus_allowance_used")]
+    out = _run_chain(
+        tmp_path, bm25_only, _Fakes(sonnet_extract=[limited]), start=1, admitted=admitted
+    )
+    assert out.model == GEMINI and out.notices == [
+        "Your Opus allowance for this hour is used; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 is rate limited; this ran on Gemini 3.1 Flash Lite through OpenRouter.",
+    ]
+    for sentence in out.notices:
+        assert "\u2014" not in sentence and sentence.endswith(".")
+
+
+def test_a_step_down_while_selecting_is_recorded_under_select(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes(opus_select=[_failing("overloaded", retryable=True)])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    assert out.model == OPUS  # the extraction was Opus's
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": OPUS, "to": SONNET, "reason": "overloaded"}
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 is overloaded; the remaining picks ran on Claude Sonnet 5.5."
+    ]
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.selector == SONNET
+    assert entity.pick.status == "match"
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 2
+    assert out.usage.selector_prompt_tokens is None  # one of the two reported nothing
+
+
+@pytest.mark.parametrize(
+    ("reason", "text"), [("balance_exhausted", "balance exhausted"), ("key_refused", "key refused")]
+)
+def test_an_unusable_anthropic_account_ends_on_openrouter_and_is_remembered(
+    tmp_path: Path, bm25_only: Any, reason: str, text: str
+) -> None:
+    from ner_site import fallback
+
+    dead = _failing(reason, f"no credit for {ANTHROPIC_KEY}")
+    fakes = _Fakes(opus_extract=[dead], sonnet_extract=[dead], sonnet_select=[dead])
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    # Sonnet shares the key and the balance: it is not tried, here or while selecting.
+    assert out.model == GEMINI
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": GEMINI, "reason": reason}
+    ]
+    assert out.notices == [
+        f"Claude is unavailable ({text}); this ran on Gemini 3.1 Flash Lite through OpenRouter."
+    ]
+    assert fakes.calls(SONNET, "extract") == fakes.calls(SONNET, "select") == 0
+    assert out.usage.llm_calls == 2
+    assert fallback.claude_block() == reason
+    assert ANTHROPIC_KEY not in out.model_dump_json()
+    # Without an OpenRouter step the chain can only go on to Sonnet.
+    fallback.reset()
+    alone = _Fakes(opus_extract=[dead])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    out = asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=alone.chain(s), indexes=bm25_only))
+    assert out.model == SONNET and out.notices == [
+        f"Claude Opus 5.5 is unavailable ({text}); this ran on Claude Sonnet 5.5."
+    ]
+
+
+def test_every_step_failing_while_extracting_is_a_scrubbed_502(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    last = LLMFatalError(f"HTTP 401 for {SENTINEL_KEY} and {ANTHROPIC_KEY}")
+    fakes = _Fakes(opus_extract=[limited], sonnet_extract=[limited], other_extract=[last])
+    with pytest.raises(ServiceError) as exc:
+        _run_chain(tmp_path, bm25_only, fakes)
+    assert exc.value.status == 502 and exc.value.code == "provider_error"
+    assert "HTTP 401" in exc.value.message  # names the last error
+    assert SENTINEL_KEY not in exc.value.message and ANTHROPIC_KEY not in exc.value.message
+    # Without an OpenRouter key the chain ends at Sonnet.
+    alone = _Fakes(opus_extract=[limited], sonnet_extract=[limited])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=alone.chain(s), indexes=bm25_only))
+    assert exc.value.status == 502 and "upstream said no" in exc.value.message
+
+
+def test_selection_failing_on_the_last_step_is_a_failed_pick_not_an_error(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    limited = _failing("rate_limited", retryable=True)
+    fakes = _Fakes(
+        opus_select=[limited],
+        sonnet_select=[limited],
+        other_select=[LLMFatalError(f"HTTP 500 with {SENTINEL_KEY}")],
+    )
+    out = _run_chain(tmp_path, bm25_only, fakes)
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.status == "failed" and entity.pick.id is None
+    assert "HTTP 500" in entity.pick.explanation and SENTINEL_KEY not in entity.pick.explanation
+    assert entity.pick.selector == OPUS  # nobody answered: the selector that was asked for
+    assert [f.stage for f in out.fallbacks] == ["select", "select"]
+    # Three calls were dispatched for the pick, and all three are counted.
+    assert out.usage.selector_calls == 3 and out.usage.selector_prompt_tokens is None
+
+
+def test_a_claude_stop_reason_is_a_normal_finish(tmp_path: Path, bm25_only: Any) -> None:
+    """The adapter passes Anthropic's stop reasons through (``end_turn``); only
+    ``length`` (its name for ``max_tokens``) means a cut-off answer."""
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+
+    def claude(finish: str, extracted: str) -> Any:
+        return lambda settings, model, purpose: FakeLLM(
+            handler=lambda r: extracted if purpose == "extract" else PICK,
+            model=model,
+            finish_reason=finish,
+        )
+
+    chain = service.make_chain(s, OPUS, claude_factory=claude("end_turn", EXTRACTED))
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    (entity,) = out.entities
+    assert entity.pick is not None and entity.pick.status == "match" and out.warnings != []
+    assert not any("cut off" in w for w in out.warnings)
+    cut = service.make_chain(s, OPUS, claude_factory=claude("length", '{"entities": [{"te'))
+    with pytest.raises(ExtractionError) as exc:
+        asyncio.run(run(NerRequest(text=TEXT), settings=s, llm=cut, indexes=bm25_only))
+    assert "cut off at the token limit" in exc.value.message
+
+
+def test_the_openrouter_step_is_sent_what_each_stage_sends_today(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """The chain reports no ``generation_defaults``, so what reaches OpenRouter is decided
+    by each stage's request and by the client behind it: extraction as ``make_llm``
+    (temperature 0, 2048 tokens), selection as ``make_select_llm`` (temperature 0, 600)."""
+    bodies: list[dict[str, Any]] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        content = PICK if "selection" in json.dumps(body.get("response_format", "")) else EXTRACTED
+        return httpx.Response(
+            200,
+            json={
+                "model": GEMINI,
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 5},
+            },
+        )
+
+    transport = httpx.MockTransport(chat)
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    limited = _failing("rate_limited", retryable=True)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        start=2,
+        claude_factory=lambda settings, model, purpose: FakeLLM([limited], model=model),
+        llm_factory=lambda st, m: make_llm(st, m, transport=transport),
+        select_factory=lambda st, m: service.make_select_llm(st, m, transport=transport),
+    )
+
+    async def go() -> NerResponse:
+        try:
+            return await run(
+                NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only
+            )
+        finally:
+            await chain.aclose()
+
+    out = asyncio.run(go())
+    assert out.model == GEMINI and out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == GEMINI and out.entities[0].pick.status == "match"
+    extraction, selection = bodies
+    assert extraction["model"] == selection["model"] == GEMINI
+    assert (extraction["temperature"], extraction["max_tokens"]) == (0, 2048)
+    assert (selection["temperature"], selection["max_tokens"]) == (0, 600)
+    assert extraction["reasoning"] == selection["reasoning"] == {"enabled": False}
+
+
+def test_the_claude_steps_are_sent_the_stage_requests_unchanged(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """What the adapter ignores (temperature, the engine's token limits) is its own
+    business (tests/test_site_claude.py); the chain passes each request through as is."""
+    fakes = _Fakes()
+    _run_chain(tmp_path, bm25_only, fakes)
+    (extraction,) = fakes.made[(OPUS, "extract")].requests
+    (selection,) = fakes.made[(OPUS, "select")].requests
+    assert (extraction.temperature, extraction.max_tokens) == (0.0, 2048)
+    assert (selection.temperature, selection.max_tokens) == (None, None)
+    assert extraction.schema is not None and selection.schema is not None
+
+
+def test_a_model_id_the_site_has_no_name_for_is_shown_as_it_is(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """After Anthropic's server-side refusal fallback the answer names another model."""
+
+    class Elsewhere(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            response = await super().complete(request)
+            return ClaudeResponse(
+                text=response.text,
+                usage=response.usage,
+                model="claude-opus-4-9",
+                served_by_fallback=True,
+            )
+
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        claude_factory=lambda settings, model, purpose: Elsewhere(
+            handler=lambda r: EXTRACTED if purpose == "extract" else PICK, model=model
+        ),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    assert out.model == "claude-opus-4-9" and out.requested_model == OPUS
+    assert out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == "claude-opus-4-9"
+    # Nothing substitutes silently: the model nobody asked for is a recorded departure.
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "extract", "from": OPUS, "to": "claude-opus-4-9", "reason": "refused"},
+        {"stage": "select", "from": OPUS, "to": "claude-opus-4-9", "reason": "refused"},
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 declined this text; this ran on claude-opus-4-9.",
+        "Claude Opus 5.5 declined this text; the pick for e1 ran on claude-opus-4-9.",
+    ]
+    assert service.display_name("claude-opus-4-9") == "claude-opus-4-9"
+    assert service.display_name(OPUS) == "Claude Opus 5.5"
+    assert service.display_name("qwen/qwen3.7-flash") == "qwen/qwen3.7-flash through OpenRouter"
+
+
+def test_a_server_side_fallback_is_recorded_once_per_stage_and_model(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    """Three picks answered from the same substitute are one departure; the step that
+    was asked is named even after the chain has stepped down in between; and a model
+    name OpenRouter reports differently is not a refusal."""
+
+    class Elsewhere(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            response = await super().complete(request)
+            return ClaudeResponse(
+                text=response.text,
+                usage=response.usage,
+                model=self.served,
+                served_by_fallback=self.model == SONNET,
+            )
+
+    def served(model: str, handler: Any, as_: str) -> FakeLLM:
+        llm = Elsewhere(handler=handler, model=model)
+        llm.served = as_  # type: ignore[attr-defined]
+        return llm
+
+    text = "haloperidol, ketamine and aspirin."
+    three = _answer(("haloperidol", "chemical", 0, 11), ("ketamine", "chemical", 13, 21))
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+
+    def claude(settings: Settings, model: str, purpose: str) -> FakeLLM:
+        if purpose == "extract":
+            return FakeLLM([three], model=model)
+        if model == OPUS:
+            return FakeLLM([_failing("rate_limited", retryable=True)], model=model)
+        return served(model, lambda r: PICK, "claude-sonnet-4-9")
+
+    chain = service.make_chain(s, OPUS, claude_factory=claude)
+    out = asyncio.run(
+        run(NerRequest(text=text), settings=s, llm=chain, select_llm=chain, indexes=bm25_only)
+    )
+    assert out.model == OPUS
+    assert {e.pick.selector for e in out.entities if e.pick} == {"claude-sonnet-4-9"}
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": OPUS, "to": SONNET, "reason": "rate_limited"},
+        {"stage": "select", "from": SONNET, "to": "claude-sonnet-4-9", "reason": "refused"},
+    ]
+    assert out.notices == [
+        "Claude Opus 5.5 is rate limited; moved on to Claude Sonnet 5.5.",
+        "Claude Sonnet 5.5 declined this text; the picks for e1, e2 ran on claude-sonnet-4-9.",
+    ]
+
+    # The OpenRouter step: whatever name its answer carries, nothing was refused.
+    plain = service.make_chain(
+        s,
+        OPUS,
+        start=2,
+        claude_factory=claude,
+        llm_factory=lambda st, m: served(m, lambda r: three, "google/gemini-3.1-flash-lite-001"),
+        select_factory=lambda st, m: served(m, lambda r: PICK, "google/gemini-3.1-flash-lite-001"),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=text), settings=s, llm=plain, select_llm=plain, indexes=bm25_only)
+    )
+    assert out.model == "google/gemini-3.1-flash-lite-001"
+    assert out.fallbacks == [] and out.notices == []
+
+
+def test_admission_step_downs_lead_the_fallbacks_and_have_their_sentences(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    from ner_site import fallback
+    from ner_site.schema import FallbackNote
+
+    def admit(reason: str, to: str = SONNET, start: int = 1, **kw: Any) -> NerResponse:
+        note = FallbackNote(stage="admit", from_=OPUS, to=to, reason=reason)
+        return _run_chain(tmp_path, bm25_only, _Fakes(), start=start, admitted=[note], **kw)
+
+    used = admit("opus_allowance_used")
+    assert used.model == SONNET and used.requested_model == OPUS
+    assert used.fallbacks[0].model_dump(mode="json") == {
+        "stage": "admit",
+        "from": OPUS,
+        "to": SONNET,
+        "reason": "opus_allowance_used",
+    }
+    assert used.notices == [
+        "Your Opus allowance for this hour is used; this ran on Claude Sonnet 5.5."
+    ]
+    assert admit("limits_unavailable").notices == [
+        "Visitor limits are unavailable; this ran on Claude Sonnet 5.5."
+    ]
+    # The reason is the one the caller read at admission, not the process's block now.
+    fallback.block_claude("key_refused")
+    blocked = admit("claude_unavailable", to=GEMINI, start=2, claude_blocked="balance_exhausted")
+    assert blocked.model == GEMINI and blocked.notices == [
+        "Claude is unavailable (balance exhausted); this ran on Gemini 3.1 Flash Lite "
+        "through OpenRouter."
+    ]
+    unnamed = admit("claude_unavailable", to=GEMINI, start=2)
+    assert unnamed.notices == [
+        "Claude is unavailable; this ran on Gemini 3.1 Flash Lite through OpenRouter."
+    ]
+    for notice in [*used.notices, *blocked.notices]:
+        assert "—" not in notice and notice.endswith(".")
+
+
+def test_a_different_claude_selector_runs_on_the_requests_chain_and_says_so(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes()
+    out = _run_chain(
+        tmp_path,
+        bm25_only,
+        fakes,
+        request=NerRequest(text=TEXT, model=OPUS, selector=SONNET),
+    )
+    assert out.requested_selector == SONNET and out.entities[0].pick is not None
+    assert out.entities[0].pick.selector == OPUS
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": SONNET, "to": OPUS, "reason": "follows_extraction"}
+    ]
+    assert out.notices == [
+        "Selection uses the model that extracted; the picks ran on Claude Opus 5.5."
+    ]
+    # Already on the selector's model (Opus stepped down while extracting): nothing to say.
+    down = _Fakes(opus_extract=[_failing("rate_limited", retryable=True)])
+    out = _run_chain(
+        tmp_path, bm25_only, down, request=NerRequest(text=TEXT, model=OPUS, selector=SONNET)
+    )
+    assert [f.reason for f in out.fallbacks] == ["rate_limited"]
+
+
+def test_a_claude_selector_after_an_openrouter_extraction_has_its_own_chain(
+    tmp_path: Path, bm25_only: Any
+) -> None:
+    fakes = _Fakes(sonnet_select=[_failing("overloaded", retryable=True)])
+    s = _settings(tmp_path, **BOTH_KEYS)
+    chain = fakes.chain(s, SONNET, purposes=("select",))
+    out = asyncio.run(
+        run(
+            NerRequest(text=TEXT, model=GEMINI, selector=SONNET),
+            settings=s,
+            llm=FakeLLM([EXTRACTED], model=GEMINI),
+            select_llm=chain,
+            indexes=bm25_only,
+        )
+    )
+    assert out.model == GEMINI and out.requested_selector == SONNET
+    assert out.entities[0].pick is not None and out.entities[0].pick.selector == GEMINI
+    assert [f.model_dump(mode="json") for f in out.fallbacks] == [
+        {"stage": "select", "from": SONNET, "to": GEMINI, "reason": "overloaded"}
+    ]
+    assert out.usage.llm_calls == 1 and out.usage.selector_calls == 2
+
+
+def test_the_claude_key_check_is_remembered_per_key(tmp_path: Path) -> None:
+    import anthropic
+
+    calls: list[str] = []
+
+    class Models:
+        def __init__(self, error: Exception | None = None) -> None:
+            self.error = error
+
+        def retrieve(self, model: str, **kw: Any) -> None:
+            calls.append(model)
+            if self.error is not None:
+                raise self.error
+
+    class SDK:
+        def __init__(self, error: Exception | None = None) -> None:
+            self.models = Models(error)
+
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    assert service.check_claude_key(_settings(tmp_path), client=SDK()) is None
+    assert service.check_claude_key(s, client=SDK()) == service.RetrieverStatus(status="ok")
+    assert service.check_claude_key(s, client=SDK()) is not None and len(calls) == 1
+    service.reset_key_check()
+    refused = anthropic.AuthenticationError(
+        f"invalid x-api-key {ANTHROPIC_KEY}",
+        response=httpx.Response(401, request=httpx.Request("GET", "https://api.anthropic.com")),
+        body=None,
+    )
+    status = service.check_claude_key(s, client=SDK(refused))
+    assert status == service.RetrieverStatus(status="unavailable", reason="key refused")
+    assert service.check_claude_key(s, client=SDK()) == status and len(calls) == 2
+
+
+def test_a_claude_key_check_that_could_not_be_completed_is_not_an_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Like :func:`check_key` for OpenRouter: Anthropic being unreachable, or answering
+    5xx, says nothing about the key. It is ``ok`` with a reason, and asked again sooner
+    than a key that was accepted."""
+    import anthropic
+
+    request = httpx.Request("GET", "https://api.anthropic.com/v1/models/claude-opus-5-5")
+    down = anthropic.APIConnectionError(message=f"no route with {ANTHROPIC_KEY}", request=request)
+    broken = anthropic.InternalServerError(
+        f"boom {ANTHROPIC_KEY}", response=httpx.Response(503, request=request), body=None
+    )
+
+    class SDK:
+        def __init__(self, error: Exception | None) -> None:
+            self.models = self
+            self.error = error
+
+        def retrieve(self, model: str, **kw: Any) -> None:
+            if self.error is not None:
+                raise self.error
+
+    clock = [1000.0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock[0])
+    s = _settings(tmp_path, ANTHROPIC_API_KEY=ANTHROPIC_KEY)
+    for error, words in ((down, "unreachable"), (broken, "HTTP 503")):
+        service.reset_key_check()
+        status = service.check_claude_key(s, client=SDK(error))
+        assert status is not None and status.status == "ok"
+        assert status.reason is not None and "key not checked" in status.reason
+        assert words in status.reason and ANTHROPIC_KEY not in status.reason
+    # Remembered only as long as a refusal, so the next look asks Anthropic again.
+    clock[0] += service.KEY_REFUSED_TTL_S + 1
+    assert service.check_claude_key(s, client=SDK(None)) == service.RetrieverStatus(status="ok")
+
+
+@pytest.mark.parametrize("field", ["opus_per_day", "sonnet_per_day", "own_per_hour", "own_per_day"])
+def test_new_allowance_settings(field: str) -> None:
+    name = "NER_SITE_" + field.upper()
+    assert name in service.ENV_NAMES
+    for value in (0, 9999, 10000):
+        assert getattr(Settings.from_env({name: str(value)}).allowance, field) == value
+    for value in ("-1", "10001", "3.2"):
+        with pytest.raises(SettingsError, match=name):
+            Settings.from_env({name: value})
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("NER_SITE_OWN_PROVIDERS", "openai,site"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "gpt-6-luna,"),
+        ("NER_SITE_OWN_MODELS_OPENROUTER", ","),
+        ("NER_SITE_OWN_MODELS_ANTHROPIC", "openai/gpt-6-luna"),
+        ("NER_SITE_OWN_MODELS_ANTHROPIC", "claude-invented"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "jev"),
+        ("NER_SITE_OWN_MODELS_OPENAI", "retrieval"),
+    ],
+)
+def test_invalid_own_settings(name: str, value: str) -> None:
+    assert name in service.ENV_NAMES
+    with pytest.raises(SettingsError, match=name):
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": ALL_OWN, name: value})
+
+
+def test_own_models_resolve_per_provider_at_validation() -> None:
+    s = Settings.from_env(
+        {"NER_SITE_OWN_PROVIDERS": "openai", "NER_SITE_OWN_MODELS_OPENAI": " second, first,second "}
+    )
+    req = validate_request(NerRequest(provider="openai", text="sample"), s)
+    assert (req.model, req.selector, req.provider) == ("second", "retrieval", "openai")
+    for options, code in (
+        ({"model": GEMINI}, "unknown_model"),
+        ({"selector": "jev"}, "unknown_selector"),
+    ):
+        with pytest.raises(ServiceError) as exc:
+            validate_request(NerRequest(provider="openai", text="sample", **options), s)
+        assert exc.value.code == code
+    # Own keys alone make the database (their flood limit) part of the deployment.
+    assert Settings.from_env({"DATABASE_URL": DB_URL}).database_url is None
+    listed = {"NER_SITE_OWN_PROVIDERS": "openai", "DATABASE_URL": DB_URL}
+    assert Settings.from_env(listed).database_url == DB_URL
+
+
+@pytest.mark.parametrize(
+    "kind,code,status",
+    [
+        ("key_refused", "provider_key_refused", 401),
+        ("rate_limited", "provider_rate_limited", 429),
+        ("call_limit", "provider_error", 502),
+        ("timeout", "provider_error", 502),
+    ],
+)
+def test_own_extraction_failures_are_fixed(
+    kind: str, code: str, status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xwalk.llm.budget import CallLimitExceeded
+
+    class Fails(FakeLLM):
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            if kind == "timeout":
+                await asyncio.sleep(10)
+            if kind == "call_limit":
+                raise CallLimitExceeded("unsafe upstream detail")
+            raise _failing(kind, "unsafe upstream detail")
+
+    monkeypatch.setattr(service, "EXTRACT_TIMEOUT_S", 0.02)
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(
+            run(
+                NerRequest(text="x", provider="openai"),
+                settings=Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai"}),
+                indexes={},
+                llm=Fails([]),
+            )
+        )
+    assert (exc.value.code, exc.value.status) == (code, status)
+    assert exc.value.message.startswith("OpenAI ") and "unsafe" not in exc.value.message
+    if status == 502:
+        assert exc.value.message == f"OpenAI could not complete the request ({kind})."
+
+
+@pytest.mark.parametrize("flag,answered", [(True, SONNET), (False, "claude-opus-5-5-echo")])
+def test_only_the_adapter_signal_produces_a_server_notice(
+    flag: bool, answered: str, tmp_path: Path, bm25_only: Any
+) -> None:
+    class Echo(FakeLLM):
+        async def complete(self, request: LLMRequest) -> ClaudeResponse:
+            response = await super().complete(request)
+            return ClaudeResponse(
+                text=response.text, usage=response.usage, model=answered, served_by_fallback=flag
+            )
+
+    s = _settings(tmp_path, **BOTH_KEYS, NER_SITE_SELECTOR=OPUS)
+    chain = service.make_chain(
+        s,
+        OPUS,
+        claude_factory=lambda st, m, purpose: Echo(
+            [EXTRACTED if purpose == "extract" else PICK], model=m
+        ),
+    )
+    out = asyncio.run(
+        run(NerRequest(text=TEXT), settings=s, indexes=bm25_only, llm=chain, select_llm=chain)
+    )
+    assert [n.stage for n in out.fallbacks] == (["extract", "select"] if flag else [])
+    assert out.model == answered and out.entities[0].pick.selector == answered
+    assert len(out.notices) == (2 if flag else 0)
+
+
+# --- own keys are off unless providers are listed (final review, A1 to A4) -------------
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", ",", " , ,"])
+def test_own_keys_are_off_unless_providers_are_listed(value: str | None) -> None:
+    env = {} if value is None else {"NER_SITE_OWN_PROVIDERS": value}
+    assert Settings.from_env(env).own_providers == ()
+    assert Settings().own_providers == ()
+    assert not service.uses_database(env)
+    with pytest.raises(ServiceError) as exc:
+        validate_request(NerRequest(provider="openai", text="sample"), Settings.from_env(env))
+    assert (exc.value.status, exc.value.code) == (400, "bad_credential")
+
+
+@pytest.mark.parametrize("database", ["mysql://u:p@h/db", "not a url", "file:./dev.db"])
+def test_an_openrouter_passcode_deployment_does_not_read_the_database_url(database: str) -> None:
+    """What ran before own keys: only the OpenRouter key, a passcode and the bundled
+    backend. A platform integration may have put anything in ``DATABASE_URL``."""
+    env = {
+        "OPENROUTER_API_KEY": SENTINEL_KEY,
+        "NER_SITE_PASSCODE": "correct horse",
+        "NER_SITE_MODELS": "google/gemini-3.1-flash-lite,openai/gpt-6-luna",
+        "NER_SITE_SELECTORS": "jev,google/gemini-3.1-flash-lite",
+        "DATABASE_URL": database,
+    }
+    s = Settings.from_env(env)
+    assert s.database_url is None and s.own_providers == ()
+    assert not service.uses_database(env)
+    assert database not in s.secrets()
+
+
+@pytest.mark.parametrize(
+    ("raw", "enabled"),
+    [
+        ("Anthropic, openrouter,", ("anthropic", "openrouter")),
+        (" OPENAI ", ("openai",)),
+        ("openai,,OpenAI,anthropic", ("openai", "anthropic")),
+    ],
+)
+def test_own_providers_are_parsed_tolerantly(raw: str, enabled: tuple[str, ...]) -> None:
+    env = {"NER_SITE_OWN_PROVIDERS": raw}
+    assert tuple(p.id for p in Settings.from_env(env).own_providers) == enabled
+    assert service.uses_database(env)
+
+
+@pytest.mark.parametrize("raw", ["openai,site", "Anthropic,bogus", "all"])
+def test_an_unknown_own_provider_is_still_refused(raw: str) -> None:
+    with pytest.raises(SettingsError, match="NER_SITE_OWN_PROVIDERS"):
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": raw})
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_own_model_list_is_unset(value: str) -> None:
+    # With own keys off (Vercel keeps a variable that was emptied), and with them on.
+    assert Settings.from_env({"NER_SITE_OWN_MODELS_OPENAI": value}).own_providers == ()
+    s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", "NER_SITE_OWN_MODELS_OPENAI": value})
+    assert s.own_providers[0].models == ("gpt-6-luna",)
+
+
+def test_only_enabled_providers_have_their_model_lists_validated() -> None:
+    bad = {"NER_SITE_OWN_MODELS_ANTHROPIC": "claude-invented", "NER_SITE_OWN_MODELS_OPENAI": "jev"}
+    assert Settings.from_env(bad).own_providers == ()
+    s = Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openrouter", **bad})
+    assert [p.id for p in s.own_providers] == ["openrouter"]
+    with pytest.raises(SettingsError, match="NER_SITE_OWN_MODELS_OPENAI"):
+        Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", **bad})
+
+
+# --- site analytics: the stats passcode (design 2026-11-18, sections 3.1 and 6) --------
+
+STATS_PASSCODE = "stats-SENTINEL-passcode-7781"
+
+
+def test_the_stats_passcode_is_off_by_default_and_a_scrubbed_secret_when_set() -> None:
+    assert Settings().stats_passcode is None
+    for env in ({}, {"NER_SITE_STATS_PASSCODE": ""}, {"NER_SITE_STATS_PASSCODE": "   "}):
+        s = Settings.from_env(env)
+        assert s.stats_passcode is None and s.database_url is None
+        assert not service.uses_database(env)
+    s = Settings.from_env({"NER_SITE_STATS_PASSCODE": f"  {STATS_PASSCODE} "})
+    assert s.stats_passcode == STATS_PASSCODE
+    assert STATS_PASSCODE in s.secrets() and STATS_PASSCODE not in repr(s)
+    assert service.scrub(f"given {STATS_PASSCODE}", s) == "given [redacted]"
+    assert "NER_SITE_STATS_PASSCODE" in service.ENV_NAMES
+
+
+@pytest.mark.parametrize(
+    "value", ["short", "sixteen-chars-00", "twenty-three-chars-0000", "x" * 23]
+)
+def test_a_stats_passcode_shorter_than_twenty_four_characters_is_refused(value: str) -> None:
+    """Nothing limits guesses at ``/api/stats``, so the passcode has to be a generated
+    secret (``openssl rand -hex 24``), not a phrase."""
+    assert service.MIN_STATS_PASSCODE_CHARS == 24
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": value})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "24" in str(exc.value)
+    assert "openssl rand -hex 24" in str(exc.value)
+    assert value not in str(exc.value)
+    assert Settings.from_env({"NER_SITE_STATS_PASSCODE": "x" * 24}).stats_passcode == "x" * 24
+
+
+def test_a_stats_passcode_must_be_ascii_like_the_visitor_passcode() -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": "pässwort-geheim-lang-genug"})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "ASCII" in str(exc.value)
+    assert "geheim" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["bare", "openrouter_only", "offline"],
+)
+def test_the_stats_passcode_makes_the_database_url_read(env: dict[str, str]) -> None:
+    """Recording needs the database on any deployment, so the rule for when
+    ``DATABASE_URL`` is read gains exactly this case and no other."""
+    assert not service.uses_database({**env, "DATABASE_URL": DB_URL})
+    assert Settings.from_env({**env, "DATABASE_URL": DB_URL}).database_url is None
+    on = {**env, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE, "DATABASE_URL": DB_URL}
+    assert service.uses_database(on)
+    s = Settings.from_env(on)
+    assert s.database_url == DB_URL and DB_URL in s.secrets()
+    # Bundled indexes still never see the database.
+    assert s.index_settings().database_url is None
+    # Set without a database: the settings are still good; recording has nowhere to go.
+    assert Settings.from_env({**on, "DATABASE_URL": ""}).database_url is None
+
+
+UNUSABLE_URLS = [
+    "mysql://u:p@h/db",
+    "https://ep-x.neon.tech/sql",
+    "postgresql://[half-a-bracket/db",
+    "postgresql://owner:pw@[::1/db",
+    "postgresql:///no-host",
+    "postgres://",
+    "ep-x-pooler.neon.tech",
+    "postgresql",
+    # A port the URL parser only looks at when it is asked for one.
+    "postgresql://owner:retrieval@ep-x.neon.tech:abc/db",
+    "postgresql://owner:pw@ep-x.neon.tech:99999/db",
+    "postgresql://owner:pw@ep-x.neon.tech:-1/db",
+    "postgresql://owner:pw@ep-x.neon.tech:54 32/db",
+    "postgresql://owner:pw@ep x.neon.tech/db",
+    "postgresql://owner:pw@ep-x.neon.tech\n/db",
+    # Host names that are not names: an empty label, a label of 64 characters, a
+    # hyphen at an end of one, two dots at the end, and addresses (Neon hosts are names).
+    "postgresql://owner:retrieval@db..example/db",
+    "postgresql://owner:retrieval@" + "a" * 64 + ".example/db",
+    "postgresql://owner:pw@-db.example/db",
+    "postgresql://owner:pw@db-.example/db",
+    "postgresql://owner:pw@db.example../db",
+    "postgresql://owner:pw@.db.example/db",
+    "postgresql://owner:pw@db_x.example/db",
+    "postgresql://owner:pw@" + ".".join(["a" * 63] * 4) + "/db",
+    "postgresql://owner:pw@[::1]/db",
+    "postgresql://owner:pw@[2001:db8::7]:5432/db",
+    "postgresql://owner:pw@127.0.0.1/db",
+    "postgresql://owner:pw@127.0.0.1:5432/db",
+    # An address with a dot at its end, in the short forms a resolver takes, as one
+    # number, in hexadecimal; a name that ends in a number is read as one too.
+    "postgresql://owner:retrieval@127.0.0.1./db",
+    "postgresql://owner:retrieval@127.1/db",
+    "postgresql://owner:pw@127.1./db",
+    "postgresql://owner:pw@2130706433/db",
+    "postgresql://owner:pw@0x7f.0.0.1/db",
+    "postgresql://owner:pw@0x7f000001/db",
+    "postgresql://owner:pw@db.example.123/db",
+    # Anything in brackets, also what is no address.
+    "postgresql://owner:retrieval@[v1.example.]/db",
+    "postgresql://owner:pw@[db.example]/db",
+    "postgresql://owner:pw@[::ffff:127.0.0.1]/db",
+    # A credential that cannot travel in a header.
+    "postgresql://owner:p\u00e4ss@ep-x.neon.tech/db",
+]
+USABLE_URLS = [
+    "postgresql://owner:pw@ep-x-pooler.c-1.eu.aws.neon.tech/neondb?sslmode=require",
+    "postgres://owner:pw@db.example./db",
+    "postgresql://owner:pw@DB.Example:5432/db",
+    "postgresql://owner:pw@" + "a" * 63 + ".example/db",
+    "postgresql://owner:pw@localhost/db",
+    "postgresql://owner:pw@1.example/db",
+    "postgresql://owner:pw@123.example.com./db",
+    "postgresql://owner:pw@0x7f.example/db",
+    "postgresql://ep-x.neon.tech",
+]
+
+
+@pytest.mark.parametrize("url", UNUSABLE_URLS)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+        {
+            "NER_SITE_OFFLINE": "1",
+            "ANTHROPIC_API_KEY": "sk-ant-x",
+            "NER_SITE_OWN_PROVIDERS": "openai",
+        },
+    ],
+    ids=["bare", "openrouter_only", "offline", "offline_with_the_rest"],
+)
+def test_a_database_url_only_analytics_reads_cannot_break_the_settings(
+    env: dict[str, str], url: str
+) -> None:
+    """Where the stats passcode is the one reason ``DATABASE_URL`` is read, the site
+    ignored that variable until analytics was turned on. A value it cannot use must
+    then mean "no statistics", not a site that answers 503 everywhere."""
+    off = Settings.from_env({**env, "DATABASE_URL": url})
+    on = Settings.from_env({**env, "DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert on.database_url is None and on.stats_passcode == STATS_PASSCODE
+    assert dataclasses.replace(on, stats_passcode=None) == off
+    # Nothing of a URL that is not kept is a secret to scrub: a password that is also
+    # an ordinary word of the answers ("retrieval") would otherwise be redacted in them.
+    assert set(on.secrets()) - {STATS_PASSCODE} == set(off.secrets())
+    assert url not in on.secrets() and "retrieval" not in on.secrets()
+
+
+def test_a_usable_analytics_database_url_may_name_a_port() -> None:
+    url = "postgresql://owner:pw@ep-x.neon.tech:5432/db"
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url
+
+
+@pytest.mark.parametrize("url", USABLE_URLS)
+def test_an_analytics_database_url_with_an_ordinary_host_name_is_kept(url: str) -> None:
+    """Also one with a dot at its end, which is a name like any other."""
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url and url in s.secrets()
+
+
+@pytest.mark.parametrize(
+    "url", ["mysql://u:p@h/db", "https://ep-x.neon.tech/sql", "ep-x.neon.tech"]
+)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"NER_SITE_BACKEND": "neon"},
+        {"ANTHROPIC_API_KEY": "sk-ant-x"},
+        {"NER_SITE_OWN_PROVIDERS": "openai"},
+        {"NER_SITE_BACKEND": "neon", "NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["neon", "claude", "own_keys", "neon_offline"],
+)
+def test_a_database_url_the_site_needs_for_more_is_checked_as_strictly_as_before(
+    env: dict[str, str], url: str
+) -> None:
+    for extra in ({}, {"NER_SITE_STATS_PASSCODE": STATS_PASSCODE}):
+        with pytest.raises(SettingsError, match="DATABASE_URL") as exc:
+            Settings.from_env({**env, **extra, "DATABASE_URL": url})
+        assert url not in str(exc.value)

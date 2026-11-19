@@ -46,6 +46,20 @@ Binding: docs/ner-site/PLAN.md section 3. Every response model serialises with
     ``usage`` also carries ``selector_calls``, ``selector_prompt_tokens``,
     ``selector_completion_tokens`` and ``selector_cost_usd`` (PLAN.md section 13).
 
+Additions of 18 November 2026 (docs/superpowers/specs/
+2026-11-18-claude-provider-open-access-design.md section 6). The 200 response also
+carries what was asked for and every departure from it::
+
+    "requested_model": "claude-opus-5-5", "requested_selector": "claude-opus-5-5",
+    "fallbacks": [{"stage": "extract", "from": "claude-opus-5-5",
+                   "to": "claude-sonnet-5-5", "reason": "rate_limited"}],
+    "notices": ["Claude Opus 5.5 is rate limited; this ran on Claude Sonnet 5.5."]
+
+``model`` is then the model that produced the extraction and each ``pick.selector`` the
+model that made that pick. ``provider`` and ``credential_source`` identify who paid for
+the model calls. Health advertises own providers and reports balances in ``visitor``
+where the site meters Claude. ``ner_site.http`` adds the operator key probes.
+
 Token counts are ``null`` when the provider did not report them, never 0.
 
 Error envelope (see :meth:`ServiceError.envelope`)::
@@ -56,10 +70,17 @@ Error envelope (see :meth:`ServiceError.envelope`)::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, SerializerFunctionWrapHandler, model_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 EntityType = Literal["chemical", "disease", "gene", "food", "other"]
 ENTITY_TYPES: tuple[EntityType, ...] = ("chemical", "disease", "gene", "food", "other")
@@ -159,9 +180,42 @@ class NerRequest(BaseModel):
     model: str | None = None
     top_k: int = 5
     selector: str | None = None
+    provider: str | None = None
+
+
+class FallbackNote(BaseModel):
+    """One departure from the requested model. ``stage`` is ``admit`` (decided before
+    any call: the visitor's allowance, the limiter, a Claude that is known to be
+    unavailable), ``extract`` or ``select``. ``reason`` is a machine string
+    (``rate_limited``, ``opus_allowance_used`` ...); the sentence for the visitor is in
+    ``NerResponse.notices``. ``from_`` is ``"from"`` on the wire (a Python keyword)."""
+
+    stage: str
+    from_: str
+    to: str
+    reason: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_off_the_wire(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "from" in data:
+            return {("from_" if key == "from" else key): value for key, value in data.items()}
+        return data
+
+    @model_serializer(mode="plain")
+    def _from_on_the_wire(self) -> dict[str, str]:
+        return {"stage": self.stage, "from": self.from_, "to": self.to, "reason": self.reason}
 
 
 class NerResponse(BaseModel):
+    """``model`` is the model that produced the extraction; ``requested_model`` and
+    ``requested_selector`` are what was asked for, defaults resolved (empty only in
+    responses written before those fields existed).
+
+    ``selector`` is the selector the request asked for, the same value as
+    ``requested_selector``, kept for pages written before that field; the model that
+    made each pick is ``entities[].pick.selector``."""
+
     ok: Literal[True] = True
     model: str
     mode: Mode
@@ -171,6 +225,12 @@ class NerResponse(BaseModel):
     warnings: list[str]
     usage: Usage
     timing_ms: dict[str, int]
+    requested_model: str = ""
+    requested_selector: str = ""
+    fallbacks: list[FallbackNote] = []
+    notices: list[str] = []
+    provider: str = "site"
+    credential_source: Literal["site", "visitor"] = "site"
 
 
 class OntologySummary(BaseModel):
@@ -178,6 +238,36 @@ class OntologySummary(BaseModel):
     name: str
     type: EntityType
     count: int
+
+
+class OwnProvider(BaseModel):
+    """The models a visitor's key may use, in the operator's configured order."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    models: list[str]
+    default_model: str
+
+
+class OwnKeys(BaseModel):
+    enabled: bool
+    providers: list[OwnProvider]
+
+
+class VisitorStatus(BaseModel):
+    limits: Literal["on", "off", "unavailable"]
+    tier: Literal["opus", "sonnet", "blocked"]
+    opus_left: int | None = None
+    sonnet_left: int | None = None
+    resets_in_s: int | None = None
+    opus_left_today: int | None = None
+    sonnet_left_today: int | None = None
+    own_left: int | None = None
+    own_left_today: int | None = None
+    day_resets_in_s: int | None = None
+    window: Literal["hour", "day"] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -192,6 +282,16 @@ class HealthResponse(BaseModel):
     retrieval: dict[str, RetrieverStatus]
     selectors: list[str] = ["retrieval"]
     default_selector: str = "retrieval"
+    own_keys: OwnKeys | None = None
+    visitor: VisitorStatus | None = None
+
+    @model_serializer(mode="wrap")
+    def _optional_sections(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        for name in ("own_keys", "visitor"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
 
 @dataclass(frozen=True)
@@ -220,11 +320,26 @@ class ServiceError(Exception):
     visitor's text in it.
     """
 
-    def __init__(self, code: str, message: str, *, status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        # Response headers that belong to the failure (``Retry-After`` on a 429).
+        self.headers: dict[str, str] = dict(headers or {})
+        # For a failure on a visitor's own key: the class name of what failed, for the
+        # request's log line only (``providers.provider_error``). Never sent.
+        self.own_error: str | None = None
+        # For a failure of the model calls: what they are known to have used (an
+        # ``xwalk.records.Usage``), for the record of runs only. Never sent.
+        self.usage: Any = None
 
     def envelope(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message}}

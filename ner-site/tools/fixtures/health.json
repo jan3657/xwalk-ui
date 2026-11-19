@@ -1,12 +1,21 @@
 {
   "ok": true,
   "mode": "live",
-  "default_model": "openai/gpt-4o-mini",
+  "default_model": "claude-opus-5-5",
   "models": [
-    "openai/gpt-4o-mini",
-    "google/gemini-2.5-flash-lite",
-    "qwen/qwen3-next-80b-a3b-instruct"
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
   ],
+  "selectors": [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "jev",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
+  ],
+  "default_selector": "claude-opus-5-5",
   "limits": {
     "max_chars": 5000,
     "max_prompt_chars": 4000,
@@ -48,5 +57,56 @@
     "dense": {
       "status": "ok"
     }
+  },
+  "llm": {
+    "status": "ok"
+  },
+  "claude": {
+    "status": "ok"
+  },
+  "visitor": {
+    "limits": "on",
+    "tier": "opus",
+    "opus_left": 7,
+    "sonnet_left": 20,
+    "resets_in_s": 1380,
+    "opus_left_today": 15,
+    "sonnet_left_today": 40,
+    "window": "hour",
+    "own_left": 30,
+    "own_left_today": 60,
+    "day_resets_in_s": 30180
+  },
+  "own_keys": {
+    "enabled": true,
+    "providers": [
+      {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "models": [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-haiku-5-5"
+        ],
+        "default_model": "claude-opus-5-5"
+      },
+      {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": [
+          "gpt-6-luna"
+        ],
+        "default_model": "gpt-6-luna"
+      },
+      {
+        "id": "openrouter",
+        "name": "OpenRouter",
+        "models": [
+          "google/gemini-3.1-flash-lite",
+          "openai/gpt-6-luna"
+        ],
+        "default_model": "google/gemini-3.1-flash-lite"
+      }
+    ]
   }
 }

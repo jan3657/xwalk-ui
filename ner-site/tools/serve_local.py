@@ -10,12 +10,61 @@ Usage (from the repository root, with the venv active)::
 ``--canned DIR`` answers from JSON fixtures and never imports ``ner_site``:
 ``GET /api/health`` -> ``health[-SCENARIO].json``; ``POST /api/ner`` ->
 ``ner[-SCENARIO].json``, or ``error.json`` with HTTP 400 when the posted text contains
-``ERROR`` (to exercise the error UI). Without ``--canned``, requests go through
+``ERROR`` (to exercise the error UI). A scenario needs at least one file of its own; the
+others fall back to the plain ``health.json`` / ``ner.json``. When
+``error-SCENARIO.json`` exists, POSTs are answered with it, with the HTTP status of its
+code (``CANNED_ERROR_STATUS``, otherwise 400): an error about the visitor's own key
+answers the own-key POSTs only, any other error the POSTs on the site's keys only, as
+the real API would. Scenarios in ``fixtures/``:
+
+- (none): Claude Opus 5.5 ran, the visitor is on the Opus allowance, own keys offered.
+- ``sonnet``: the hour's Opus allowance is used; requests start on Claude Sonnet 5.5.
+- ``blocked``: the hour's requests are used; every site-key POST answers 429.
+- ``day``: the day's requests are used; every site-key POST answers 429 (day wording).
+- ``unavailable``: the limiter cannot be consulted; every site-key POST answers 503
+  ``limits_unavailable``. Own-key POSTs still run.
+- ``own-refused``: the provider refuses the visitor's key (401 ``provider_key_refused``).
+- ``own-bad``: the API refuses the credential (400 ``bad_credential``).
+- ``own-off``: own keys turned off (``own_keys.enabled`` false).
+- ``fallback``: Opus stepped down mid-request (``fallbacks`` and ``notices`` set).
+- ``degraded``: offline mode, dense retrieval unavailable, and the response shape of
+  an API from before the Claude change (no ``claude``, ``visitor``, ``notices``,
+  ``own_keys``).
+
+``GET /api/stats`` (the private stats page at ``/stats``) is canned too. It wants the
+header ``X-Stats-Passcode: local-stats-passcode`` and answers 401 with
+``stats-error-required.json`` or ``stats-error-invalid.json`` without it. With it, the
+answer is the first of ``stats-SCENARIO-DAYS.json``, ``stats-SCENARIO.json``,
+``stats-DAYS.json`` and ``stats.json`` that exists (``DAYS`` from ``?days=``, 30 when
+absent): a populated answer for 7, 30 and 90 days by default. An error envelope there is
+answered with the status of its code (``stats_unavailable`` 503, ``not_found`` 404), and
+a 404 comes before the passcode check, as on a site with stats turned off. Stats
+scenarios:
+
+- ``empty``: stats are on and no run has been recorded yet.
+- ``nostats``: stats are off; ``/api/stats`` answers 404.
+- ``unavailable`` (also above): the database is down; ``/api/stats`` answers 503.
+
+Each canned ``/api/stats`` request is logged with whether it carried the passcode header
+(``stats_passcode=present`` or ``absent``, never its value).
+
+A POST whose body names an own-key ``provider`` is answered with ``ner-own.json`` (its
+``provider`` and model fields set from the request). As the real API does, the canned
+one answers 400 ``bad_credential`` when such a POST lacks a well-formed
+``Authorization: Bearer`` header or a POST on the site's keys carries one. Each canned
+API request is logged with whether it carried an ``Authorization`` header (``present``
+or ``absent``, never its value), which is how to check that only ``POST /api/ner`` does.
+
+Without ``--canned``, requests go through
 ``ner_site.http.handle`` exactly as the Vercel functions do; ``--offline`` sets
 ``NER_SITE_OFFLINE=1`` so the stand-in extractor replaces the LLM.
 
 The response headers from ``ner-site/vercel.json`` are added to every response, so the
-page runs under the same Content-Security-Policy locally as on Vercel.
+page runs under the same Content-Security-Policy locally as on Vercel, and its
+``rewrites`` are followed for static requests (``/stats`` serves ``stats.html``).
+Nothing answers ``/_vercel/insights/script.js``: it is a 404 here, as it is on Vercel
+until Web Analytics is enabled for the project, so the page is always tested with it
+missing.
 """
 
 from __future__ import annotations
@@ -31,7 +80,7 @@ from collections.abc import Callable
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 PROJECT = Path(__file__).resolve().parents[1]
 PUBLIC = PROJECT / "public"
@@ -39,7 +88,7 @@ VERCEL_JSON = PROJECT / "vercel.json"
 MAX_READ_BYTES = 1 << 20  # the service itself rejects bodies over 64 KB
 
 Response = tuple[int, dict[str, str], bytes]
-Backend = Callable[[str, str, dict[str, str], bytes], Response]
+Backend = Callable[[str, str, dict[str, str | list[str]], bytes], Response]
 HeaderRules = list[tuple[re.Pattern[str], list[tuple[str, str]]]]
 
 
@@ -63,18 +112,163 @@ def load_header_rules(path: Path = VERCEL_JSON) -> HeaderRules:
     return rules
 
 
+def load_rewrites(path: Path = VERCEL_JSON) -> dict[str, str]:
+    """``rewrites`` from vercel.json as exact source path -> destination path, which is
+    all this project uses (no patterns, no external destinations)."""
+    config: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return {str(r["source"]): str(r["destination"]) for r in config.get("rewrites", [])}
+
+
+# HTTP status for a canned error envelope, by error code; anything else answers 400.
+CANNED_ERROR_STATUS = {
+    "visitor_limit_reached": 429,
+    "bad_credential": 400,
+    "provider_key_refused": 401,
+    "provider_rate_limited": 429,
+    "provider_error": 502,
+    "limits_unavailable": 503,
+    "stats_passcode_required": 401,
+    "stats_passcode_invalid": 401,
+    "stats_unavailable": 503,
+    "not_found": 404,
+}
+# The passcode the canned /api/stats accepts. Not a secret: it opens fixture data only.
+CANNED_STATS_PASSCODE = "local-stats-passcode"
+# Errors about the visitor's own key: a scenario with one refuses the own-key POSTs and
+# lets the site-key ones through; a scenario with any other error does the opposite.
+OWN_KEY_ERRORS = frozenset(
+    {"bad_credential", "provider_key_refused", "provider_rate_limited", "provider_error"}
+)
+NEEDS_HEADER = (
+    "a request with your own API key needs exactly one Authorization header of the form "
+    "'Bearer <key>'"
+)
+BAD_KEY = "the API key must be 20 to 512 printable ASCII characters without spaces"
+# 20 to 512 printable ASCII characters without spaces, as the real API requires.
+BEARER = re.compile(r"Bearer ([\x21-\x7e]{20,512})", re.IGNORECASE | re.ASCII)
+
+
+def _load_fixture(file: Path) -> object:
+    return json.loads(file.read_text(encoding="utf-8"))
+
+
+def _error_code(envelope: object) -> str | None:
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _error_response(envelope: object, health: object) -> Response:
+    """The envelope with its code's status. ``Retry-After`` as the real API sends it:
+    the seconds to the reset health reports for a used allowance (the day's when the
+    day is the window), 30 for a limiter that cannot be consulted."""
+    code = _error_code(envelope)
+    response = _json_response(CANNED_ERROR_STATUS.get(code or "", 400), envelope)
+    if code == "visitor_limit_reached":
+        visitor = health.get("visitor") if isinstance(health, dict) else None
+        visitor = visitor if isinstance(visitor, dict) else {}
+        field = "day_resets_in_s" if visitor.get("window") == "day" else "resets_in_s"
+        seconds = visitor.get(field)
+        response[1]["Retry-After"] = str(seconds) if isinstance(seconds, int) else "1380"
+    elif code == "limits_unavailable":
+        response[1]["Retry-After"] = "30"
+    return response
+
+
+def _own_models(health: object) -> dict[str, list[str]]:
+    own = health.get("own_keys") if isinstance(health, dict) else None
+    if not isinstance(own, dict) or own.get("enabled") is not True:
+        return {}
+    providers = own.get("providers")
+    return {
+        p["id"]: p["models"]
+        for p in (providers if isinstance(providers, list) else [])
+        if isinstance(p, dict) and isinstance(p.get("id"), str) and p.get("models")
+    }
+
+
+def _own_result(template: object, request: dict[str, Any]) -> object:
+    """``ner-own.json`` saying what this request asked for: the provider and its models."""
+    if not isinstance(template, dict):
+        return template
+    result = dict(template)
+    result["provider"] = request["provider"]
+    result["credential_source"] = "visitor"
+    for field, names in (
+        ("model", ("model", "requested_model")),
+        ("selector", ("selector", "requested_selector")),
+    ):
+        if isinstance(request.get(field), str) and request[field]:
+            result.update(dict.fromkeys(names, request[field]))
+    return result
+
+
+def _canned_stats(
+    directory: Path, suffix: str, query: str, headers: dict[str, str | list[str]]
+) -> Response:
+    """``GET /api/stats`` from fixtures; see the module docstring for the order."""
+    days = parse_qs(query).get("days", ["30"])[-1]
+    days = days if re.fullmatch(r"[0-9]{1,3}", days) else "30"
+    names = [
+        f"stats{suffix}-{days}.json",
+        f"stats{suffix}.json",
+        f"stats-{days}.json",
+        "stats.json",
+    ]
+    answer = next((_load_fixture(directory / n) for n in names if (directory / n).is_file()), None)
+    code = _error_code(answer)
+    status = 200 if code is None else CANNED_ERROR_STATUS.get(code, 400)
+    if answer is None or status == 404:  # stats are off: nothing about a passcode
+        return _envelope(404, "not_found", "no such endpoint")
+    given = headers.get("x-stats-passcode")
+    if given != CANNED_STATS_PASSCODE:
+        kind = "required" if given is None else "invalid"
+        return _json_response(401, _load_fixture(directory / f"stats-error-{kind}.json"))
+    return _json_response(status, answer)
+
+
 def canned_backend(directory: Path, scenario: str) -> Backend:
     suffix = f"-{scenario}" if scenario else ""
-    names = (f"health{suffix}.json", f"ner{suffix}.json", "error.json")
-    fixtures: dict[str, object] = {}
-    for name in names:
-        file = directory / name
-        if not file.is_file():
-            raise SystemExit(f"serve_local: fixture {file} not found")
-        fixtures[name] = json.loads(file.read_text(encoding="utf-8"))
-    health, ner, error = (fixtures[n] for n in names)
+    scenario_files = [
+        directory / f"{kind}{suffix}.json" for kind in ("health", "ner", "error", "stats")
+    ]
+    if scenario and not any(file.is_file() for file in scenario_files):
+        raise SystemExit(f"serve_local: no fixture for scenario {scenario!r} in {directory}")
 
-    def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
+    def pick(kind: str) -> object:
+        """``KIND-SCENARIO.json`` when the scenario has one, else the plain ``KIND.json``."""
+        for file in (directory / f"{kind}{suffix}.json", directory / f"{kind}.json"):
+            if file.is_file():
+                return _load_fixture(file)
+        raise SystemExit(f"serve_local: fixture {directory / f'{kind}.json'} not found")
+
+    health, ner, error = pick("health"), pick("ner"), pick("error")
+    own_file = directory / "ner-own.json"
+    own_ner = _load_fixture(own_file) if own_file.is_file() else ner
+    own_models = _own_models(health)
+    # A scenario with an error file of its own refuses every POST of the kind the error
+    # is about (e.g. the 429 state for the site's keys, a refused key for an own key).
+    always_error = bool(scenario) and (directory / f"error{suffix}.json").is_file()
+    error_is_own = _error_code(error) in OWN_KEY_ERRORS
+
+    def backend(
+        method: str, path: str, headers: dict[str, str | list[str]], body: bytes
+    ) -> Response:
+        path, _, query = path.partition("?")
+        authorization = headers.get("authorization")
+        # Whether a credential came, never the credential.
+        seen = "absent" if authorization is None else "present"
+        stats_seen = "absent" if headers.get("x-stats-passcode") is None else "present"
+        print(
+            f"canned: {method} {path} authorization={seen}"
+            + (f" stats_passcode={stats_seen}" if path == "/api/stats" else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+        if path == "/api/stats":
+            if method != "GET":
+                return _method_not_allowed()
+            return _canned_stats(directory, suffix, query, headers)
         if path == "/api/health":
             return _json_response(200, health) if method == "GET" else _method_not_allowed()
         if path != "/api/ner":
@@ -87,10 +281,55 @@ def canned_backend(directory: Path, scenario: str) -> Backend:
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _envelope(400, "bad_json", "the request body is not valid JSON")
+        provider = request.get("provider") if isinstance(request, dict) else None
+        own = provider is not None and provider != "site"
+        known = isinstance(provider, str) and provider in own_models
+        if own and not known:
+            return _envelope(
+                400,
+                "bad_credential",
+                "own API keys are not available for that provider on this site",
+            )
+        if own:
+            value = authorization.strip(" \t") if isinstance(authorization, str) else ""
+            if not value.lower().startswith("bearer "):
+                return _envelope(400, "bad_credential", NEEDS_HEADER)
+            match = BEARER.fullmatch(value)
+            if match is None:
+                return _envelope(400, "bad_credential", BAD_KEY)
+            if any(
+                isinstance(request.get(f), str) and match[1] in request[f]
+                for f in ("text", "prompt")
+            ):
+                return _envelope(
+                    400,
+                    "bad_credential",
+                    "your API key also appears in the text or the prompt; "
+                    "remove it from there before running (and consider revoking that key)",
+                )
+            models = own_models[provider]
+            for field, choices in (("model", models), ("selector", ["retrieval", *models])):
+                if request.get(field) is None:
+                    request[field] = choices[0]
+                if request[field] not in choices:
+                    return _envelope(
+                        400,
+                        f"unknown_{field}",
+                        f"{field} is not offered; choose one of {', '.join(choices)}",
+                    )
+        if not own and authorization is not None:
+            return _envelope(
+                400,
+                "bad_credential",
+                "this request carries an API key but asks for the site's models; choose your "
+                "provider, or send no Authorization header",
+            )
+        if always_error and own == error_is_own:
+            return _error_response(error, health)
         text = request.get("text") if isinstance(request, dict) else None
         if isinstance(text, str) and "ERROR" in text:
             return _json_response(400, error)
-        return _json_response(200, ner)
+        return _json_response(200, _own_result(own_ner, request) if own else ner)
 
     return backend
 
@@ -117,7 +356,9 @@ def service_backend(*, offline: bool) -> Backend:
     handle: Callable[..., tuple[int, dict[str, str], bytes]] = http_mod.handle
     settings = service_mod.Settings.from_env(os.environ)
 
-    def backend(method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
+    def backend(
+        method: str, path: str, headers: dict[str, str | list[str]], body: bytes
+    ) -> Response:
         status, out_headers, out_body = handle(method, path, headers, body, settings=settings)
         return status, dict(out_headers), out_body
 
@@ -128,7 +369,12 @@ def make_handler(
     backend: Backend,
     rules: HeaderRules,
     delay: float,
+    rewrites: dict[str, str] | None = None,
 ) -> type[SimpleHTTPRequestHandler]:
+    """The backend is handed the path with its query string: the canned backend and the
+    real handler both read ``days`` from it (``GET /api/stats?days=7``)."""
+    rewrites = rewrites or {}
+
     class Handler(SimpleHTTPRequestHandler):
         server_version = "xwalk-ner-local"
         sys_version = ""
@@ -163,13 +409,23 @@ def make_handler(
                 self.close_connection = True
             else:
                 raw = self.rfile.read(length) if length > 0 else b""
-                lowered = {k.lower(): v for k, v in self.headers.items()}
+                lowered: dict[str, str | list[str]] = {
+                    k.lower(): self.headers[k] for k in self.headers if k.lower() != "authorization"
+                }
+                if method == "POST":
+                    auth = self.headers.get_all("Authorization", [])
+                    if auth:
+                        lowered["authorization"] = auth[0] if len(auth) == 1 else auth
                 if delay > 0 and method == "POST":
                     time.sleep(delay)
                 try:
-                    status, headers, body = backend(method, urlsplit(self.path).path, lowered, raw)
+                    parts = urlsplit(self.path)
+                    target = parts.path
+                    if parts.query:
+                        target += "?" + parts.query
+                    status, headers, body = backend(method, target, lowered, raw)
                 except Exception as exc:  # noqa: BLE001 - a local dev server reports and goes on
-                    self.log_error("backend raised %r", exc)
+                    self.log_error("backend raised %s", type(exc).__name__)
                     status, headers, body = _envelope(500, "internal", "internal error")
             self.send_response(status)
             for key, value in headers.items():
@@ -184,16 +440,24 @@ def make_handler(
             path = urlsplit(self.path).path
             return path == "/api" or path.startswith("/api/")
 
+        def _rewrite(self) -> None:
+            """A vercel.json rewrite: serve the destination file, keep the address."""
+            destination = rewrites.get(urlsplit(self.path).path)
+            if destination is not None:
+                self.path = destination
+
         def do_GET(self) -> None:
             if self._is_api():
                 self._api("GET")
             else:
+                self._rewrite()
                 super().do_GET()
 
         def do_HEAD(self) -> None:
             if self._is_api():
                 self._api("HEAD")
             else:
+                self._rewrite()
                 super().do_HEAD()
 
         def do_POST(self) -> None:
@@ -237,7 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--scenario",
         default="",
-        help="with --canned: use health-NAME.json and ner-NAME.json (e.g. 'degraded')",
+        help="with --canned: use the NAME fixtures (sonnet, blocked, day, unavailable, "
+        "own-refused, own-bad, own-off, fallback, degraded, empty, nostats)",
     )
     parser.add_argument(
         "--delay", type=float, default=0.0, help="seconds to wait before answering a POST"
@@ -257,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         backend = service_backend(offline=args.offline)
         mode = "ner_site.http" + (" (offline)" if args.offline else " (live)")
 
-    handler = make_handler(backend, load_header_rules(), args.delay)
+    handler = make_handler(backend, load_header_rules(), args.delay, load_rewrites())
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     except OSError as exc:

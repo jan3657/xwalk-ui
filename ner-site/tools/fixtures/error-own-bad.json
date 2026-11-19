@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "bad_credential",
+    "message": "the API key must be 20 to 512 printable ASCII characters without spaces"
+  }
+}

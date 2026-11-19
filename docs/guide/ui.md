@@ -67,7 +67,7 @@ retrievable at all. It is not a decision; the first candidate is the best text m
 - *Built in*: 200-term samples of ChEBI, FoodOn, the CTD disease vocabulary (MeSH/OMIM)
   and NCBI Gene, the slices the examples use (`scripts/build_ui_ontologies.py` makes
   them). They are marked *sample*: they are not the full ontologies.
-- *Imported*: an OBO, OWL (needs `xwalk[ontology]` at import time only), CSV, TSV or
+- *Imported*: an OBO, OWL (needs `xwalk-match[ontology]` at import time only), CSV, TSV or
   JSONL file, parsed once into `<root>/.xwalk-ui/library/<name>/terms.jsonl`.
 - *Downloaded*: any OBO Foundry ontology from the catalog (HPO, Mondo, DOID, GO, ChEBI,
   Uberon, CL, PATO, UO, ENVO by their permanent `purl.obolibrary.org` URLs; ChEBI from

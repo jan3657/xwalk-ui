@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "stats_unavailable",
+    "message": "the statistics cannot be read right now; try again shortly"
+  }
+}

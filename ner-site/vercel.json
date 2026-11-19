@@ -6,6 +6,7 @@
       "includeFiles": "{ner_site/**,indexes/**}"
     }
   },
+  "rewrites": [{ "source": "/stats", "destination": "/stats.html" }],
   "headers": [
     {
       "source": "/(.*)",

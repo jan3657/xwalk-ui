@@ -10,6 +10,8 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234338ca'/%3E%3Cpath d='M4 5l8 6M12 5l-8 6' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="app.css">
   <script src="app.js" defer></script>
+  <script src="analytics.js" defer></script>
+  <script src="/_vercel/insights/script.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#text">Skip to the text box</a>
@@ -57,10 +59,28 @@
         </div>
       </details>
 
+      <div class="run-with" id="run-with" hidden>
+        <div class="field">
+          <label for="provider">Run with</label>
+          <select id="provider"></select>
+        </div>
+        <div class="field key-field" id="own-key-field" hidden>
+          <label for="own-key" id="own-key-label">Your API key</label>
+          <div class="key-row">
+            <input id="own-key" type="password" autocomplete="off" spellcheck="false"
+              autocapitalize="off" autocorrect="off" data-1p-ignore data-lpignore="true"
+              aria-describedby="own-key-note">
+            <button type="button" id="forget-key" class="ghost">Forget key</button>
+          </div>
+        </div>
+        <p id="own-key-note" class="hint key-note" hidden></p>
+      </div>
+
       <div class="options">
         <div class="field" id="model-field">
           <label for="model">Extraction model</label>
-          <select id="model" name="model"></select>
+          <select id="model" name="model" aria-describedby="allowance"></select>
+          <p id="allowance" class="hint allowance" hidden></p>
         </div>
         <div class="field" id="selector-field" hidden>
           <label for="selector">Pick the match with</label>
@@ -73,6 +93,14 @@
         <div class="field" id="passcode-field" hidden>
           <label for="passcode">Passcode</label>
           <input id="passcode" name="passcode" type="password" autocomplete="current-password">
+        </div>
+      </div>
+
+      <div id="payer" class="payer" role="alert" hidden>
+        <p id="payer-message"></p>
+        <div class="button-row">
+          <button type="button" id="payer-retry" class="secondary" hidden>Try again</button>
+          <button type="button" id="payer-site" class="secondary">Use the site's models</button>
         </div>
       </div>
 
@@ -95,6 +123,11 @@
       <div class="results-head">
         <h2 id="results-heading">Results</h2>
         <p id="results-summary" class="summary" aria-live="polite"></p>
+        <p id="results-models" class="ran-on"></p>
+      </div>
+      <div id="notices" class="notices" role="note" aria-labelledby="notices-title" hidden>
+        <p id="notices-title" class="notices-title">About this run</p>
+        <ul id="notices-list"></ul>
       </div>
       <div class="panel">
         <p id="highlighted" class="highlighted"></p>
@@ -109,6 +142,11 @@
         Built with <a href="https://github.com/jan3657/xwalk">xwalk</a>. Text you submit is
         sent to the model provider for extraction and is not stored by this site.
       </p>
+      <p>
+        Requests are limited per visitor using a salted hash of your IP address, kept for
+        one day. Runs are counted without your text.
+      </p>
+      <p>This site counts visits without cookies.</p>
     </footer>
   </main>
 </body>

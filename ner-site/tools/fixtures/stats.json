@@ -1,0 +1,73 @@
+{
+  "ok": true,
+  "days": 30,
+  "generated_at": "2026-11-18T14:22:07Z",
+  "totals": {"runs": 262, "ok": 233, "errors": 29, "visitors": 104, "prompt_tokens": 701502, "completion_tokens": 122151, "estimated_usd": 3.436, "unpriced_runs": 8},
+  "by_day": [
+    {"day": "2026-10-20", "runs": 8, "ok": 7, "visitors": 3, "opus": 4, "sonnet": 3, "other": 0, "own": 1, "stepped_down": 1, "estimated_usd": 0.1194, "p50_ms": 6120, "p95_ms": 15482},
+    {"day": "2026-10-21", "runs": 11, "ok": 11, "visitors": 4, "opus": 8, "sonnet": 2, "other": 0, "own": 1, "stepped_down": 1, "estimated_usd": 0.1891, "p50_ms": 7927, "p95_ms": 17973},
+    {"day": "2026-10-22", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-10-23", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-10-24", "runs": 4, "ok": 4, "visitors": 2, "opus": 4, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0.0901, "p50_ms": 4821, "p95_ms": 6267},
+    {"day": "2026-10-25", "runs": 4, "ok": 4, "visitors": 2, "opus": 3, "sonnet": 0, "other": 1, "own": 0, "stepped_down": 0, "estimated_usd": 0.084, "p50_ms": 4954, "p95_ms": 9129},
+    {"day": "2026-10-26", "runs": 7, "ok": 5, "visitors": 3, "opus": 3, "sonnet": 0, "other": 0, "own": 2, "stepped_down": 0, "estimated_usd": 0.0883, "p50_ms": 6049, "p95_ms": 10214},
+    {"day": "2026-10-27", "runs": 11, "ok": 11, "visitors": 5, "opus": 5, "sonnet": 3, "other": 1, "own": 2, "stepped_down": 0, "estimated_usd": 0.1542, "p50_ms": 3432, "p95_ms": 10815},
+    {"day": "2026-10-28", "runs": 13, "ok": 12, "visitors": 7, "opus": 5, "sonnet": 6, "other": 1, "own": 1, "stepped_down": 1, "estimated_usd": 0.1503, "p50_ms": 5051, "p95_ms": 7846},
+    {"day": "2026-10-29", "runs": 8, "ok": 7, "visitors": 3, "opus": 6, "sonnet": 0, "other": 0, "own": 1, "stepped_down": 1, "estimated_usd": 0.1136, "p50_ms": 5028, "p95_ms": 8839},
+    {"day": "2026-10-30", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-10-31", "runs": 4, "ok": 4, "visitors": 2, "opus": 4, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0.0916, "p50_ms": 6798, "p95_ms": 11215},
+    {"day": "2026-11-01", "runs": 3, "ok": 3, "visitors": 1, "opus": 3, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0.043, "p50_ms": 4645, "p95_ms": 6613},
+    {"day": "2026-11-02", "runs": 4, "ok": 4, "visitors": 2, "opus": 4, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0.1008, "p50_ms": 4501, "p95_ms": 6655},
+    {"day": "2026-11-03", "runs": 13, "ok": 12, "visitors": 4, "opus": 8, "sonnet": 3, "other": 0, "own": 1, "stepped_down": 0, "estimated_usd": 0.1962, "p50_ms": 5489, "p95_ms": 10988},
+    {"day": "2026-11-04", "runs": 15, "ok": 13, "visitors": 6, "opus": 7, "sonnet": 3, "other": 0, "own": 3, "stepped_down": 1, "estimated_usd": 0.175, "p50_ms": 4261, "p95_ms": 7656},
+    {"day": "2026-11-05", "runs": 11, "ok": 9, "visitors": 6, "opus": 6, "sonnet": 0, "other": 1, "own": 2, "stepped_down": 2, "estimated_usd": 0.1039, "p50_ms": 4806, "p95_ms": 8538},
+    {"day": "2026-11-06", "runs": 13, "ok": 10, "visitors": 5, "opus": 5, "sonnet": 4, "other": 0, "own": 2, "stepped_down": 2, "estimated_usd": 0.1369, "p50_ms": 5159, "p95_ms": 14133},
+    {"day": "2026-11-07", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-11-08", "runs": 1, "ok": 1, "visitors": 1, "opus": 0, "sonnet": 0, "other": 0, "own": 1, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 7196, "p95_ms": 7196},
+    {"day": "2026-11-09", "runs": 16, "ok": 15, "visitors": 8, "opus": 4, "sonnet": 12, "other": 0, "own": 0, "stepped_down": 3, "estimated_usd": 0.1848, "p50_ms": 4356, "p95_ms": 6799},
+    {"day": "2026-11-10", "runs": 32, "ok": 28, "visitors": 9, "opus": 5, "sonnet": 23, "other": 1, "own": 2, "stepped_down": 3, "estimated_usd": 0.3265, "p50_ms": 3988, "p95_ms": 8556},
+    {"day": "2026-11-11", "runs": 16, "ok": 15, "visitors": 6, "opus": 6, "sonnet": 8, "other": 0, "own": 1, "stepped_down": 0, "estimated_usd": 0.2217, "p50_ms": 6045, "p95_ms": 9377},
+    {"day": "2026-11-12", "runs": 12, "ok": 10, "visitors": 5, "opus": 8, "sonnet": 2, "other": 0, "own": 1, "stepped_down": 0, "estimated_usd": 0.2007, "p50_ms": 6837, "p95_ms": 18362},
+    {"day": "2026-11-13", "runs": 7, "ok": 7, "visitors": 2, "opus": 5, "sonnet": 2, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0.1285, "p50_ms": 5635, "p95_ms": 7048},
+    {"day": "2026-11-14", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-11-15", "runs": 0, "ok": 0, "visitors": 0, "opus": 0, "sonnet": 0, "other": 0, "own": 0, "stepped_down": 0, "estimated_usd": 0, "p50_ms": 0, "p95_ms": 0},
+    {"day": "2026-11-16", "runs": 10, "ok": 7, "visitors": 4, "opus": 4, "sonnet": 3, "other": 0, "own": 1, "stepped_down": 2, "estimated_usd": 0.0954, "p50_ms": 4911, "p95_ms": 14421},
+    {"day": "2026-11-17", "runs": 18, "ok": 16, "visitors": 7, "opus": 5, "sonnet": 7, "other": 2, "own": 2, "stepped_down": 0, "estimated_usd": 0.1739, "p50_ms": 5421, "p95_ms": 15307},
+    {"day": "2026-11-18", "runs": 21, "ok": 18, "visitors": 7, "opus": 7, "sonnet": 8, "other": 1, "own": 2, "stepped_down": 1, "estimated_usd": 0.2681, "p50_ms": 4426, "p95_ms": 7095}
+  ],
+  "by_model": [
+    {"model": "claude-sonnet-5-5", "credential": "site", "runs": 107, "prompt_tokens": 307386, "completion_tokens": 51303, "estimated_usd": 1.1278},
+    {"model": "claude-opus-5-5", "credential": "site", "runs": 101, "prompt_tokens": 298396, "completion_tokens": 55734, "estimated_usd": 2.3083},
+    {"model": null, "credential": "site", "runs": 20, "prompt_tokens": 0, "completion_tokens": 0, "estimated_usd": 0.0},
+    {"model": "claude-haiku-5-5", "credential": "visitor", "runs": 13, "prompt_tokens": 33152, "completion_tokens": 5428, "estimated_usd": 0.0},
+    {"model": "google/gemini-3.1-flash-lite", "credential": "site", "runs": 8, "prompt_tokens": 26833, "completion_tokens": 4263, "estimated_usd": 0.0},
+    {"model": "gpt-6-luna", "credential": "visitor", "runs": 5, "prompt_tokens": 12680, "completion_tokens": 1894, "estimated_usd": 0.0},
+    {"model": "google/gemini-3.1-flash-lite", "credential": "visitor", "runs": 4, "prompt_tokens": 15634, "completion_tokens": 2016, "estimated_usd": 0.0},
+    {"model": "claude-opus-5-5", "credential": "visitor", "runs": 4, "prompt_tokens": 7421, "completion_tokens": 1513, "estimated_usd": 0.0}
+  ],
+  "by_code": [
+    {"code": "visitor_limit_reached", "runs": 12},
+    {"code": "provider_error", "runs": 6},
+    {"code": "limits_unavailable", "runs": 4},
+    {"code": "text_too_long", "runs": 2},
+    {"code": "provider_rate_limited", "runs": 2},
+    {"code": "unknown_model", "runs": 2},
+    {"code": "provider_key_refused", "runs": 1}
+  ],
+  "by_fallback": [
+    {"reason": "overloaded", "runs": 10},
+    {"reason": "rate_limited", "runs": 8}
+  ],
+  "by_country": [
+    {"country": "SI", "runs": 69},
+    {"country": "US", "runs": 53},
+    {"country": "DE", "runs": 40},
+    {"country": "AT", "runs": 29},
+    {"country": "JP", "runs": 17},
+    {"country": "HR", "runs": 17},
+    {"country": "NL", "runs": 13},
+    {"country": "GB", "runs": 9},
+    {"country": null, "runs": 8},
+    {"country": "IT", "runs": 7}
+  ]
+}

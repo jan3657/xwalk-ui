@@ -74,7 +74,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument(
         "--chatgpt-login",
         action="store_true",
-        help="enable local Sign in with ChatGPT (requires xwalk[chatgpt] and --host 127.0.0.1)",
+        help="enable local Sign in with ChatGPT "
+        "(requires xwalk-match[chatgpt] and --host 127.0.0.1)",
     )
     ui.add_argument(
         "--dense",
@@ -83,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="off",
         choices=("off", "local", "api"),
         help="dense retrieval alongside BM25: 'local' (the default when given alone) adds "
-        "general and biomedical sentence-transformers models (requires xwalk[dense]); "
+        "general and biomedical sentence-transformers models (requires xwalk-match[dense]); "
         "'api' adds Qwen3-Embedding 8B through OpenRouter (needs OPENROUTER_API_KEY)",
     )
     ui.add_argument(

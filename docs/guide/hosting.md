@@ -175,7 +175,7 @@ it is the operator's bill. `xwalk-ui` refuses `--dense api` with `--offline-only
 
 ### Sign in with ChatGPT locally
 
-With `xwalk[chatgpt]` installed, `--chatgpt-login` adds **Continue with ChatGPT** in
+With `xwalk-match[chatgpt]` installed, `--chatgpt-login` adds **Continue with ChatGPT** in
 Start, Quick map, and Settings. Eligible Plus and Pro users can authorize ChatGPT plan
 usage. After connecting, Quick map and new projects select the ChatGPT provider
 automatically and show its available models, without API-key or endpoint fields.

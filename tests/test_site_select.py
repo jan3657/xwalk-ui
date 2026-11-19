@@ -226,3 +226,217 @@ def test_an_unsure_none_is_a_review_without_a_term_not_a_failure() -> None:
     (result,), _ = _run(JEV, decider=FakeDecider(handler=unsure))
     assert result.pick is not None
     assert result.pick.status == "review" and result.pick.id is None
+
+
+# --- a fallback chain as the selector (spec 2026-11-18, section 5 step 6) ------------
+
+
+def _pick_reply(request: LLMRequest) -> str:
+    return json.dumps(
+        {"chosen_key": _key_of(request, "CHEBI:15365"), "confidence_score": 0.9, "explanation": "x"}
+    )
+
+
+def test_a_pick_names_the_model_of_the_chain_that_answered_it() -> None:
+    from ner_site.fallback import FallbackLLM, Step
+    from xwalk.llm.base import LLMRetryableError
+
+    limited = LLMRetryableError("429")
+    limited.reason = "rate_limited"  # type: ignore[attr-defined]
+    opus = FakeLLM([limited], model="claude-opus-5-5")
+    sonnet = FakeLLM(handler=_pick_reply, model="claude-sonnet-5-5")
+    chain = FallbackLLM([Step("opus", opus), Step("sonnet", sonnet)])
+    chain.stage = "select"
+    (result,), stats = _run("claude-opus-5-5", llm=chain)
+    assert result.pick is not None and result.pick.status == "match"
+    assert result.pick.selector == "claude-sonnet-5-5"  # not the selector that was asked for
+    assert [(f.stage, f.from_model, f.to_model) for f in chain.fallbacks] == [
+        ("select", "claude-opus-5-5", "claude-sonnet-5-5")
+    ]
+    assert stats.calls == 2 and stats.prompt_tokens is None  # the failed call is counted
+
+
+def test_concurrent_picks_each_name_their_own_model() -> None:
+    """Two entities in flight on one chain that steps down between their answers."""
+    from ner_site.fallback import FallbackLLM, Step
+    from xwalk.llm.base import LLMFatalError
+
+    refused = LLMFatalError("declined")
+    refused.reason = "refused"  # type: ignore[attr-defined]
+    seen: list[str] = []
+
+    def opus_reply(request: LLMRequest) -> Any:
+        seen.append(request.user)
+        return _pick_reply(request) if len(seen) == 1 else refused
+
+    opus = FakeLLM(handler=opus_reply, model="claude-opus-5-5")
+    sonnet = FakeLLM(handler=_pick_reply, model="claude-sonnet-5-5")
+    chain = FallbackLLM([Step("opus", opus), Step("sonnet", sonnet)])
+    _, candidates = _setup()
+    first, second = _entity(), _entity(id="e2")
+    results, _ = _run(
+        "claude-opus-5-5",
+        llm=chain,
+        results=[first, second],
+        candidates={"e1": candidates["e1"], "e2": candidates["e1"]},
+    )
+    named = [r.pick.selector for r in results if r.pick is not None]
+    assert named == ["claude-opus-5-5", "claude-sonnet-5-5"]
+    assert all(r.pick is not None and r.pick.id == "CHEBI:15365" for r in results)
+
+
+def test_a_plain_client_keeps_the_selector_it_was_asked_as() -> None:
+    llm = FakeLLM(handler=_pick_reply, model="some-provider-name-for-it")
+    (result,), _ = _run("openai/gpt-6-luna", llm=llm)
+    assert result.pick is not None and result.pick.selector == "openai/gpt-6-luna"
+
+
+def test_a_failed_llm_pick_still_counts_its_call() -> None:
+    from xwalk.llm.base import LLMFatalError
+
+    (result,), stats = _run("openai/gpt-6-luna", llm=FakeLLM([LLMFatalError("HTTP 500")]))
+    assert result.pick is not None and result.pick.status == "failed"
+    assert result.pick.selector == "openai/gpt-6-luna" and "HTTP 500" in result.pick.explanation
+    assert stats.calls == 1 and stats.prompt_tokens is None
+
+
+@pytest.mark.parametrize(
+    "answer,word",
+    [
+        ("not-json", "bad_answer"),
+        ('{"chosen_key":"FAKE"}', "bad_answer"),
+        (TimeoutError("unsafe"), "timeout"),
+        (RuntimeError("unsafe"), "error"),
+    ],
+)
+def test_own_failed_pick_uses_only_a_machine_word(answer: Any, word: str) -> None:
+    (result,), _ = _run("gpt-6-luna", own_key=True, llm=FakeLLM([answer]))
+    assert result.pick and (result.pick.status, result.pick.explanation) == ("failed", word)
+
+
+def test_cancelled_own_call_becomes_a_failed_pick() -> None:
+    class Cancelled(FakeLLM):
+        async def complete(self, request: LLMRequest) -> Any:
+            raise asyncio.CancelledError("unsafe provider detail")
+
+    (result,), _ = _run("gpt-6-luna", own_key=True, llm=Cancelled([]))
+    assert result.pick and (result.pick.status, result.pick.explanation) == ("failed", "timeout")
+
+
+def test_a_site_selector_can_still_supply_its_own_view() -> None:
+    class Client(FakeLLM):
+        def view(self) -> FakeLLM:
+            view = FakeLLM(handler=_pick_reply)
+            view.answered_by = "reported-model"
+            return view
+
+    (result,), stats = _run("requested-model", llm=Client([]))
+    assert result.pick and result.pick.selector == "reported-model"
+    assert not stats.served_elsewhere
+
+
+# --- calls cut off by the deadline are still reported (final review, C3) ---------------
+
+
+class _Stalls(FakeLLM):
+    """Answers the first `quick` picks, then never: a call the deadline has to cancel."""
+
+    def __init__(self, quick: int = 0) -> None:
+        super().__init__(handler=_pick_reply, model="stalling")
+        self._quick = quick
+
+    async def complete(self, request: LLMRequest) -> Any:
+        if self._quick > 0:
+            self._quick -= 1
+            return await super().complete(request)
+        await asyncio.sleep(30)
+        raise AssertionError("not reached")
+
+
+def _two_entities() -> tuple[list[EntityResult], dict[str, list[Candidate]]]:
+    _, candidates = _setup()
+    return [_entity(), _entity(id="e2")], {"e1": candidates["e1"], "e2": candidates["e1"]}
+
+
+@pytest.mark.parametrize("own_key", [False, True])
+def test_a_pick_cancelled_by_the_deadline_still_counts_its_dispatched_call(own_key: bool) -> None:
+    """The call left for the provider and may be billed; the cancellation skips the
+    usage the pick would have reported, so the call budget's count is what is left."""
+    from xwalk.llm.budget import BudgetedLLM, CallBudget
+
+    llm = BudgetedLLM(_Stalls(), CallBudget(limit=4))
+    (result,), stats = _run("gpt-6-luna", llm=llm, deadline=0.05, own_key=own_key)
+    assert result.pick is not None and result.pick.status == "failed"
+    assert llm.budget.dispatched == 1
+    assert stats.calls == 1
+    assert stats.prompt_tokens is None and stats.completion_tokens is None
+    assert stats.cost_usd is None and stats.reported_cost is None
+
+
+def test_one_answered_and_one_cancelled_pick_report_two_calls_and_unknown_tokens() -> None:
+    from ner_site.service import wire_usage
+    from xwalk.llm.budget import BudgetedLLM, CallBudget
+    from xwalk.records import Usage
+
+    results, candidates = _two_entities()
+    llm = BudgetedLLM(_Stalls(quick=1), CallBudget(limit=4))
+    picked, stats = _run("m", llm=llm, deadline=0.05, results=results, candidates=candidates)
+    assert sorted(r.pick.status for r in picked if r.pick) == ["failed", "match"]
+    assert (stats.calls, stats.prompt_tokens, stats.completion_tokens) == (2, None, None)
+    usage = wire_usage(Usage(prompt_tokens=5, completion_tokens=2, calls=1), 0, stats)
+    assert usage.selector_calls == 2
+    assert usage.selector_prompt_tokens is None and usage.selector_completion_tokens is None
+    assert usage.selector_cost_usd is None
+
+
+def test_calls_that_reported_are_not_counted_twice() -> None:
+    from xwalk.llm.budget import BudgetedLLM, CallBudget
+
+    results, candidates = _two_entities()
+    llm = BudgetedLLM(FakeLLM(handler=_pick_reply), CallBudget(limit=4))
+    _, stats = _run("m", llm=llm, results=results, candidates=candidates)
+    assert llm.budget.dispatched == 2 and stats.calls == 2
+    assert stats.prompt_tokens is not None and stats.completion_tokens is not None
+    # Calls made before this step (an extraction on the same budget) are not the selector's.
+    again = SelectStats()
+    indexes, _ = _setup()
+    asyncio.run(
+        select_entities(results, candidates, indexes, selector="m", text=TEXT, stats=again, llm=llm)
+    )
+    assert llm.budget.dispatched == 4 and again.calls == 2
+
+
+def test_a_cancelled_pick_on_a_chain_counts_the_call_of_the_step_it_was_on() -> None:
+    from ner_site.claude import OPUS
+    from ner_site.service import SELECT, Settings, make_chain
+
+    settings = Settings(anthropic_api_key="sk-ant-SENTINEL-0123456789")
+    chain = make_chain(
+        settings, OPUS, purposes=(SELECT,), claude_factory=lambda s, model, purpose: _Stalls()
+    )
+    (result,), stats = _run(OPUS, llm=chain, deadline=0.05)
+    assert result.pick is not None and "deadline" in result.pick.explanation
+    assert stats.calls == 1 and stats.prompt_tokens is None
+
+
+def test_a_cancelled_pick_through_the_own_key_reader_counts_its_call() -> None:
+    from ner_site.http import _OwnJSONClient
+    from ner_site.providers import Credential
+    from xwalk.llm.budget import BudgetedLLM, CallBudget
+
+    credential = Credential("openai", lambda: "sk-SENTINEL-0123456789abcdef")
+    llm = _OwnJSONClient(BudgetedLLM(_Stalls(), CallBudget(limit=4)), credential, {})
+    (result,), stats = _run("gpt-6-luna", llm=llm, deadline=0.05, own_key=True)
+    assert result.pick is not None and result.pick.explanation == "timeout"
+    assert stats.calls == 1 and stats.prompt_tokens is None
+
+
+def test_a_cancelled_jev_pick_counts_its_dispatched_call() -> None:
+    from xwalk.decide.budget import BudgetedDecider
+    from xwalk.llm.budget import CallBudget
+
+    decider = BudgetedDecider(_SlowDecider(), CallBudget(limit=8))
+    (result,), stats = _run(JEV, decider=decider, deadline=0.05)
+    assert result.pick is not None and "deadline" in result.pick.explanation
+    assert decider.budget.dispatched == 1
+    assert stats.calls == 1 and stats.reported_cost is None

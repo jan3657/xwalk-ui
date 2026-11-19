@@ -31,7 +31,7 @@ Review queue, plus the Export and Resume dialogs.
 - **The CLI beside the click.** Where the page does something the CLI can, it shows the
   exact command (`$ xwalk explain --run … --full s3`), copyable. Only real commands.
 
-The build is committed under `src/xwalk_ui/static/app/`, so `pip install xwalk` never
+The build is committed under `src/xwalk_ui/static/app/`, so `pip install xwalk-ui` never
 needs Node. CI (`web` job) rebuilds it and fails when the committed files differ.
 
 ## Working on it

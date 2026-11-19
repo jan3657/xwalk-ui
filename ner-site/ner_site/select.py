@@ -7,7 +7,8 @@ Retrieval ranks; a selector decides. The visitor chooses the selector per reques
   candidate, choose among the survivors or none, gate the choice on the slots'
   properties; thresholds fitted on the pilots, ``POLICIES``);
 - an LLM id (``openai/gpt-6-luna`` ...): ``xwalk.stages.select.Selector``, one call that
-  returns an opaque candidate key or null.
+  returns an opaque candidate key or null. A Claude id runs on a fallback chain, and each
+  pick's ``selector`` is then the model that made that pick.
 
 Both read the question sets in ``ner_site/slots/`` (copied from the examples). Both only
 ever resolve to a candidate retrieved for the entity: Jev chooses among keys, and an LLM's
@@ -21,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from xwalk.decide.base import DecisionClient
 from xwalk.decide.matcher import DecisionMatcher
 from xwalk.decide.policy import DecisionPolicy
 from xwalk.decide.questions import QuestionSet
-from xwalk.llm.base import LLMClient
+from xwalk.llm.base import LLMClient, failure_usage
 from xwalk.prompts.contract import PromptSet, PromptSlots, load_slots
 from xwalk.records import Candidate, MatchStatus, Record, RetrievalHit
 from xwalk.records import Usage as XwalkUsage
@@ -44,6 +45,7 @@ from xwalk.templates import TemplateSet
 from ner_site.indexes import OntologyIndex
 from ner_site.mapping import MAX_LISTED
 from ner_site.ontologies import DOC_TEMPLATE, term_url
+from ner_site.providers import failure_word
 from ner_site.schema import EntityResult, Pick, PickStatus
 
 RETRIEVAL_ONLY = "retrieval"
@@ -107,13 +109,18 @@ _JEV_STATUS: dict[MatchStatus, PickStatus] = {
 @dataclass
 class SelectStats:
     """Filled in by `select_entities`: the selector's calls, tokens and reported cost.
-    Tokens and cost are None once any call did not report them ("unknown", not 0)."""
+    Tokens and cost are None once any call did not report them ("unknown", not 0),
+    which includes a call that was sent and then cut off by the request deadline.
+
+    ``served_elsewhere`` records the requested and serving model per pick when the
+    adapter signals a server-side refusal fallback."""
 
     calls: int = 0
     prompt_tokens: int | None = 0
     completion_tokens: int | None = 0
     cost_usd: float | None = 0.0
     cost_reported: bool = True  # False for selectors whose provider reports no cost
+    served_elsewhere: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def add(self, usage: XwalkUsage) -> None:
         self.calls += usage.calls
@@ -131,6 +138,21 @@ class SelectStats:
         if self.calls == 0:
             return None
         return self.cost_usd if self.cost_reported else None
+
+
+def dispatched(client: object) -> int:
+    """How many requests `client` has sent so far, as its call budgets counted them
+    when each was dispatched: a budgeted client or decider (``budget.dispatched``,
+    also behind a wrapper that passes ``budget`` on), a staged step (the clients it
+    has ``built``) or a fallback chain (its ``steps``). 0 for a client with no budget."""
+    steps = getattr(client, "steps", None)
+    if steps is not None:
+        return sum(dispatched(step.client) for step in steps)
+    built = getattr(client, "built", None)
+    if built is not None:
+        return sum(dispatched(part) for part in built)
+    count = getattr(getattr(client, "budget", None), "dispatched", None)
+    return count if isinstance(count, int) else 0
 
 
 @cache
@@ -263,20 +285,39 @@ async def _with_llm(
     llm: LLMClient,
     selector: str,
     stats: SelectStats,
+    own_key: bool,
 ) -> Pick:
     source = _source(entity, text)
+    # A fallback chain (ner_site.fallback) may answer this pick from another model than
+    # the one asked for, and may move on while other picks are in flight: a view of it
+    # remembers which model answered this one, and the pick names that model.
+    get_view = None if own_key else getattr(llm, "view", None)
+    view = get_view() if callable(get_view) else None
     chooser = Selector(
-        llm,
+        llm if view is None else view,
         _prompts(entity.type),
         SELECT_TEMPLATES,
         policy=SelectorPolicy(max_candidates=MAX_CANDIDATES),
     )
-    outcome = await chooser.select(source, SELECT_TEMPLATES.render_context(source), candidates)
+    try:
+        outcome = await chooser.select(source, SELECT_TEMPLATES.render_context(source), candidates)
+    except Exception as exc:
+        # The caller turns this into a failed pick; its calls were dispatched all the same.
+        stats.add(failure_usage(exc))
+        raise
     stats.add(outcome.usage)
+    answered = getattr(view, "answered_by", None)
+    if answered:
+        selector = answered
+        if getattr(view, "served_by_fallback", False) and view.asked:
+            stats.served_elsewhere[entity.id] = (view.asked, answered)
     choice = outcome.choice
     if outcome.error is not None:
         return _pick(
-            selector, "failed", candidates, explanation=f"unreadable answer: {outcome.error}"
+            selector,
+            "failed",
+            candidates,
+            explanation="bad_answer" if own_key else f"unreadable answer: {outcome.error}",
         )
     if choice.resolution is Resolution.ABSTAIN:
         return _pick(
@@ -291,7 +332,7 @@ async def _with_llm(
             selector,
             "failed",
             candidates,
-            explanation="the model named no candidate it was shown",
+            explanation="bad_answer" if own_key else "the model named no candidate it was shown",
         )
     return _pick(
         selector,
@@ -314,6 +355,7 @@ async def select_entities(
     decider: DecisionClient | None = None,
     llm: LLMClient | None = None,
     deadline: float | None = None,
+    own_key: bool = False,
 ) -> list[EntityResult]:
     """`results` with ``pick`` set for every entity that was routed to an ontology and
     has candidates (None otherwise, and for ``retrieval``). `candidates` maps entity ids
@@ -325,6 +367,9 @@ async def select_entities(
     if selector != JEV and llm is None:
         raise ValueError(f"selector {selector!r} needs an LLM client")
     stats.cost_reported = selector == JEV
+    client = decider if selector == JEV else llm
+    sent_before, counted_before = dispatched(client), stats.calls
+    deadline_note = "timeout" if own_key else DEADLINE_NOTE
     deadline_at = None if deadline is None else time.monotonic() + deadline
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
@@ -337,7 +382,7 @@ async def select_entities(
             remaining = None if deadline_at is None else deadline_at - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return entity.model_copy(
-                    update={"pick": _pick(selector, "failed", found, explanation=DEADLINE_NOTE)}
+                    update={"pick": _pick(selector, "failed", found, explanation=deadline_note)}
                 )
             try:
                 if selector == JEV:
@@ -345,15 +390,31 @@ async def select_entities(
                     work = _with_jev(entity, index, found, text, decider, stats)
                 else:
                     assert llm is not None
-                    work = _with_llm(entity, found, text, llm, selector, stats)
+                    work = _with_llm(entity, found, text, llm, selector, stats, own_key)
                 pick = await asyncio.wait_for(work, timeout=remaining)
+            except asyncio.CancelledError:
+                if not own_key:
+                    raise
+                pick = _pick(selector, "failed", found, explanation="timeout")
             except asyncio.TimeoutError:
-                pick = _pick(selector, "failed", found, explanation=DEADLINE_NOTE)
+                pick = _pick(selector, "failed", found, explanation=deadline_note)
             except Exception as exc:  # noqa: BLE001 - a failed pick, never a 5xx
-                pick = _pick(selector, "failed", found, explanation=f"{type(exc).__name__}: {exc}")
+                pick = _pick(
+                    selector,
+                    "failed",
+                    found,
+                    explanation=failure_word(exc) if own_key else f"{type(exc).__name__}: {exc}",
+                )
         return entity.model_copy(update={"pick": pick})
 
-    return list(await asyncio.gather(*(one(e) for e in results)))
+    picked = list(await asyncio.gather(*(one(e) for e in results)))
+    # A pick the deadline cancelled never reported its usage, but its request had left
+    # and may be billed. The budgets counted it at dispatch: what they saw beyond what
+    # the picks reported is booked as calls with unknown tokens and cost, never dropped.
+    missing = (dispatched(client) - sent_before) - (stats.calls - counted_before)
+    if missing > 0:
+        stats.add(XwalkUsage.unreported(missing))
+    return picked
 
 
 __all__ = [
@@ -364,5 +425,6 @@ __all__ = [
     "RETRIEVAL_ONLY",
     "SELECT_TEMPLATES",
     "SelectStats",
+    "dispatched",
     "select_entities",
 ]

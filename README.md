@@ -30,7 +30,7 @@ See [workbench usage](docs/guide/ui.md), [hosting](docs/guide/hosting.md),
 and [NER deployment](ner-site/README.md). NER is a separate Vercel deployment
 with its own pinned engine dependency in `ner-site/requirements.txt`.
 
-The workbench and CI pin the matching engine extraction commit
-`ef3180b4d0d5a95b81c3e96f5307b48ad1d7d912` from the backend repository.
-Installing from Git requires Git on the machine. NER deployment retains its separately
-tested engine pin in `ner-site/requirements.txt`.
+The workbench, CI and NER deployment pin the renamed `xwalk-match` engine commit
+`62b8d592515ade0d59c39462eca4f079954b7856` from the backend repository.
+Installing from Git requires Git on the machine. The Python import and CLI remain `xwalk`.
+Use a fresh environment when migrating from the former Git-installed `xwalk` distribution.

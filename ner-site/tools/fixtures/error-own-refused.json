@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "provider_key_refused",
+    "message": "Anthropic refused this key. It may be mistyped, revoked, out of credit, or not allowed to use this model."
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "stats_passcode_invalid",
+    "message": "the stats passcode is not correct"
+  }
+}

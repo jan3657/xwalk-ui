@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "visitor_limit_reached",
+    "message": "you have used this hour's requests; try again in 23 minutes, or use your own API key"
+  }
+}

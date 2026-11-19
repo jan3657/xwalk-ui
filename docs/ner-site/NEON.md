@@ -157,7 +157,7 @@ works the same), `--batch` (texts per embeddings request, default 128),
 - **Sources.** Samples: the bundled JSONL. Full: CTD `CTD_diseases.tsv.gz` (DiseaseName,
   DiseaseID, Definition, Synonyms split on `|`), ChEBI `chebi.obo.gz` through
   `obo_source(id_prefix="CHEBI:")`, FoodOn `foodon.owl` through
-  `owl_source(id_prefix="FOODON:")` (needs `xwalk[ontology]`), NCBI Gene
+  `owl_source(id_prefix="FOODON:")` (needs `xwalk-match[ontology]`), NCBI Gene
   `{Homo_sapiens,Mus_musculus,Rattus_norvegicus}.gene_info.gz` (Symbol, Synonyms with
   `-` for none, description, organism from `#tax_id`). Records keep the samples' fields
   (label, synonyms, definition; genes add organism and tax_id). Downloads go to their own

@@ -1,0 +1,86 @@
+{
+  "ok": true,
+  "mode": "live",
+  "default_model": "claude-opus-5-5",
+  "models": [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
+  ],
+  "backend": "bundled",
+  "selectors": [
+    "retrieval",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "jev",
+    "google/gemini-3.1-flash-lite",
+    "openai/gpt-6-luna"
+  ],
+  "default_selector": "claude-opus-5-5",
+  "limits": {
+    "max_chars": 5000,
+    "max_prompt_chars": 4000,
+    "max_entities": 25,
+    "top_k_max": 10
+  },
+  "passcode_required": false,
+  "default_prompt": "Extract every mention of these entity types:\n- chemical: a chemical compound, element or drug (e.g. \"aspirin\", \"glucose\", \"sodium chloride\").\n- disease: a disease or disorder (e.g. \"rheumatoid arthritis\", \"type 2 diabetes\", \"asthma\").\n- gene: a gene or protein, by name or symbol (e.g. \"BRCA1\", \"tumor necrosis factor\", \"insulin receptor\").\n- food: a food, dish or ingredient (e.g. \"apple\", \"whole milk\", \"olive oil\").\n- other: any other notable named entity, such as an organism, person, place or organisation (e.g. \"Escherichia coli\").\n\nRules:\n- Copy each mention exactly as written in the text, with its spelling, case and punctuation; do not correct, expand or normalise it.\n- Each occurrence is its own entity: a mention that appears twice is listed twice.\n- Mentions must not nest or overlap: when one contains another, keep only the longer (e.g. \"rheumatoid arthritis\", not also \"arthritis\").\n- Extract at most 25 entities.",
+  "ontologies": [
+    {
+      "slug": "chebi-sample",
+      "name": "ChEBI (sample)",
+      "type": "chemical",
+      "count": 200
+    },
+    {
+      "slug": "ctd-disease-sample",
+      "name": "CTD diseases / MeSH (sample)",
+      "type": "disease",
+      "count": 200
+    },
+    {
+      "slug": "ncbi-gene-sample",
+      "name": "NCBI Gene (sample)",
+      "type": "gene",
+      "count": 200
+    },
+    {
+      "slug": "foodon-sample",
+      "name": "FoodOn (sample)",
+      "type": "food",
+      "count": 200
+    }
+  ],
+  "retrieval": {
+    "bm25": {
+      "status": "ok"
+    },
+    "dense": {
+      "status": "ok"
+    }
+  },
+  "llm": {
+    "status": "ok"
+  },
+  "claude": {
+    "status": "ok"
+  },
+  "visitor": {
+    "limits": "on",
+    "tier": "opus",
+    "opus_left": 7,
+    "sonnet_left": 20,
+    "resets_in_s": 1380,
+    "opus_left_today": 15,
+    "sonnet_left_today": 40,
+    "window": "hour",
+    "own_left": 30,
+    "own_left_today": 60,
+    "day_resets_in_s": 30180
+  },
+  "own_keys": {
+    "enabled": false,
+    "providers": []
+  }
+}

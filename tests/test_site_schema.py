@@ -61,14 +61,19 @@ HEALTH_RESPONSE = """
 """
 
 
-def _round_trip(model: Any, raw: str) -> None:
+def _round_trip(model: Any, raw: str, added: dict[str, Any] | None = None) -> None:
     data = json.loads(raw)
     dumped = model.model_validate(data).model_dump(mode="json", exclude_none=False)
-    assert json.dumps(dumped) == json.dumps(data)
+    assert json.dumps(dumped) == json.dumps({**data, **(added or {})})
 
 
 def test_the_plan_s_ner_response_round_trips_unchanged() -> None:
-    _round_trip(NerResponse, NER_RESPONSE)
+    # The plan's example predates the fields of 18 November 2026: they are additions,
+    # appended after it at their defaults, and nothing before them moves.
+    added = {"requested_model": "", "requested_selector": "", "fallbacks": [], "notices": []}
+    _round_trip(
+        NerResponse, NER_RESPONSE, {**added, "provider": "site", "credential_source": "site"}
+    )
 
 
 def test_the_plan_s_health_response_round_trips_unchanged() -> None:
@@ -156,3 +161,103 @@ def test_service_error_envelope_matches_the_plan() -> None:
 
 def test_limits_public_is_the_health_subset() -> None:
     assert Limits().public() == json.loads(HEALTH_RESPONSE)["limits"]
+
+
+# --- Claude as the default provider (spec 2026-11-18, section 6) ---------------------
+
+
+def test_a_fallback_note_is_from_on_the_wire() -> None:
+    from ner_site.schema import FallbackNote
+
+    note = FallbackNote(stage="extract", from_="claude-opus-5-5", to="b/c", reason="rate_limited")
+    wire = {"stage": "extract", "from": "claude-opus-5-5", "to": "b/c", "reason": "rate_limited"}
+    assert note.model_dump(mode="json") == wire
+    assert list(note.model_dump(mode="json")) == ["stage", "from", "to", "reason"]
+    assert FallbackNote.model_validate(wire) == note
+
+
+def test_the_response_carries_what_was_asked_for_and_every_departure() -> None:
+    from ner_site.schema import FallbackNote
+
+    data = json.loads(NER_RESPONSE)
+    plain = NerResponse.model_validate(data).model_dump(mode="json")
+    assert plain["requested_model"] == "" and plain["requested_selector"] == ""
+    assert plain["fallbacks"] == [] and plain["notices"] == []
+    note = {"stage": "admit", "from": "a", "to": "b", "reason": "opus_allowance_used"}
+    full = NerResponse.model_validate(
+        {
+            **data,
+            "requested_model": "claude-opus-5-5",
+            "requested_selector": "jev",
+            "fallbacks": [note],
+            "notices": ["Your Opus allowance for this hour is used."],
+        }
+    )
+    assert full.fallbacks == [FallbackNote(stage="admit", from_="a", to="b", reason=note["reason"])]
+    dumped = full.model_dump(mode="json")
+    assert dumped["fallbacks"] == [note] and dumped["requested_selector"] == "jev"
+    assert json.loads(full.model_dump_json())["fallbacks"] == [note]
+
+
+def test_a_service_error_may_carry_response_headers() -> None:
+    plain = ServiceError("bad_json", "no", status=400)
+    assert plain.headers == {}
+    limited = ServiceError("visitor_limit_reached", "x", status=429, headers={"Retry-After": "60"})
+    assert limited.headers == {"Retry-After": "60"}
+    assert limited.envelope() == {
+        "ok": False,
+        "error": {"code": "visitor_limit_reached", "message": "x"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "llm_calls", "known"),
+    [("ner.json", 1, True), ("ner-sonnet.json", 1, True), ("ner-fallback.json", 2, False)],
+)
+def test_the_claude_fixtures_show_the_usage_the_server_sends(
+    name: str, llm_calls: int, known: bool
+) -> None:
+    """The page is developed against ``tools/fixtures``: ``llm_calls`` counts extraction
+    calls only (never more than the call cap), the picks are under ``selector_calls``
+    with their own tokens, a provider that reports no cost leaves ``selector_cost_usd``
+    null, and tokens are null once a call (a failed one) did not report them."""
+    from pathlib import Path
+
+    fixtures = Path(__file__).resolve().parents[1] / "ner-site" / "tools" / "fixtures"
+    data = json.loads((fixtures / name).read_text(encoding="utf-8"))
+    response = NerResponse.model_validate(data)
+    assert response.model_dump(mode="json") == data  # nothing missing, nothing extra
+    usage, raw = response.usage, data["usage"]
+    assert set(raw) == set(Usage.model_fields)
+    picks = sum(1 for entity in response.entities if entity.pick is not None)
+    assert usage.llm_calls == llm_calls <= Limits().llm_call_cap
+    assert picks > 0 and usage.selector_calls >= picks
+    assert usage.selector_cost_usd is None
+    tokens = (
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.selector_prompt_tokens,
+        usage.selector_completion_tokens,
+    )
+    assert all(isinstance(t, int) and t > 0 for t in tokens) if known else tokens == (None,) * 4
+    if known:
+        assert usage.selector_calls == picks
+
+
+def test_own_result_fixture_round_trip() -> None:
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "ner-site/tools/fixtures/ner-own.json"
+    data = json.loads(path.read_text())
+    assert (data["provider"], data["credential_source"]) == ("anthropic", "visitor")
+    assert NerResponse.model_validate(data).model_dump(mode="json") == data
+
+
+def test_health_schema_preserves_new_wire_fields() -> None:
+    from pathlib import Path
+
+    directory = Path(__file__).resolve().parents[1] / "ner-site/tools/fixtures"
+    for name in ("health.json", "health-own-off.json"):
+        data = json.loads((directory / name).read_text())
+        dumped = HealthResponse.model_validate(data).model_dump(mode="json")
+        assert dumped["own_keys"] == data["own_keys"] and dumped["visitor"] == data["visitor"]

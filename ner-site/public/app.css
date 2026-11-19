@@ -273,6 +273,15 @@ summary {
   font-size: 0.875rem;
 }
 
+.allowance {
+  margin: 0;
+}
+
+.allowance.blocked {
+  color: var(--text);
+  font-weight: 600;
+}
+
 .counter.over {
   color: var(--danger-text);
   font-weight: 600;
@@ -428,6 +437,70 @@ button.small {
   flex: 0 1 11rem;
 }
 
+/* "Run with": the site's models or the visitor's own key. Sits above the options as
+   one more row of the form; with it shown, the two rows share a single rule. */
+.run-with {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.run-with .field {
+  flex: 1 1 14rem;
+}
+
+.run-with .key-field {
+  flex: 2 1 20rem;
+}
+
+.run-with:not([hidden]) + .options {
+  margin-top: 16px;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.key-row {
+  display: flex;
+  gap: 8px;
+}
+
+.key-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.key-row button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.key-note {
+  flex: 1 1 100%;
+  max-width: 44rem;
+  margin: 0;
+}
+
+.payer {
+  margin-top: 18px;
+  padding: 12px 16px;
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-radius: var(--radius);
+}
+
+.payer p {
+  margin: 0;
+  max-width: 44rem;
+}
+
+.payer .button-row {
+  margin-top: 10px;
+}
+
 .run-row {
   display: flex;
   flex-wrap: wrap;
@@ -547,6 +620,46 @@ button[aria-busy="true"] .spinner {
 .summary {
   margin: 0;
   color: var(--muted);
+}
+
+.ran-on {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.ran-on .asked {
+  color: var(--muted);
+}
+
+/* Neutral information about the run (a different model answered). Not a warning (amber)
+   and not an error (red): the accent tint, with a label. */
+.notices {
+  margin: 0 0 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  border-radius: var(--radius);
+}
+
+.notices-title {
+  margin: 0 0 4px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.notices ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.notices li + li {
+  margin-top: 4px;
 }
 
 .highlighted {
@@ -789,6 +902,10 @@ button[aria-busy="true"] .spinner {
 
 .footer p {
   margin: 0;
+}
+
+.footer p + p {
+  margin-top: 6px;
 }
 
 /* ---------- narrow screens ---------- */
