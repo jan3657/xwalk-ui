@@ -7,6 +7,7 @@ tmp_path and dense is always given an explicit directory (never the committed on
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -1794,3 +1795,192 @@ def test_only_enabled_providers_have_their_model_lists_validated() -> None:
     assert [p.id for p in s.own_providers] == ["openrouter"]
     with pytest.raises(SettingsError, match="NER_SITE_OWN_MODELS_OPENAI"):
         Settings.from_env({"NER_SITE_OWN_PROVIDERS": "openai", **bad})
+
+
+# --- site analytics: the stats passcode (design 2026-11-18, sections 3.1 and 6) --------
+
+STATS_PASSCODE = "stats-SENTINEL-passcode-7781"
+
+
+def test_the_stats_passcode_is_off_by_default_and_a_scrubbed_secret_when_set() -> None:
+    assert Settings().stats_passcode is None
+    for env in ({}, {"NER_SITE_STATS_PASSCODE": ""}, {"NER_SITE_STATS_PASSCODE": "   "}):
+        s = Settings.from_env(env)
+        assert s.stats_passcode is None and s.database_url is None
+        assert not service.uses_database(env)
+    s = Settings.from_env({"NER_SITE_STATS_PASSCODE": f"  {STATS_PASSCODE} "})
+    assert s.stats_passcode == STATS_PASSCODE
+    assert STATS_PASSCODE in s.secrets() and STATS_PASSCODE not in repr(s)
+    assert service.scrub(f"given {STATS_PASSCODE}", s) == "given [redacted]"
+    assert "NER_SITE_STATS_PASSCODE" in service.ENV_NAMES
+
+
+@pytest.mark.parametrize(
+    "value", ["short", "sixteen-chars-00", "twenty-three-chars-0000", "x" * 23]
+)
+def test_a_stats_passcode_shorter_than_twenty_four_characters_is_refused(value: str) -> None:
+    """Nothing limits guesses at ``/api/stats``, so the passcode has to be a generated
+    secret (``openssl rand -hex 24``), not a phrase."""
+    assert service.MIN_STATS_PASSCODE_CHARS == 24
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": value})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "24" in str(exc.value)
+    assert "openssl rand -hex 24" in str(exc.value)
+    assert value not in str(exc.value)
+    assert Settings.from_env({"NER_SITE_STATS_PASSCODE": "x" * 24}).stats_passcode == "x" * 24
+
+
+def test_a_stats_passcode_must_be_ascii_like_the_visitor_passcode() -> None:
+    with pytest.raises(SettingsError) as exc:
+        Settings.from_env({"NER_SITE_STATS_PASSCODE": "pässwort-geheim-lang-genug"})
+    assert "NER_SITE_STATS_PASSCODE" in str(exc.value) and "ASCII" in str(exc.value)
+    assert "geheim" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["bare", "openrouter_only", "offline"],
+)
+def test_the_stats_passcode_makes_the_database_url_read(env: dict[str, str]) -> None:
+    """Recording needs the database on any deployment, so the rule for when
+    ``DATABASE_URL`` is read gains exactly this case and no other."""
+    assert not service.uses_database({**env, "DATABASE_URL": DB_URL})
+    assert Settings.from_env({**env, "DATABASE_URL": DB_URL}).database_url is None
+    on = {**env, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE, "DATABASE_URL": DB_URL}
+    assert service.uses_database(on)
+    s = Settings.from_env(on)
+    assert s.database_url == DB_URL and DB_URL in s.secrets()
+    # Bundled indexes still never see the database.
+    assert s.index_settings().database_url is None
+    # Set without a database: the settings are still good; recording has nowhere to go.
+    assert Settings.from_env({**on, "DATABASE_URL": ""}).database_url is None
+
+
+UNUSABLE_URLS = [
+    "mysql://u:p@h/db",
+    "https://ep-x.neon.tech/sql",
+    "postgresql://[half-a-bracket/db",
+    "postgresql://owner:pw@[::1/db",
+    "postgresql:///no-host",
+    "postgres://",
+    "ep-x-pooler.neon.tech",
+    "postgresql",
+    # A port the URL parser only looks at when it is asked for one.
+    "postgresql://owner:retrieval@ep-x.neon.tech:abc/db",
+    "postgresql://owner:pw@ep-x.neon.tech:99999/db",
+    "postgresql://owner:pw@ep-x.neon.tech:-1/db",
+    "postgresql://owner:pw@ep-x.neon.tech:54 32/db",
+    "postgresql://owner:pw@ep x.neon.tech/db",
+    "postgresql://owner:pw@ep-x.neon.tech\n/db",
+    # Host names that are not names: an empty label, a label of 64 characters, a
+    # hyphen at an end of one, two dots at the end, and addresses (Neon hosts are names).
+    "postgresql://owner:retrieval@db..example/db",
+    "postgresql://owner:retrieval@" + "a" * 64 + ".example/db",
+    "postgresql://owner:pw@-db.example/db",
+    "postgresql://owner:pw@db-.example/db",
+    "postgresql://owner:pw@db.example../db",
+    "postgresql://owner:pw@.db.example/db",
+    "postgresql://owner:pw@db_x.example/db",
+    "postgresql://owner:pw@" + ".".join(["a" * 63] * 4) + "/db",
+    "postgresql://owner:pw@[::1]/db",
+    "postgresql://owner:pw@[2001:db8::7]:5432/db",
+    "postgresql://owner:pw@127.0.0.1/db",
+    "postgresql://owner:pw@127.0.0.1:5432/db",
+    # An address with a dot at its end, in the short forms a resolver takes, as one
+    # number, in hexadecimal; a name that ends in a number is read as one too.
+    "postgresql://owner:retrieval@127.0.0.1./db",
+    "postgresql://owner:retrieval@127.1/db",
+    "postgresql://owner:pw@127.1./db",
+    "postgresql://owner:pw@2130706433/db",
+    "postgresql://owner:pw@0x7f.0.0.1/db",
+    "postgresql://owner:pw@0x7f000001/db",
+    "postgresql://owner:pw@db.example.123/db",
+    # Anything in brackets, also what is no address.
+    "postgresql://owner:retrieval@[v1.example.]/db",
+    "postgresql://owner:pw@[db.example]/db",
+    "postgresql://owner:pw@[::ffff:127.0.0.1]/db",
+    # A credential that cannot travel in a header.
+    "postgresql://owner:p\u00e4ss@ep-x.neon.tech/db",
+]
+USABLE_URLS = [
+    "postgresql://owner:pw@ep-x-pooler.c-1.eu.aws.neon.tech/neondb?sslmode=require",
+    "postgres://owner:pw@db.example./db",
+    "postgresql://owner:pw@DB.Example:5432/db",
+    "postgresql://owner:pw@" + "a" * 63 + ".example/db",
+    "postgresql://owner:pw@localhost/db",
+    "postgresql://owner:pw@1.example/db",
+    "postgresql://owner:pw@123.example.com./db",
+    "postgresql://owner:pw@0x7f.example/db",
+    "postgresql://ep-x.neon.tech",
+]
+
+
+@pytest.mark.parametrize("url", UNUSABLE_URLS)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPENROUTER_API_KEY": SENTINEL_KEY, "NER_SITE_PASSCODE": "correct horse"},
+        {"NER_SITE_OFFLINE": "1"},
+        {
+            "NER_SITE_OFFLINE": "1",
+            "ANTHROPIC_API_KEY": "sk-ant-x",
+            "NER_SITE_OWN_PROVIDERS": "openai",
+        },
+    ],
+    ids=["bare", "openrouter_only", "offline", "offline_with_the_rest"],
+)
+def test_a_database_url_only_analytics_reads_cannot_break_the_settings(
+    env: dict[str, str], url: str
+) -> None:
+    """Where the stats passcode is the one reason ``DATABASE_URL`` is read, the site
+    ignored that variable until analytics was turned on. A value it cannot use must
+    then mean "no statistics", not a site that answers 503 everywhere."""
+    off = Settings.from_env({**env, "DATABASE_URL": url})
+    on = Settings.from_env({**env, "DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert on.database_url is None and on.stats_passcode == STATS_PASSCODE
+    assert dataclasses.replace(on, stats_passcode=None) == off
+    # Nothing of a URL that is not kept is a secret to scrub: a password that is also
+    # an ordinary word of the answers ("retrieval") would otherwise be redacted in them.
+    assert set(on.secrets()) - {STATS_PASSCODE} == set(off.secrets())
+    assert url not in on.secrets() and "retrieval" not in on.secrets()
+
+
+def test_a_usable_analytics_database_url_may_name_a_port() -> None:
+    url = "postgresql://owner:pw@ep-x.neon.tech:5432/db"
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url
+
+
+@pytest.mark.parametrize("url", USABLE_URLS)
+def test_an_analytics_database_url_with_an_ordinary_host_name_is_kept(url: str) -> None:
+    """Also one with a dot at its end, which is a name like any other."""
+    s = Settings.from_env({"DATABASE_URL": url, "NER_SITE_STATS_PASSCODE": STATS_PASSCODE})
+    assert s.database_url == url and url in s.secrets()
+
+
+@pytest.mark.parametrize(
+    "url", ["mysql://u:p@h/db", "https://ep-x.neon.tech/sql", "ep-x.neon.tech"]
+)
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"NER_SITE_BACKEND": "neon"},
+        {"ANTHROPIC_API_KEY": "sk-ant-x"},
+        {"NER_SITE_OWN_PROVIDERS": "openai"},
+        {"NER_SITE_BACKEND": "neon", "NER_SITE_OFFLINE": "1"},
+    ],
+    ids=["neon", "claude", "own_keys", "neon_offline"],
+)
+def test_a_database_url_the_site_needs_for_more_is_checked_as_strictly_as_before(
+    env: dict[str, str], url: str
+) -> None:
+    for extra in ({}, {"NER_SITE_STATS_PASSCODE": STATS_PASSCODE}):
+        with pytest.raises(SettingsError, match="DATABASE_URL") as exc:
+            Settings.from_env({**env, **extra, "DATABASE_URL": url})
+        assert url not in str(exc.value)

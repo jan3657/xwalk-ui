@@ -84,6 +84,12 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # What the SDK raises for a 200 whose body it cannot decode: the decoders' own errors,
 # not an ``anthropic`` one. Caught around the SDK call only (``ClaudeClient._send``).
 UNREADABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
+# The modules a JSON body is decoded in. The decoder can also give up with a plain
+# ``ValueError`` (an integer of more digits than Python converts), which is told from
+# any other ``ValueError`` by where it was raised (``_from_the_decoder``). Not the
+# ``json`` package as a whole: its encoder raises ``ValueError`` too (``dumps`` of a
+# value it will not write), and that is a fault in what was sent, not in an answer.
+_DECODERS = frozenset({"json.decoder", "json.scanner"})
 MAX_MESSAGE_CHARS = 500
 
 
@@ -287,6 +293,19 @@ def _fatal(reason: str, message: str) -> LLMError:
     error = LLMFatalError(message, usage=Usage.unreported())
     error.reason = reason  # type: ignore[attr-defined]
     return error
+
+
+def _from_the_decoder(exc: BaseException) -> bool:
+    """Whether `exc` was raised while a JSON body was being decoded: one of the frames
+    it passed through belongs to the JSON decoder or its scanner. Its class and message
+    are not asked: a ``ValueError`` about anything else, raised anywhere else (the
+    JSON encoder included), is not this."""
+    trace = exc.__traceback__
+    while trace is not None:
+        if trace.tb_frame.f_globals.get("__name__") in _DECODERS:
+            return True
+        trace = trace.tb_next
+    return False
 
 
 def _retry_after(exc: anthropic.APIStatusError) -> float | None:
@@ -496,10 +515,26 @@ class ClaudeClient:
         (``UNREADABLE``), which is no ``anthropic`` error. Here, and only here, such an
         error is the provider's answer being unreadable (``_unreadable``); the same
         class raised while the request is built or the answer is read is a bug of this
-        code and is left alone."""
+        code and is left alone. Two more answers are unreadable in the same way:
+
+        - a body the decoder gives up on with a plain ``ValueError`` (an integer of
+          more digits than Python converts). Only a ``ValueError`` that was raised
+          inside the decoder counts (``_from_the_decoder``); any other propagates.
+        - a 200 without a JSON content type whose body is not JSON (an HTML page from
+          something in between): the SDK then returns the body as text instead of a
+          message. Read as a message it would be an empty answer, which the stage
+          refuses as the model's own (a 422, with no retry and no step-down)."""
         try:
-            return await self._client.beta.messages.create(**arguments)
+            message = await self._client.beta.messages.create(**arguments)
         except UNREADABLE:
+            failure = self._unreadable()
+        except ValueError as exc:
+            if not _from_the_decoder(exc):
+                raise
+            failure = self._unreadable()
+        else:
+            if not isinstance(message, (str, bytes)):
+                return message
             failure = self._unreadable()
         # Raised out here: the decoder's error quotes the body it could not read.
         raise failure

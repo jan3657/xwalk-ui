@@ -1721,6 +1721,16 @@ async def test_an_answer_in_a_coding_that_cannot_be_decoded_is_a_fixed_failure(
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert provider_error(caught.value, provider).status == 502
     assert len(wire.requests) == 1
+    # The dispatch is settled as what it was, on every provider (re-review 3: the two
+    # OpenAI-compatible ones left it open, so the budget said the provider was well).
+    budget = llm.budget
+    assert budget.dispatched == 1 and budget.provider_error is not None
+    assert KEY not in budget.provider_error and "x-made-up" not in budget.provider_error
+    if provider != "anthropic":
+        assert budget.provider_error == "bad_answer"
+    with pytest.raises(LLMError) as limit:
+        await llm.complete(REQUEST)
+    assert failure_word(limit.value) == "call_limit" and len(wire.requests) == 1
 
 
 UNREADABLE = {
@@ -1729,6 +1739,8 @@ UNREADABLE = {
     "empty": b"",
     "not utf-8": b'\xff\xfe{"a":1}',
     "echoing": ('{"error": "' + KEY + '", ').encode(),
+    # Longer than Python converts: the decoder raises a plain ValueError, not its own.
+    "huge integer": b'{"id":"msg_1","n":' + b"9" * 4301 + b',"content":[{"type":"te',
 }
 WRONG_SHAPE = {
     "a list": b"[1, 2]",
@@ -1755,6 +1767,42 @@ async def test_a_200_that_is_not_json_is_the_providers_bad_answer(provider: str,
     error = provider_error(caught.value, provider)
     assert (error.status, error.code) == (502, "provider_error")
     assert leaks(strings(error) + str(caught.value)) == []
+
+
+NOT_JSON_TYPED = {
+    "html": (b"<html><body>busy</body></html>", {"Content-Type": "text/html"}),
+    "no content type, malformed": (b'{"id": "msg_1", "content": [', {}),
+    "no content type, empty": (b"", {}),
+    "no content type, huge integer": (UNREADABLE["huge integer"], {}),
+    "plain text echoing": (f"upstream says {KEY}".encode(), {"Content-Type": "text/plain"}),
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_JSON_TYPED), ids=list(NOT_JSON_TYPED))
+@pytest.mark.parametrize("provider", OWN_PROVIDERS)
+async def test_a_200_without_a_json_content_type_that_is_not_json_is_a_bad_answer(
+    provider: str, case: str
+) -> None:
+    """Re-review 3: for Anthropic the SDK hands such a body back as a string, which
+    passed for an empty answer (422). It is the provider's ``bad_answer`` like the
+    rest, and the call is settled as that in the budget."""
+    content, headers = NOT_JSON_TYPED[case]
+    lib: Any = httpx2 if provider == "anthropic" else httpx
+    wire = Wire(
+        provider,
+        lambda request: lib.Response(200, headers=headers, stream=lib.ByteStream(content)),
+    )
+    llm = build(wire, call_cap=1)
+    with pytest.raises(LLMError) as caught:
+        await llm.complete(REQUEST)
+    await llm.aclose()
+    assert str(caught.value) == f"{PROVIDER_NAMES[provider]} request failed (bad_answer)"
+    assert failure_word(caught.value) == "bad_answer"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    error = provider_error(caught.value, provider)
+    assert (error.status, error.code) == (502, "provider_error")
+    assert leaks(strings(error) + str(caught.value) + repr(vars(llm.budget))) == []
+    assert len(wire.requests) == 1
 
 
 @pytest.mark.parametrize("body", list(WRONG_SHAPE), ids=list(WRONG_SHAPE))

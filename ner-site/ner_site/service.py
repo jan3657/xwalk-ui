@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import re
 import threading
 import time
@@ -32,7 +33,14 @@ from xwalk.decide.budget import BudgetedDecider
 from xwalk.decide.fake import FakeDecider
 from xwalk.decide.jev import JevClient
 from xwalk.fingerprint import redact_url
-from xwalk.llm.base import LLMCapabilities, LLMClient, LLMError, LLMRequest, LLMResponse
+from xwalk.llm.base import (
+    LLMCapabilities,
+    LLMClient,
+    LLMError,
+    LLMRequest,
+    LLMResponse,
+    failure_usage,
+)
 from xwalk.llm.budget import BudgetedLLM, CallBudget, CallLimitExceeded
 from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
@@ -134,6 +142,11 @@ MIN_SELECT_BUDGET_S = 5.0
 
 MAX_ERROR_DETAIL = 300
 MIN_SCRUBBED_CHARS = 8
+# The stats passcode guards the operator's numbers on a public site, and nothing in
+# front of ``/api/stats`` limits how often it may be guessed: only a generated secret
+# will do, so anything shorter than ``openssl rand -hex 24`` at half its length is
+# refused (site analytics design, section 3.1 and "As built").
+MIN_STATS_PASSCODE_CHARS = 24
 
 # (env name, Limits field, lowest, highest). A value outside the range is a settings
 # error, not clamped: an operator who typed 500000 should learn that it was refused.
@@ -182,6 +195,7 @@ ENV_NAMES = (
     "NER_SITE_OWN_PROVIDERS",
     *(f"NER_SITE_OWN_MODELS_{p.upper()}" for p in providers.OWN_PROVIDERS),
     "NER_SITE_VISITOR_SALT",
+    "NER_SITE_STATS_PASSCODE",
 )
 
 
@@ -197,13 +211,62 @@ def _listed_own(env: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(p for p in (item.strip().lower() for item in raw.split(",")) if p))
 
 
-def uses_database(env: Mapping[str, str]) -> bool:
-    """The index backend or a live allowance needs the URL, including in the settings cache."""
+def _site_uses_database(env: Mapping[str, str]) -> bool:
+    """Whether the index backend or a live allowance needs the URL: everything that
+    read it before there was a record of runs."""
     if env.get("NER_SITE_BACKEND", "").strip().lower() == "neon":
         return True
     if env.get("NER_SITE_OFFLINE", "").strip().lower() in _TRUE:
         return False
     return bool(env.get("ANTHROPIC_API_KEY", "").strip() or _listed_own(env))
+
+
+def uses_database(env: Mapping[str, str]) -> bool:
+    """The index backend, a live allowance or the record of runs (which the stats
+    passcode turns on) needs the URL, including in the settings cache."""
+    return _site_uses_database(env) or bool((env.get("NER_SITE_STATS_PASSCODE") or "").strip())
+
+
+# One label of a host name: 1 to 63 letters, digits and hyphens, no hyphen at an end.
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _usable_database_url(url: str) -> bool:
+    """Whether a URL that only the record of runs reads can be used: a postgres:// or
+    postgresql:// URL, in plain ASCII without spaces (it is sent in a header as it
+    is), whose host is a DNS name and whose port, if it names one, is a number in
+    range. A name is labels of 1 to 63 letters, digits and hyphens, no hyphen at an
+    end of one, at most 253 characters, with or without one dot at its very end. An
+    address is not a name (a Neon host always is one): in brackets, with a dot at its
+    end, or in a resolver's short forms. Nothing in brackets is. Never
+    raises: the URL parser leaves the port and the brackets to whoever asks for them,
+    and anything it stumbles on then means "not usable"."""
+    if not url.isascii() or not all(0x21 <= ord(ch) <= 0x7E for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        parts.port  # noqa: B018 - raises for a port that is not a number in range
+    except ValueError:
+        return False
+    if parts.scheme not in {"postgres", "postgresql"} or not host or len(host) > 254:
+        return False
+    if "[" in parts.netloc or "]" in parts.netloc:
+        return False  # brackets hold an address, or something that is not a host at all
+    name = host[:-1] if host.endswith(".") else host
+    labels = name.split(".")
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return False
+    # A name whose last label is a number is read as an IPv4 address by resolvers and
+    # URL parsers, in decimal or hexadecimal and with fewer than four parts (127.1,
+    # 2130706433, 0x7f.1): not a name either.
+    if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", labels[-1]):
+        return False
+    return len(name) <= 253 and all(_DNS_LABEL.fullmatch(label) for label in labels)
 
 
 def _own_providers(env: Mapping[str, str]) -> tuple[providers.ProviderInfo, ...]:
@@ -270,6 +333,8 @@ class Settings:
     fallback_model: str = DEFAULT_FALLBACK_MODEL
     allowance: Allowance = field(default_factory=Allowance)
     visitor_salt: str | None = field(default=None, repr=False)
+    # Set: runs are recorded and GET /api/stats answers to it. Unset: neither exists.
+    stats_passcode: str | None = field(default=None, repr=False)
 
     # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
     own_providers: tuple[providers.ProviderInfo, ...] = ()
@@ -337,6 +402,14 @@ class Settings:
             # http.server decodes header values as Latin-1 and browsers refuse other
             # characters in a header, so a non-ASCII passcode could never match.
             raise SettingsError("NER_SITE_PASSCODE must be ASCII (printable, no accents)")
+        stats_passcode = get("NER_SITE_STATS_PASSCODE") or None
+        if stats_passcode is not None and not stats_passcode.isascii():
+            raise SettingsError("NER_SITE_STATS_PASSCODE must be ASCII (printable, no accents)")
+        if stats_passcode is not None and len(stats_passcode) < MIN_STATS_PASSCODE_CHARS:
+            raise SettingsError(
+                f"NER_SITE_STATS_PASSCODE must be at least {MIN_STATS_PASSCODE_CHARS} "
+                "characters; generate one, for example with: openssl rand -hex 24"
+            )
 
         offline_raw = get("NER_SITE_OFFLINE").lower()
         if offline_raw not in _TRUE | _FALSE:
@@ -371,6 +444,17 @@ class Settings:
             raise SettingsError("NER_SITE_NEON_CATALOG=full needs NER_SITE_BACKEND=neon")
         own_providers = _own_providers(env)
         database_url = (get("DATABASE_URL") or None) if uses_database(env) else None
+        if (
+            database_url is not None
+            and not _site_uses_database(env)
+            and not _usable_database_url(database_url)
+        ):
+            # Read for the record of runs alone: until the stats passcode was set this
+            # deployment did not look at the variable, so a value that cannot be used
+            # must not become a settings error that answers 503 on every route. There
+            # are then no statistics (GET /api/stats says so, 503), and nothing else
+            # changes.
+            database_url = None
         if database_url is not None and urlsplit(database_url).scheme not in {
             "postgres",
             "postgresql",
@@ -418,6 +502,7 @@ class Settings:
             allowance=Allowance(**allowance),
             own_providers=own_providers,
             visitor_salt=get("NER_SITE_VISITOR_SALT") or None,
+            stats_passcode=stats_passcode,
         )
         if not settings.offered_models:
             raise SettingsError(
@@ -516,6 +601,7 @@ class Settings:
             self.passcode,
             self.database_url,
             self.visitor_salt,
+            self.stats_passcode,
         ]
         if self.database_url:
             password = urlsplit(self.database_url).password
@@ -1232,6 +1318,10 @@ async def run(
             )
         else:
             raise
+        if isinstance(exc, LLMError):
+            # What the failed calls are known to have used (a refusal reports its
+            # tokens): the handler keeps it for the run's row, never for the answer.
+            failure.usage = failure_usage(exc)
     else:
         failure = None
     if failure is not None:

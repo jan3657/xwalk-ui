@@ -337,6 +337,9 @@ class ServiceError(Exception):
         # For a failure on a visitor's own key: the class name of what failed, for the
         # request's log line only (``providers.provider_error``). Never sent.
         self.own_error: str | None = None
+        # For a failure of the model calls: what they are known to have used (an
+        # ``xwalk.records.Usage``), for the record of runs only. Never sent.
+        self.usage: Any = None
 
     def envelope(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message}}

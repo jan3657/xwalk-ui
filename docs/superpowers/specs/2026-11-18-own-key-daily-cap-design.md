@@ -325,15 +325,27 @@ points marked "final review" were changed after two reviews of the whole branch.
   one of two fixed content types, `content-length`, `retry-after` and
   `retry-after-ms` only in a strict form, and `content-encoding` rewritten in lower
   case when the client can decode every coding in it (third round: otherwise the
-  answer is a `bad_answer` failure, not a body passed on still encoded).
+  answer is a `bad_answer` failure, not a body passed on still encoded; fourth
+  round: that failure is settled as `bad_answer` in the call budget on OpenAI and
+  OpenRouter too, where the dispatch had been left open).
 - **Own-path failures (section 5, final review).** Only a failure of the provider,
   the SDK, the HTTP library or a timeout is a provider error, also inside the
   clients themselves; any other exception is a fault of the site's code: 500
   `internal`, logged with its type and frames, during extraction, and a failed pick
   during selection. A 200 from a provider that cannot be decoded is the provider's
-  failure (`bad_answer`), for all three. The log line names the class of what failed
+  failure (`bad_answer`), for all three. Fourth round: for Anthropic that includes a
+  200 that is not a message at all (an HTML page, or a body without a JSON content
+  type that is not JSON either; the SDK returns it as text, and it used to pass for
+  an empty answer) and a body the decoder gives up on with a plain `ValueError`
+  (it used to be a 500); on the site's key the same answers are `transient`, so the
+  chain retries and steps down. A `ValueError` from anywhere but the JSON decoder
+  and its scanner (the JSON encoder included) is not read as an unreadable answer:
+  it is a fault of the site's code like any other, so 500 `internal` during
+  extraction and a failed pick with the word `error` during selection. The log line
+  names the class of what failed
   in either stage (`own_error`, with `WireRefused` taking precedence, and
-  `own_errors` when picks failed for different reasons); a client that fails to
+  `own_errors`, every class with no cap, when picks failed for different reasons);
+  a client that fails to
   close is logged (`own_close_error`) and does not replace the result. The call
   budget of an own-key request remembers a failed call by its class only.
 - **Selector usage (section 6, final review).** `selector_calls` counts every call
