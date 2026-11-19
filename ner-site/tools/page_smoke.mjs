@@ -23,6 +23,13 @@
 // correct whether /api/health answers before it, after it, with an error, or never.
 // closing-panel covers the panel after the cards.
 //
+// The review states (no-script, bfcache-payer, run-locks-payer, health-out-of-order,
+// late-health-keeps-text, stalled-body, steps-and-allowance) each hold one failure that a
+// review found and that must not come back: a native form submission without the script,
+// a page restored from the back-forward cache after its key was forgotten, the payer or
+// model changed during a run, health answers arriving out of order or late, and an
+// answer whose body stalls.
+//
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
 
@@ -183,6 +190,10 @@ class Session {
     this.strayAuthorization = []; // any other request that carried an Authorization header
     this.health = "pass";
     this.healthGate = null; // a promise /api/health waits for before it answers
+    // Answers for the next reads of /api/health, one each, in the order the reads are
+    // made: { gate, health }. When it is empty, `health` and `healthGate` answer.
+    this.healthQueue = [];
+    this.noScript = false; // app.js is not served: the page as it is without it
     this.ner = "pass";
     this.example = "pass"; // example.json: "pass", "missing" (404), "garbage", or { gate }
     this.failedLoads = false; // a state that cuts the connection expects net::ERR_FAILED
@@ -209,6 +220,8 @@ class Session {
       if (status && where.includes("/api/") && this.expectedStatuses.has(Number(status[1]))) return;
       if (this.failedLoads && /net::ERR_FAILED/.test(text) && where.includes("/api/ner")) return;
       if (this.example === "missing" && where.includes("/example.json")) return;
+      // Without app.js: the load fails, and the policy refuses the form's submission.
+      if (this.noScript && (where.includes("/app.js") || /app\.js|form-action/.test(text))) return;
       this.failures.push(`console error: ${text} (${where})`);
     });
     page.on("request", (request) => {
@@ -233,11 +246,15 @@ class Session {
       if (example && example.gate) await example.gate;
       return route.continue();
     });
+    await page.route("**/app.js", (route) => (this.noScript ? route.abort("failed") : route.continue()));
     await page.route("**/api/health", async (route) => {
-      if (this.healthGate) await this.healthGate;
-      if (this.health === "pass") return route.continue();
-      if (this.health === "fail") return route.fulfill({ status: 500, contentType: "text/plain", body: "down" });
-      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(this.health) });
+      const queued = this.healthQueue.shift();
+      if (queued && queued.gate) await queued.gate;
+      else if (!queued && this.healthGate) await this.healthGate;
+      const health = queued ? queued.health : this.health;
+      if (health === "pass") return route.continue();
+      if (health === "fail") return route.fulfill({ status: 500, contentType: "text/plain", body: "down" });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(health) });
     });
     await page.route("**/api/ner", async (route) => {
       if (this.ner === "pass") return route.continue();
@@ -303,7 +320,7 @@ class Session {
     this.check(seen.text === text, `${what}: the text box holds ${JSON.stringify(seen.text.slice(0, 40))}`);
     this.check(seen.announce === "", `${what}: the example was announced: ${JSON.stringify(seen.announce)}`);
     this.check(/ChEBI/.test(seen.legend) && /FoodOn/.test(seen.legend), `${what}: the legend has no ontology names: ${JSON.stringify(seen.legend)}`);
-    if (counts) this.check(/searched 261,018 ontology terms by keyword and by meaning, and the model chose among real candidates/.test(seen.next || ""), `${what}: the closing panel says ${JSON.stringify(seen.next)}`);
+    if (counts) this.check(/^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning, and the model chose among real candidates\. The catalog holds 261,018 terms\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/.test(seen.next || ""), `${what}: the closing panel says ${JSON.stringify(seen.next)}`);
     this.check(this.posts.length === 0, `${what}: the example cost a request`);
     this.check(seen.stored.length === 0, `${what}: the page stored something: ${seen.stored.join(", ")}`);
     return seen;
@@ -414,7 +431,8 @@ class Session {
     this.check(run.inView, "Run cannot be scrolled fully into view");
     this.check(run.onTop, "Run is covered by another element");
     this.check(run.height >= 44, `Run is ${run.height}px tall, under the 44px touch target`);
-    this.check(!run.disabled, "Run is disabled at the end of the state");
+    // Without the script Run stays as index.html ships it: disabled.
+    this.check(run.disabled === this.noScript, `Run is ${run.disabled ? "disabled" : "enabled"} at the end of the state`);
     this.check(run.label === "Map this text", `Run label is ${JSON.stringify(run.label)}`);
     this.check(this.strayAuthorization.length === 0, `a key left the page outside POST /api/ner: ${this.strayAuthorization.join(", ")}`);
   }
@@ -471,6 +489,70 @@ class Session {
     this.check(!/you have used|your allowance|\byou used\b/i.test(seen.title + seen.body), `"${title}" blames the visitor for a per-network limit`);
   }
 
+  // What a browser fires when it brings the page back from the back-forward cache.
+  async restoredFromCache() {
+    await this.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await this.page.waitForLoadState("networkidle").catch(() => {});
+  }
+
+  // What a screen reader says after the Run button's name: its aria-describedby.
+  runDescription() {
+    return this.page.evaluate(() =>
+      (document.getElementById("run").getAttribute("aria-describedby") || "")
+        .split(/\s+/)
+        .map((id) => (document.getElementById(id) ? document.getElementById(id).textContent.trim() : ""))
+        .filter(Boolean)
+        .join(" "),
+    );
+  }
+
+  // The contrast ratio of an element's text (or of its ::placeholder) against what is
+  // painted behind it, with the opacity of every ancestor taken into account.
+  contrast(selector, pseudo) {
+    return this.page.evaluate(
+      ([sel, pseudoName]) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        const cx = canvas.getContext("2d", { willReadFrequently: true });
+        const rgba = (css) => {
+          cx.clearRect(0, 0, 1, 1);
+          cx.fillStyle = css;
+          cx.fillRect(0, 0, 1, 1);
+          const d = cx.getImageData(0, 0, 1, 1).data;
+          return [d[0], d[1], d[2], d[3] / 255];
+        };
+        const over = (top, under) => [0, 1, 2].map((i) => top[i] * top[3] + under[i] * (1 - top[3])).concat(1);
+        const mix = (inside, outside, alpha) => [0, 1, 2].map((i) => inside[i] * alpha + outside[i] * (1 - alpha)).concat(1);
+        const chain = [];
+        for (let n = document.querySelector(sel); n; n = n.parentElement) chain.unshift(n);
+        // Each ancestor paints its background on what is behind it; an ancestor with an
+        // opacity is then blended, with everything inside it, into what was behind.
+        const paint = (i, behind) => {
+          const style = getComputedStyle(chain[i]);
+          const bg = over(rgba(style.backgroundColor), behind);
+          let pair;
+          if (i === chain.length - 1) {
+            const own = pseudoName ? getComputedStyle(chain[i], pseudoName) : style;
+            const ink = rgba(own.color);
+            if (pseudoName) ink[3] *= Number(own.opacity);
+            pair = [bg, over(ink, bg)];
+          } else pair = paint(i + 1, bg);
+          const alpha = Number(style.opacity);
+          return alpha < 1 ? pair.map((c) => mix(c, behind, alpha)) : pair;
+        };
+        const [bg, fg] = paint(0, [255, 255, 255, 1]);
+        const lum = (c) => {
+          const [r, g, b] = c.slice(0, 3).map((v) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : ((v / 255 + 0.055) / 1.055) ** 2.4));
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const [hi, lo] = [lum(bg), lum(fg)].sort((a, b) => b - a);
+        return Math.round(((hi + 0.05) / (lo + 0.05)) * 100) / 100;
+      },
+      [selector, pseudo || null],
+    );
+  }
+
   async chooseOwnKey(providerId) {
     const { page } = this;
     if (!(await this.optionsOpen())) await page.click("#options > summary");
@@ -509,7 +591,11 @@ const STATES = {
     await s.expectText("#lede", /^Paste a sentence\. Claude finds the chemicals, diseases and foods in it, and xwalk links each one to a term in ChEBI, MeSH or FoodOn\.$/, "the lede");
     await s.expectText("#caveat", /^Searches 261,018 real ontology terms\. Every ID comes from the ontology; the model never writes one\.$/, "the trust line");
     await s.expectText("#options-summary", /^Options: Claude Opus 5\.5, free runs$/, "the Options summary");
-    await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\./, "the hint under Run");
+    await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\. Use public or de-identified text: it is sent to the model provider\.$/, "the hint under Run");
+    s.check(!/not saved|stores no|kept for one day/i.test(await s.text("#privacy")), "the footer still promises more than the site does");
+    await s.expectText("#privacy", /may keep recently embedded mentions in memory/, "the footer's line about the embedding cache");
+    const described = await s.runDescription();
+    s.check(/^Runs on this site's models, free\.$/.test(described), `Run is described as ${JSON.stringify(described)}`);
     await s.expectHidden("#banner", "the banner");
     await s.expectHidden("#allowance", "the free-runs line");
     s.check(!(await s.optionsOpen()), "Options should be closed on arrival");
@@ -534,6 +620,8 @@ const STATES = {
     await s.expectText("#text-error", /^Paste some text first, or tap Example\.$/);
     await s.expectHidden("#error", "the error box");
     s.check(s.posts.length === 0, "an empty text was submitted");
+    const faint = await s.contrast("#text", "::placeholder");
+    s.check(faint >= 4.5, `the placeholder's contrast is ${faint}:1`);
     const seen = await s.page.evaluate(() => {
       const r = document.getElementById("text-error").getBoundingClientRect();
       return r.top >= 0 && r.bottom <= window.innerHeight;
@@ -548,7 +636,24 @@ const STATES = {
     await s.open();
     await s.page.fill("#text", "a".repeat(5001));
     await s.expectVisible("#text-error", "the message at the text box, before Run");
-    await s.expectText("#text-error", /^This text is 5,001 characters; the demo takes up to 5,000\. Shorten it by 1\.$/);
+    await s.expectText("#text-error", /^This text is over the 5,000 character limit\. Shorten it to map it\.$/);
+    await s.expectText("#text-counter", /^5,001 \/ 5,000 characters, 1 over$/, "the counter over the limit");
+    // The alert is said when the limit is passed, not again on every keystroke after.
+    await s.page.evaluate(() => {
+      window.smokeAlerts = 0;
+      new MutationObserver((records) => {
+        window.smokeAlerts += records.length;
+      }).observe(document.getElementById("text-error"), { childList: true, characterData: true, subtree: true, attributes: true });
+    });
+    await s.page.focus("#text");
+    await s.page.evaluate(() => {
+      const box = document.getElementById("text");
+      box.setSelectionRange(box.value.length, box.value.length);
+    });
+    await s.page.keyboard.type("bcd");
+    await s.expectText("#text-counter", /^5,004 \/ 5,000 characters, 4 over$/, "the counter after more typing");
+    s.check((await s.page.evaluate(() => window.smokeAlerts)) === 0, "the too-long alert was rewritten while the visitor typed");
+    s.check(/\btext-error\b/.test(await s.page.getAttribute("#text", "aria-describedby")), "the text box is not described by its error");
     await s.run();
     await s.expectVisible("#text-error", "the message at the text box, after Run");
     await s.expectHidden("#error", "the error box");
@@ -593,6 +698,17 @@ const STATES = {
     await s.runExample();
     await s.expectError("The free runs for your network today are used.", { look: "notice", ownKey: true, body: /^They come back at (.+ \()?midnight UTC\)?\.$/ });
     await s.expectHidden("#allowance", "the free-runs line while the notice says the same");
+    // The tab is left open past midnight UTC and looked at again: the limit is over,
+    // and neither the notice nor the line beside Run goes on saying that it is not.
+    s.health = fixture("health");
+    await s.setVisibility("hidden");
+    await s.setVisibility("visible");
+    await s.expectHidden("#error", "the daily-limit notice once the limit is over");
+    await s.expectHidden("#allowance", "the daily-limit line once the limit is over");
+    await s.expectVisible("#run-hint", "the 'Free, no sign-up' hint once the limit is over");
+    s.health = fixture("health-day");
+    await s.run();
+    await s.expectError("The free runs for your network today are used.", { look: "notice", ownKey: true });
     await s.page.click("#error-own-key");
     s.check(await s.optionsOpen(), "'Use my own key' in the error box did not open Options");
     await s.expectHidden("#error", "the error box after 'Use my own key'");
@@ -662,13 +778,21 @@ const STATES = {
     await s.open();
     await s.chooseOwnKey("anthropic");
     await s.expectText("#options-summary", /^Options: your Anthropic key$/);
+    // A cheaper model chosen for the key comes back with it: a reload must not move the
+    // visitor's bill to the provider's default model.
+    await s.page.selectOption("#model", "claude-haiku-5-5");
+    await s.page.selectOption("#selector", "claude-haiku-5-5");
     await s.page.reload({ waitUntil: "networkidle" });
+    s.check((await s.page.inputValue("#model")) === "claude-haiku-5-5", `after the reload the model is ${await s.page.inputValue("#model")}`);
+    s.check((await s.page.inputValue("#selector")) === "claude-haiku-5-5", `after the reload the selector is ${await s.page.inputValue("#selector")}`);
+    const described = await s.runDescription();
+    s.check(/^Runs on your Anthropic key; Anthropic bills you\.$/.test(described), `Run is described as ${JSON.stringify(described)}`);
     s.check(await s.optionsOpen(), "Options is closed after a reload with an own key chosen");
     await s.expectText("#options-summary", /^Options: your Anthropic key$/, "the Options summary after the reload");
     await s.expectVisible("#own-key", "the key field after the reload");
     s.check((await s.page.inputValue("#provider")) === "anthropic", "the payer choice was not restored");
     s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the key was not restored");
-    await s.expectText("#run-hint", /^Runs on your Anthropic key\. Use public or de-identified text: it is sent to Anthropic and not saved by this site\.$/);
+    await s.expectText("#run-hint", /^Runs on your Anthropic key\. Use public or de-identified text: it is sent to Anthropic\.$/);
     await s.expectHidden("#payer", "the payer hold");
     const stored = await s.page.evaluate(() => Object.keys(window.sessionStorage).concat(Object.keys(window.localStorage)));
     s.check(stored.every((k) => k === "xwalk-ner-own-key" || k === "xwalk-ner-payer"), `unexpected storage entries: ${stored.join(", ")}`);
@@ -678,6 +802,7 @@ const STATES = {
     const post = s.posts[0] || { body: {}, authorization: "" };
     s.check(post.authorization === `Bearer ${FAKE_KEY}`, "the own-key run did not carry the key");
     s.check(post.body && post.body.provider === "anthropic", "the own-key run did not name its provider");
+    s.check(post.body && post.body.model === "claude-haiku-5-5" && post.body.selector === "claude-haiku-5-5", "the own-key run did not use the restored models");
   },
 
   // A saved own-key choice the site no longer offers: nothing runs until the visitor chooses.
@@ -722,6 +847,9 @@ const STATES = {
     await s.expectVisible("#payer", "the payer hold");
     await s.expectVisible("#payer-retry", "'Try again' in the hold");
     await s.expectVisible("#banner", "the banner");
+    await s.expectText("#banner", /^Could not reach the service\. Runs are on hold: see the note under the button\./, "the banner during a hold");
+    s.check(!/You can still try a run/.test(await s.text("#banner")), "the banner offers a run that the hold refuses");
+    s.check(/on hold until you choose who pays/.test(await s.runDescription()), "Run's description does not say that runs are held");
     s.check(await s.page.evaluate(() => document.getElementById("run").disabled), "Run is enabled during a payer hold");
     s.health = fixture("health");
     await s.page.click("#payer-retry");
@@ -916,7 +1044,7 @@ const STATES = {
 
     await s.expectText("#results-summary", /^7 mentions found: 3 matched, 1 to check, 1 where no term fits, 1 that could not be matched, 1 not looked up\.$/, "the summary");
     await s.expectText("#results-takeaway", /^In 1 of 4 matches Claude Opus 5\.5 chose a different term than the top search hit, and for 1 mention it found no fitting term rather than guess\.$/, "the takeaway");
-    await s.expectText("#status", /^Done in 8\.8 s: 3\.3 s reading the text, 2\.3 s searching, 3\.2 s choosing terms\.$/, "the one-sentence status");
+    await s.expectText("#status", /^Done in 8\.8 s: 3\.3 s reading the text, 2\.3 s searching, 3\.2 s choosing terms\. Read by Claude Opus 5\.5; terms chosen by Claude Opus 5\.5\.$/, "the status line, with the models that answered");
     await s.expectHidden("#results-cap", "the 25-cap line");
     await s.expectHidden("#stale", "the earlier-text line");
     await s.expectHidden("#warnings-box", "the notes box");
@@ -929,7 +1057,16 @@ const STATES = {
       const other = document.querySelector('#highlighted a[href="#card-e4"]');
       return { name: m.textContent, title: m.title, tags: document.querySelectorAll("#highlighted .mention-tag").length, other: other.textContent, count: document.querySelectorAll("#highlighted a.mention").length };
     });
-    s.check(mention.name === "metformin (chemical)" && mention.title === "metformin: chemical", `the mention's accessible name is ${JSON.stringify(mention.name)}`);
+    s.check(mention.name === "metformin (chemical)" && mention.title === "chemical", `the mention's accessible name is ${JSON.stringify(mention.name)}, its tooltip ${JSON.stringify(mention.title)}`);
+    // The visitor's words are text on the page, never the value of an attribute.
+    const copied = await s.page.evaluate(() => {
+      const found = [];
+      for (const node of document.querySelectorAll("#results *")) {
+        for (const attr of node.attributes) if (/metformin|aspirin|warfarin|oily fish/i.test(attr.value)) found.push(`${node.tagName.toLowerCase()}[${attr.name}]`);
+      }
+      return found;
+    });
+    s.check(copied.length === 0, `text of the submission is copied into attributes: ${copied.join(", ")}`);
     s.check(mention.other === "BRCA1 (other, not looked up)", `the unmapped mention's accessible name is ${JSON.stringify(mention.other)}`);
     s.check(mention.tags === 0 && mention.count === 7, "inline type pills are back, or a mention is not highlighted");
     await s.expectText("#legend", /Chemical\s*ChEBI · 219k terms/, "the legend");
@@ -950,6 +1087,9 @@ const STATES = {
     await s.page.click("#card-e1 .card-more");
     await s.expectVisible("#card-detail-e1", "the opened card's detail");
     await s.expectText("#card-detail-e1", /The reason for Aspirin\./);
+    // What 0.93 means is in the opened card: a phone has no hover for the tooltip.
+    await s.expectText("#card-detail-e1 .card-conf-note", /^0\.93 is the model's own confidence, not a measured accuracy\.$/, "the confidence line in the opened card");
+    s.check((await s.page.locator("#card-detail-e3 .card-conf-note, #card-detail-e5 .card-conf-note").count()) === 0, "a card with no term explains a confidence");
     s.check((await s.page.locator("#card-detail-e1 tbody tr:visible").count()) === 5, "the opened card does not list the top 5 candidates");
     s.check((await s.page.locator("#card-detail-e1 tr.is-picked").innerText()).includes("Aspirin (salt)"), "the chosen candidate is not marked");
     const wide = await s.page.locator("#card-detail-e1 td.cand-score").first().isVisible();
@@ -997,6 +1137,8 @@ const STATES = {
     await s.page.click("#no-entities-example");
     s.check((await s.page.inputValue("#text")).startsWith(EXAMPLE_FULL_START), "'Load example' in the panel did not fill the text box");
     await s.expectVisible("#stale", "the earlier-text line once the example is loaded");
+    const dimmed = await s.contrast("#no-entities-example");
+    s.check(dimmed >= 4.5, `"Load example" in the dimmed result has a contrast of ${dimmed}:1`);
   },
 
   // Each failure has its own words and one way on. None clears the text box.
@@ -1115,6 +1257,25 @@ const STATES = {
     const stored = await s.page.evaluate(() => Object.keys(window.sessionStorage).concat(Object.keys(window.localStorage)));
     s.check(stored.length === 0, `the page stored something: ${stored.join(", ")}`);
     s.check(!/aspirin|metformin/i.test(s.page.url()), "the text is in the URL");
+
+    // Clear and Example during a run are edits too: the answer leaves the focus alone.
+    for (const button of ["clear-text", "load-example"]) {
+      const held = s.gate();
+      s.ner = { gate: held.promise, body: shaped() };
+      await s.page.fill("#text", SHAPED_TEXT);
+      await s.run();
+      await s.expectVisible("#progress", "the progress bar");
+      await s.page.waitForTimeout(700);
+      await s.page.click(`#${button}`);
+      const y = await s.page.evaluate(() => window.scrollY);
+      held.release();
+      await s.settled();
+      await s.page.waitForTimeout(700);
+      const then = await s.page.evaluate(() => ({ y: window.scrollY, focus: document.activeElement && document.activeElement.id }));
+      s.check(then.focus !== "results-heading", `after #${button} during a run the answer took the focus`);
+      s.check(Math.abs(then.y - y) <= 2, `after #${button} during a run the answer scrolled the page (${y} -> ${then.y})`);
+      await s.expectVisible("#stale", `the earlier-text line after #${button} during a run`);
+    }
   },
 
   // ---------- the recorded example on arrival ----------
@@ -1152,8 +1313,9 @@ const STATES = {
     if (s.shot) await s.shot("edited");
     await s.page.fill("#text", EXAMPLE_FILE.text);
     await s.expectHidden("#stale", "the line once the box holds the example again");
+    // An empty box: there is no "yours" to map, so the line is not shown.
     await s.page.click("#clear-text");
-    await s.expectVisible("#stale", "the line after Clear");
+    await s.expectHidden("#stale", "the line about the example's text while the box is empty");
     s.check((await s.shown()).heading === "Example result", "Clear changed the heading");
 
     // A failed run leaves the example where it is, still labelled.
@@ -1326,7 +1488,8 @@ const STATES = {
     await s.runShaped();
     await s.expectVisible("#next", "the closing panel");
     await s.expectText("#next-title", /^That lookup is xwalk$/);
-    await s.expectText("#next-body", /^The model never writes an ID\. xwalk searched 261,018 ontology terms by keyword and by meaning, and the model chose among real candidates\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/);
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning, and the model chose among real candidates\. The catalog holds 261,018 terms\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/);
+    s.check(!/searched [\d,]+/.test(await s.text("#next-body")), "the closing panel says the run searched the whole catalog");
     const link = await s.page.evaluate(() => {
       const a = document.getElementById("next-github");
       const order = document.getElementById("cards").compareDocumentPosition(document.getElementById("next")) & Node.DOCUMENT_POSITION_FOLLOWING;
@@ -1350,10 +1513,37 @@ const STATES = {
     s.check(tried.focus === "text" && tried.inView, `'Try your own text' left the focus on #${tried.focus}, text box in view: ${tried.inView}`);
 
     // Only what is true of the result: no model chose, and half the search was off.
-    s.ner = { body: shaped({ entities: shaped().entities.map((e) => ({ ...e, pick: null })), retrieval: { bm25: { status: "ok" }, dense: { status: "unavailable", reason: "no index" } } }) };
+    const keywordOnly = (m) => ({ ...m, retrievers: { bm25: m.retrievers.bm25 } });
+    const searchOnly = shaped().entities.map((e) => ({ ...e, pick: null, matches: e.matches.map(keywordOnly), more: e.more.map(keywordOnly) }));
+    s.ner = { body: shaped({ entities: searchOnly, retrieval: { bm25: { status: "ok" }, dense: { status: "unavailable", reason: "no index" } } }) };
     await s.run();
     await s.settled();
-    await s.expectText("#next-body", /xwalk searched 261,018 ontology terms by keyword, and each mention shows the top search result\./, "the closing panel for a keyword-only run with no model");
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword, and each mention shows the top search result\. The catalog holds 261,018 terms\./, "the closing panel for a keyword-only run with no model");
+    await s.expectText("#status", /Read by Claude Opus 5\.5; no model chose the terms\.$/, "the status line of a run where no model chose");
+
+    // Every pick failed: a selector is named on each, but no model chose anything, and
+    // the cards do not show the top search result either. Nothing is said about choosing.
+    const failed = shaped().entities.map((e) => (e.pick ? { ...e, pick: { ...e.pick, status: "failed", id: null, label: null, url: null, confidence: null, explanation: "cut off by the request deadline" } } : e));
+    s.ner = { body: shaped({ entities: failed }) };
+    await s.run();
+    await s.settled();
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning\. The catalog holds 261,018 terms\./, "the closing panel when every pick failed");
+    s.check(!/chose|top search result/.test(await s.text("#next-body")), "the closing panel claims a choice that was not made");
+    await s.expectText("#status", /Read by Claude Opus 5\.5\.$/, "the status line when every pick failed");
+    await s.expectHidden("#results-takeaway", "the takeaway when every pick failed");
+    await s.page.click("#run-details > summary");
+    await s.expectText("#results-models", /^Extracted by Claude Opus 5\.5\. The model did not finish choosing the terms\.$/, "Run details when every pick failed");
+
+    // Both halves of the search were off: one sentence says so, not "keyword only" and
+    // "meaning only" at once; no mention has a term, and there is no lookup to point at.
+    const nothing = shaped().entities.map((e) => ({ ...e, pick: null, matches: [], more: [], notes: e.ontology ? ["every retriever failed; no matches"] : e.notes }));
+    s.ner = { body: shaped({ entities: nothing, retrieval: { bm25: { status: "unavailable", reason: "x" }, dense: { status: "unavailable", reason: "y" } } }) };
+    await s.run();
+    await s.settled();
+    await s.expectText("#notices", /^About this run\s*The search was unavailable for this run, so the mentions could not be looked up\.$/, "the notice when the whole search was off");
+    s.check(!/keyword only|meaning only/.test(await s.text("#results")), "the result says 'keyword only' and 'meaning only' at once");
+    s.check(!/top search result/.test(await s.text("#results")), "a result with no candidate claims a top search result");
+    await s.expectHidden("#next", "the closing panel when nothing could be looked up");
 
     // Nothing was looked up: there is no lookup to explain.
     s.ner = { body: shaped({ entities: [] }) };
@@ -1407,6 +1597,337 @@ const STATES = {
     await s.expectResults();
     await s.expectHidden("#error", "the error box after the run that worked");
     await s.expectHidden("#progress", "the progress bar after the run");
+  },
+
+  // ---------- what the reviews found ----------
+
+  // app.js never loads. The page then has a form and no handler: nothing may be
+  // submitted, and above all no text may end up in the address. Three things stand in
+  // the way, and each is checked by itself: Run ships disabled, the policy refuses any
+  // form submission, and no field has a name, so a submission would carry nothing.
+  async "no-script"(s) {
+    const SECRET = "Patient Jane Roe takes warfarin";
+    s.noScript = true;
+    const response = await fetch(s.base);
+    const policy = response.headers.get("content-security-policy") || "";
+    s.check(/(^|;)\s*form-action 'none'/.test(policy), `the Content-Security-Policy does not set form-action 'none': ${JSON.stringify(policy)}`);
+    const html = await response.text();
+    s.check(/<button type="submit" id="run"[^>]*\sdisabled>/.test(html), "Run is not disabled in index.html");
+    s.check(/<noscript><p class="banner">This demo needs JavaScript\.<\/p><\/noscript>/.test(html), "the noscript line is gone");
+    await s.page.goto(s.base, { waitUntil: "load" });
+    await s.page.waitForTimeout(300);
+    s.check(await s.page.evaluate(() => document.getElementById("run").disabled), "without the script Run is enabled");
+    const named = await s.page.evaluate(() => [...document.getElementById("ner-form").elements].filter((e) => e.name).map((e) => `#${e.id}[name=${e.name}]`));
+    s.check(named.length === 0, `form fields have names, so a native submission would carry them: ${named.join(", ")}`);
+    await s.page.fill("#text", SECRET);
+    // What a visitor can do: tap the button, or press Enter in a field.
+    const box = await s.page.locator("#run").boundingBox();
+    await s.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await s.page.evaluate(() => {
+      document.getElementById("passcode-field").hidden = false;
+    });
+    await s.page.fill("#passcode", "hunter2");
+    await s.page.press("#passcode", "Enter");
+    await s.page.waitForTimeout(400);
+    const clean = () => {
+      const url = new URL(s.page.url());
+      return url.search === "" && !/warfarin|Jane|hunter2/i.test(decodeURIComponent(url.href));
+    };
+    s.check(clean(), `a tap on Run without the script changed the address to ${s.page.url()}`);
+    // The button's own guard taken away: the policy and the missing names still hold.
+    await s.page.evaluate(() => {
+      document.getElementById("run").disabled = false;
+    });
+    await s.page.locator("#run").scrollIntoViewIfNeeded();
+    const again = await s.page.locator("#run").boundingBox();
+    await s.page.mouse.click(again.x + again.width / 2, again.y + again.height / 2);
+    await s.page.waitForTimeout(600);
+    s.check(clean(), `a native submission put the form in the address: ${s.page.url()}`);
+    s.check((await s.page.inputValue("#text").catch(() => "")) === SECRET, "a native submission reloaded the page");
+    s.check(s.posts.length === 0, "something was posted without the script");
+    // (Playwright goes on waiting for the navigation the policy refused; a fresh load
+    // of the page ends that wait, and the checks every state ends with run on it.)
+    await s.page.goto(s.base, { waitUntil: "load" });
+  },
+
+  // A page brought back from the back-forward cache is the old document, key field and
+  // all. If the key was forgotten, or the payer changed, in another document of the tab
+  // meanwhile, the restored page must not send the old key or write it back.
+  async "bfcache-payer"(s) {
+    s.health = fixture("health");
+    s.ner = { body: (request) => ({ ...fixture("ner-own"), provider: request.provider || "site" }) };
+    const stored = (entry) => s.page.evaluate((k) => window.sessionStorage.getItem(k), entry);
+    const drop = (...entries) => s.page.evaluate((keys) => keys.forEach((k) => window.sessionStorage.removeItem(k)), entries);
+    await s.open();
+    await s.chooseOwnKey("anthropic");
+    s.check(((await stored(OWN_KEY_ENTRY)) || "").includes(FAKE_KEY), "the key was not kept for the tab");
+
+    // "Forget key" pressed in another document of this tab, then Back to this one.
+    await drop(OWN_KEY_ENTRY);
+    await s.restoredFromCache();
+    s.check((await s.page.inputValue("#own-key")) === "", "a restored page kept a key that was forgotten");
+    s.check((await s.page.inputValue("#provider")) === "anthropic", "forgetting the key changed who pays");
+    await s.runExample();
+    await s.expectVisible("#own-key-error", "the request for a key");
+    await s.expectText("#own-key-error", /^Paste your Anthropic API key/);
+    s.check(s.posts.length === 0, "a restored page ran after its key was forgotten");
+    s.check((await stored(OWN_KEY_ENTRY)) === null, "a restored page wrote the forgotten key back");
+
+    // The payer switched to the site there: this page says so, and runs without a key.
+    await s.page.fill("#own-key", FAKE_KEY);
+    await drop(OWN_KEY_ENTRY, PAYER_ENTRY);
+    await s.restoredFromCache();
+    s.check((await s.page.inputValue("#provider")) === "site", "a restored page kept a payer that was changed");
+    s.check((await s.page.inputValue("#own-key")) === "", "a restored page kept the key of a payer that was changed");
+    await s.expectText("#run-hint", /^Free, no sign-up/, "the hint after the payer changed");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].authorization === "" && !s.posts[0].body.provider, "the run after the payer changed carried a key or a provider");
+    s.check((await stored(OWN_KEY_ENTRY)) === null && (await stored(PAYER_ENTRY)) === null, "a restored page wrote the old choice back");
+
+    // A choice that cannot be settled (its provider is not offered here) holds the run.
+    await s.page.evaluate((k) => window.sessionStorage.setItem(k, "openai-eu"), PAYER_ENTRY);
+    await s.restoredFromCache();
+    await s.expectVisible("#payer", "the payer hold on a restored page");
+    s.check(await s.page.evaluate(() => document.getElementById("run").disabled), "Run is enabled on a restored page whose payer is unsettled");
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 1, "a run was sent while the payer was unsettled");
+    await s.page.click("#payer-site");
+    await s.expectHidden("#payer", "the payer hold after choosing the site");
+
+    // The same through the browser's own history: a second copy of the page in this
+    // tab, "Forget key" there, then Back. Whether the browser restores the first copy
+    // from its cache or loads it again, the forgotten key is not in it and is not sent.
+    await s.chooseOwnKey("anthropic");
+    await s.page.goto(`${s.base}?copy=2`, { waitUntil: "networkidle" });
+    s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the second copy did not restore the key");
+    await s.page.click("#forget-key");
+    await s.page.goBack({ waitUntil: "load" });
+    await s.page.waitForLoadState("networkidle").catch(() => {});
+    await s.page.waitForTimeout(300);
+    s.check(!new URL(s.page.url()).search, `Back did not return to the first copy: ${s.page.url()}`);
+    s.check((await s.page.inputValue("#own-key")) === "", "after Back the page holds the forgotten key");
+    await s.runExample();
+    await s.page.waitForTimeout(400);
+    s.check(s.posts.length === 1, "after Back a run went out with the forgotten key");
+    s.check(s.posts.every((p) => !p.authorization), "the forgotten key was sent");
+    s.check((await stored(OWN_KEY_ENTRY)) === null, "after Back the forgotten key was written back");
+  },
+
+  // During a run nothing can change who pays or which models run, and what the page
+  // says about the run when it ends is about the provider and the model it was
+  // submitted with.
+  async "run-locks-payer"(s) {
+    s.health = fixture("health");
+    s.expectedStatuses.add(401);
+    s.expectedStatuses.add(429);
+    const gate = s.gate();
+    s.ner = { gate: gate.promise, status: 401, body: fixture("error-own-refused") };
+    await s.open();
+    await s.chooseOwnKey("anthropic");
+    await s.runExample();
+    await s.expectVisible("#progress", "the progress bar");
+    const locked = await s.page.evaluate(() => ["provider", "own-key", "forget-key", "model", "selector"].filter((id) => !document.getElementById(id).disabled));
+    s.check(locked.length === 0, `during a run these can still be changed: ${locked.join(", ")}`);
+    await s.expectText("#run-hint", /^Runs on your Anthropic key\./, "the hint during the run");
+    // Past the disabled controls, as a script or a restored form might: still no change.
+    await s.page.evaluate(() => {
+      const provider = document.getElementById("provider");
+      provider.value = "openrouter";
+      provider.dispatchEvent(new Event("change", { bubbles: true }));
+      document.getElementById("forget-key").click();
+      document.getElementById("model").value = "claude-haiku-5-5";
+    });
+    s.check((await s.page.inputValue("#provider")) === "anthropic", "the payer changed during a run");
+    s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the key was forgotten during a run");
+    await s.expectText("#options-summary", /^Options: your Anthropic key$/, "the Options summary during the run");
+    gate.release();
+    await s.settled();
+    await s.expectVisible("#own-key-error", "the message at the key field");
+    // The run was submitted with Claude Opus 5.5; the list was moved to Haiku meanwhile.
+    await s.expectText("#own-key-error", /^Anthropic did not accept this key\. .* may use Claude Opus 5\.5\.$/, "the key error, bound to the submitted provider and model");
+    s.check((s.posts[0] || { body: {} }).body.provider === "anthropic" && s.posts[0].body.model === "claude-opus-5-5", "the run was not the Anthropic run on Opus");
+    const open = await s.page.evaluate(() => ["provider", "own-key", "forget-key", "model", "selector"].filter((id) => document.getElementById(id).disabled));
+    s.check(open.length === 0, `after the run these are still disabled: ${open.join(", ")}`);
+
+    // A notice about the site's free runs does not stay up over another payer.
+    await s.page.selectOption("#provider", "site");
+    s.ner = { status: 429, headers: { "Retry-After": "1380" }, body: fixture("error-blocked") };
+    await s.run();
+    await s.expectError("The free runs for your network this hour are used.", { look: "notice", ownKey: true });
+    await s.page.selectOption("#provider", "openrouter");
+    await s.expectHidden("#error", "the free-runs notice after choosing an own key");
+    await s.page.selectOption("#provider", "site");
+  },
+
+  // The first health read of a cold function can answer after a run and the read that
+  // follows it. The late answer, or its failure, must not undo what the visitor chose
+  // in between.
+  async "health-out-of-order"(s) {
+    const settings = () => s.page.evaluate(() => ({ provider: document.getElementById("provider").value, model: document.getElementById("model").value, selector: document.getElementById("selector").value, key: document.getElementById("own-key").value }));
+    for (const late of ["answer", "failure"]) {
+      const first = s.gate();
+      s.healthQueue = [{ gate: first.promise, health: late === "answer" ? productionHealth() : "fail" }];
+      s.health = productionHealth();
+      s.ner = { body: shaped() };
+      if (late === "failure") s.expectedStatuses.add(500);
+      await s.openHeld();
+      await s.page.fill("#text", SHAPED_TEXT);
+      await s.run();
+      await s.expectVisible('#results[data-kind="run"] .card', "the result of a run made before health answered");
+      // The read after the run answers at once and fills the form.
+      await s.expectVisible("#options-summary", "the Options summary");
+      await s.page.waitForFunction(() => document.getElementById("provider").options.length > 1, null, { timeout: 5000 }).catch(() => s.failures.push("the read after the run did not fill the form"));
+      await s.chooseOwnKey("anthropic");
+      await s.page.selectOption("#model", "claude-haiku-5-5");
+      await s.page.selectOption("#selector", "claude-haiku-5-5");
+      const chosen = await settings();
+      first.release();
+      await s.page.waitForLoadState("networkidle").catch(() => {});
+      await s.page.waitForTimeout(400);
+      const kept = await settings();
+      s.check(JSON.stringify(kept) === JSON.stringify(chosen), `a late ${late} of the first health read changed the choices: ${JSON.stringify(chosen)} -> ${JSON.stringify(kept)}`);
+      await s.expectHidden("#payer", `the payer hold after a late ${late}`);
+      await s.expectHidden("#banner", `the banner after a late ${late}`);
+      await s.expectVisible("#model", `the model list after a late ${late}`);
+      await s.page.evaluate(() => window.sessionStorage.clear());
+    }
+    s.healthQueue = [];
+  },
+
+  // Map is pressed on the prefilled example before health answers; health then says
+  // this deployment is not the one the recorded example belongs to. The recording goes,
+  // the text that is being mapped stays, and its result is not called an earlier text's.
+  async "late-health-keeps-text"(s) {
+    const health = s.gate();
+    const answer = s.gate();
+    s.healthGate = health.promise;
+    s.health = fixture("health");
+    s.ner = { gate: answer.promise, body: shaped() };
+    await s.openHeld();
+    await s.expectExample("before health answers");
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar");
+    health.release();
+    await s.page.waitForFunction(() => /200-term sample/.test(document.getElementById("caveat").textContent), null, { timeout: 5000 }).catch(() => s.failures.push("health did not arrive during the run"));
+    await s.page.waitForTimeout(300);
+    s.check((await s.page.inputValue("#text")) === EXAMPLE_FILE.text, `health arriving during the run changed the text box to ${JSON.stringify((await s.page.inputValue("#text")).slice(0, 40))}`);
+    await s.expectHidden('#results[data-kind="example"]', "the recorded example on a sample catalog");
+    s.healthGate = null;
+    answer.release();
+    await s.expectVisible('#results[data-kind="run"] .card', "the result of the run");
+    await s.settled();
+    s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text, "the run did not send the example text");
+    s.check((await s.page.inputValue("#text")) === EXAMPLE_FILE.text, "the text box does not hold the text that was mapped");
+    await s.expectHidden("#stale", "the earlier-text line on a result for the text in the box");
+  },
+
+  // The answer's headers arrive and its body does not finish. The request's timer has
+  // to stay armed until the body is read; when it runs out, or the connection is cut,
+  // Run comes back and the visitor is told that the run may have been counted. The
+  // browser's fetch is replaced for POST /api/ner (a route cannot stall a body), and
+  // the 130-second timer is shortened to under a second.
+  async "stalled-body"(s) {
+    s.health = productionHealth();
+    await s.page.addInitScript(() => {
+      const realFetch = window.fetch.bind(window);
+      const realTimeout = window.setTimeout.bind(window);
+      window.setTimeout = (fn, ms, ...rest) => realTimeout(fn, ms === 130000 ? 800 : ms, ...rest);
+      window.fetch = (input, init = {}) => {
+        const url = typeof input === "string" ? input : input.url;
+        if (!window.smokeBody || !/\/api\/ner$/.test(url)) return realFetch(input, init);
+        const body = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"ok": true, "entities": ['));
+            if (window.smokeBody === "cut") realTimeout(() => controller.error(new TypeError("network error")), 200);
+            else if (init.signal) init.signal.addEventListener("abort", () => controller.error(new DOMException("The operation was aborted.", "AbortError")));
+          },
+        });
+        return Promise.resolve(new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }));
+      };
+    });
+    await s.open();
+    await s.page.fill("#text", SHAPED_TEXT);
+    const ended = (what) =>
+      s.page.waitForFunction(() => document.getElementById("run").getAttribute("aria-busy") === "false", null, { timeout: 8000 }).catch(() => {
+        s.failures.push(`${what}: Run is still disabled 8 seconds after a 0.8-second timeout`);
+      });
+
+    // Stalled: the phone is locked and unlocked meanwhile, as in the report.
+    await s.page.evaluate(() => {
+      window.smokeBody = "stall";
+    });
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar");
+    await s.setVisibility("hidden");
+    await s.setVisibility("visible");
+    await ended("a stalled body");
+    await s.expectError("The result did not finish arriving.", { action: "Run again", body: /Your text is still here\. The interrupted run may still have been counted\.$/ });
+
+    // Cut off part of the way through.
+    await s.page.evaluate(() => {
+      window.smokeBody = "cut";
+    });
+    await s.page.click("#error-action");
+    await ended("a body that was cut off");
+    await s.expectError("The connection dropped before the result arrived.", { action: "Run again", body: /The interrupted run may still have been counted\.$/ });
+    s.check((await s.page.inputValue("#text")) === SHAPED_TEXT, "an interrupted answer changed the text box");
+
+    // And the page is whole again: the next run, with a real answer, shows its result.
+    await s.page.evaluate(() => {
+      window.smokeBody = null;
+    });
+    s.ner = { body: shaped() };
+    await s.page.click("#error-action");
+    await s.expectResults();
+  },
+
+  // What the page promises before and during a run follows what will be submitted: the
+  // free-runs line names Claude Sonnet only for the step that uses Claude, the Decide
+  // step does not promise a model's pick when no model is asked, and the result names
+  // the models that answered.
+  async "steps-and-allowance"(s) {
+    const GEMINI = "google/gemini-3.1-flash-lite";
+    s.health = fixture("health-sonnet");
+    await s.open();
+    await s.expectText("#allowance", /Runs now start on Claude Sonnet, a faster model\.$/, "the free-runs line when Claude reads the text");
+    await s.page.click("#options > summary");
+    await s.page.selectOption("#model", GEMINI);
+    await s.expectText("#allowance", /^The free runs on Claude Opus for your network this hour are used\. The choice of terms now starts on Claude Sonnet, a faster model\.$/, "the free-runs line when only the choice of terms uses Claude");
+    await s.expectText("#options-summary", /^Options: Gemini 3\.1 Flash Lite, free runs$/, "the Options summary with Gemini reading");
+    await s.page.selectOption("#selector", GEMINI);
+    await s.expectHidden("#allowance", "the free-runs line when no step uses Claude");
+    await s.page.selectOption("#selector", "claude-opus-5-5");
+
+    // A model chooses: the Decide step says so, and the result names who answered.
+    let gate = s.gate();
+    s.ner = { gate: gate.promise, body: shaped({ model: GEMINI, selector: "claude-sonnet-5-5", entities: shaped().entities.map((e) => (e.pick ? { ...e, pick: { ...e.pick, selector: "claude-sonnet-5-5" } } : e)) }) };
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectVisible("#pipe-decide", "what the Decide step does");
+    await s.expectText("#pipe-decide", /^The model picks the best term from the shortlist/, "the Decide step when a model is asked to choose");
+    gate.release();
+    await s.expectResults();
+    await s.expectText("#status", /Read by Gemini 3\.1 Flash Lite; terms chosen by Claude Sonnet 5\.5\.$/, "the models that answered");
+    s.check(s.posts[0].body.model === GEMINI && s.posts[0].body.selector === "claude-opus-5-5", "the run was not submitted with the chosen models");
+
+    // The top search result, no model: nothing about a pick, a confidence or a reason.
+    await s.page.selectOption("#selector", "retrieval").catch(() => {});
+    if ((await s.page.inputValue("#selector")) !== "retrieval") {
+      // This fixture's site list has no "retrieval": an own key's default is that.
+      await s.chooseOwnKey("anthropic");
+    }
+    s.check((await s.page.inputValue("#selector")) === "retrieval", "the selector is not the top search result");
+    gate = s.gate();
+    s.ner = { gate: gate.promise, body: shaped({ entities: shaped().entities.map((e) => ({ ...e, pick: null })) }) };
+    await s.run();
+    await s.expectVisible("#pipe-decide", "what the Decide step does");
+    await s.expectText("#pipe-decide", /^No model chooses in this run: each mention gets its top search result\.$/, "the Decide step when no model is asked");
+    s.check(!/confidence|reason/.test(await s.text("#pipe-decide")), "the Decide step promises a confidence and a reason that will not come");
+    gate.release();
+    await s.expectResults();
+    await s.expectText("#status", /no model chose the terms\.$/, "the status line when no model chose");
   },
 };
 
