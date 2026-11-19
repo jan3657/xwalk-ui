@@ -2450,9 +2450,13 @@ const STATES = {
     await s.page.waitForTimeout(700);
     let g = await s.guide();
     s.check(g.view === "expanded" && g.toggle === "Close" && g.expanded === "true", `after "How it works" the figure is ${g.view}, its button ${JSON.stringify(g.toggle)}`);
-    s.check(g.play === "idle" && g.active.length === 0, "opening the figure started a play");
+    // The visitor asked to see it: it opens, comes into view and plays the chosen mention once.
+    s.check(g.play === "playing" || g.play === "done", `opening the figure did not start a play: ${g.play}`);
     const opened = await s.shown();
-    s.check(opened.scrollY === before.scrollY && opened.focus === "guide-toggle", `opening the figure moved the page: scrollY ${opened.scrollY}, focus ${opened.focus}`);
+    s.check(opened.scrollY >= before.scrollY && opened.focus === "guide-toggle", `opening the figure lost the place: scrollY ${opened.scrollY}, focus ${opened.focus}`);
+    await s.page.waitForFunction(() => document.getElementById("pipe").getAttribute("data-play") === "done", null, { timeout: 25000 });
+    await s.page.waitForTimeout(300);
+    g = await s.guide();
     s.check(g.chips.length === 7 && g.chips.filter((c) => c.current).map((c) => c.text).join() === "metformin", `the mentions to follow are ${JSON.stringify(g.chips)}`);
     s.check(g.chips.every((c) => c.tag === "BUTTON" && /\((chemical|disease|food)\)$/.test(c.name)), "a mention chip is not a button named with its type");
     // At rest: the finished figure for the mention where the selector overruled the search.

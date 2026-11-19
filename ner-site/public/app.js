@@ -1333,15 +1333,7 @@
       renderBanner(null, null);
       // Nothing is known about the catalog, so nothing is claimed about its size.
       el.caveat.hidden = true;
-      for (const node of el.pipe.querySelectorAll(".guide-node")) {
-    guide.nodes[node.getAttribute("data-k")] = node;
-    node.addEventListener("click", () => guideTap(node.getAttribute("data-k")));
-  }
-  el.guideToggle.addEventListener("click", () => guideSetOpen(!guideOpen()));
-  el.guidePlay.addEventListener("click", () => guidePlay(guide.at));
-  guideReset();
-
-  fillTopK(DEFAULT_LIMITS.top_k_max);
+      fillTopK(DEFAULT_LIMITS.top_k_max);
       el.modelField.hidden = true;
       updateCounter();
       // Still chosen (the visitor may have picked the site's models while waiting).
@@ -3217,7 +3209,15 @@
     guide.nodes[node.getAttribute("data-k")] = node;
     node.addEventListener("click", () => guideTap(node.getAttribute("data-k")));
   }
-  el.guideToggle.addEventListener("click", () => guideSetOpen(!guideOpen()));
+  // "How it works" is the visitor asking to see it: open the figure, bring it into view
+  // and play the chosen mention once. During a run it only opens.
+  el.guideToggle.addEventListener("click", () => {
+    const opening = !guideOpen();
+    guideSetOpen(opening);
+    if (!opening) return;
+    reveal(el.pipe, "start");
+    if (!state.running && guideEntities()[guide.at]) guidePlay(guide.at);
+  });
   el.guidePlay.addEventListener("click", () => guidePlay(guide.at));
   guideReset();
 
