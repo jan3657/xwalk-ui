@@ -1882,6 +1882,30 @@ Not run or not verified:
   connection timing out) is a lost row with `usage: "PostgresError"`: nothing is
   retried, because an insert is not idempotent.
 
+### Own keys turned on, 19 November 2026
+
+Checked on a preview deployment of `8c5d4f6` with
+`NER_SITE_OWN_PROVIDERS=anthropic,openai,openrouter`, no passcode, the bundled backend
+and a `DATABASE_URL` that cannot be reached:
+
+- The Vercel project has no log drains and no integrations, and its variables hold no
+  `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG`, `ANTHROPIC_BASE_URL` or proxy variable
+  (rollout steps 1 and 2, as far as the CLI and API show them; the firewall's logs
+  were not looked at).
+- `GET /api/health` listed the three providers with their default model lists.
+- A made-up key (`sk-rollout-sentinel-...`) sent once per provider: each answered 401
+  `provider_key_refused` naming the provider. Neither the three responses (headers
+  included) nor the deployment's function log held the key, its middle part, its
+  masked form or the word `Authorization`; the log has three `provider_key_refused`
+  lines. A key of five characters answered 400 `bad_credential` (step 3, by `curl`
+  through `vercel curl`, not with `tools/claude_check.py`).
+
+Not run: a real key on any provider (step 4), so no own-key run has succeeded
+anywhere; whether OpenAI's API knows `gpt-6-luna`; the flood limit against Neon with
+own keys; the browser's password manager (step 7). Production was then given
+`NER_SITE_OWN_PROVIDERS=anthropic,openai,openrouter` at the operator's request, with
+the passcode kept, so only passcode holders can use an own key.
+
 ### For the operator after deploying
 
 1. `GET /api/health`: `mode: live`, `llm: {"status": "ok"}`, `dense: ok`. Without
