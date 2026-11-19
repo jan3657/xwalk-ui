@@ -120,7 +120,8 @@ def test_the_footer_states_its_conditions() -> None:
     text = footer.group(0)
     assert (
         "<li>This site is built not to keep your text, prompt or results: its logs and its "
-        "database hold run metadata only, for example time, model, token counts and country, "
+        "database are designed to hold run metadata only, for example time, model, token counts "
+        "and country, "
         "and a visitor hash that changes every day.</li>"
     ) in text
     assert "<li>When embedding search is used, the mentions found in your text are sent" in text
