@@ -149,15 +149,22 @@
       </div>
     </form>
 
-    <!-- The three steps of a run. Idle: one compact row. While a run is under way the
-         same element shows what each step does, a moving bar and a clock. Nothing here
-         is ticked by a timer; data-step is ready for real events once the API streams. -->
-    <div id="pipe" class="pipe" data-state="idle">
-      <ol class="pipe-steps" aria-label="How a run works">
-        <li data-step="find"><b>Find</b><span class="pipe-desc" id="pipe-find">The language model reads your text and marks every chemical, disease and food.</span></li>
-        <li data-step="search"><b>Search</b><span class="pipe-desc" id="pipe-search">xwalk looks each one up in the full ontology with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.</span></li>
-        <li data-step="decide"><b>Decide</b><span class="pipe-desc" id="pipe-decide">A term is chosen for each mention from its shortlist.</span></li>
-      </ol>
+    <!-- How a run works, and its progress indicator. Collapsed (the default): one row
+         with the three agents this demo runs. While a run is under way the same row says
+         what each one does, with a moving bar and a clock; nothing is ticked by a timer.
+         Expanded: the whole figure. app.js plays one mention of the result on display
+         through it; the dashed boxes are the rest of the xwalk loop, which this demo
+         does not run. -->
+    <div id="pipe" class="pipe" data-state="idle" data-view="collapsed" data-play="idle" role="group" aria-label="How a run works">
+      <h2 class="guide-title" id="guide-title">How it works</h2>
+      <button type="button" id="guide-toggle" class="pill guide-toggle" aria-expanded="false" aria-controls="guide-follow guide-library guide-panel">How it works</button>
+      <div id="guide-follow" class="guide-follow">
+        <div id="guide-chips" class="guide-chips" role="group" aria-labelledby="guide-chips-label" hidden></div>
+        <div class="guide-controls">
+          <button type="button" id="guide-play" class="guide-play" disabled><span aria-hidden="true" id="guide-play-icon">&#9654;</span> <span id="guide-play-label">Play</span></button>
+          <span id="guide-hint" class="hint guide-hint">Tap a box to see what it does.</span>
+        </div>
+      </div>
       <div id="progress" class="pipe-run" hidden>
         <div class="progress-bar" aria-hidden="true"><span></span></div>
         <p class="hint pipe-clock">
@@ -165,6 +172,91 @@
           <span id="progress-time" class="progress-time" aria-hidden="true"></span>
         </p>
       </div>
+      <div class="guide-rows" id="guide-rows">
+        <div class="guide-row guide-demo">
+          <button type="button" class="guide-node" data-k="reader" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Reader</span>
+              <span class="guide-ns">finds the mentions</span>
+              <span class="pipe-desc" id="pipe-find">The language model reads your text and marks every chemical, disease and food.</span>
+            </span>
+          </button>
+          <span class="guide-arr" aria-hidden="true">&rarr;</span>
+          <button type="button" class="guide-node" data-k="retriever" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Retriever</span>
+              <span class="guide-ns" id="guide-retriever-sub">two searches, merged</span>
+              <span class="pipe-desc" id="pipe-search">xwalk looks each one up in the full ontology with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.</span>
+            </span>
+          </button>
+          <span class="guide-arr" aria-hidden="true">&rarr;</span>
+          <button type="button" class="guide-node" data-k="selector" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Selector</span>
+              <span class="guide-ns" id="guide-selector-sub">picks one, or none</span>
+              <span class="pipe-desc" id="pipe-decide">A term is chosen for each mention from its shortlist.</span>
+            </span>
+          </button>
+          <span class="guide-arr guide-arr-end" aria-hidden="true">&rarr;</span>
+          <button type="button" class="guide-node guide-res" data-k="result" aria-controls="guide-panel">
+            <span class="guide-txt">
+              <span class="guide-nn" id="guide-result-name">Ontology ID</span>
+              <span class="guide-ns" id="guide-result-sub">with the reason</span>
+            </span>
+          </button>
+        </div>
+        <div class="guide-library" id="guide-library">
+          <p class="guide-rowlabel">The xwalk library continues the loop (not run by this demo)</p>
+          <div class="guide-row">
+          <button type="button" class="guide-node guide-lib" data-k="scorer" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Scorer</span>
+              <span class="guide-ns">is it actually right?</span>
+            </span>
+          </button>
+          <span class="guide-arr" aria-hidden="true">&rarr;</span>
+          <button type="button" class="guide-node guide-lib" data-k="verifier" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Verifier</span>
+              <span class="guide-ns">second look, if in doubt</span>
+            </span>
+          </button>
+          <span class="guide-arr" aria-hidden="true">&rarr;</span>
+          <button type="button" class="guide-node guide-lib" data-k="policy" aria-controls="guide-panel">
+            <span class="guide-txt">
+              <span class="guide-nn">Policy</span>
+              <span class="guide-ns">one of four outcomes, or retry</span>
+            </span>
+          </button>
+          <span class="guide-arr guide-arr-back" aria-hidden="true">&#8634;</span>
+          <button type="button" class="guide-node guide-lib" data-k="rewriter" aria-controls="guide-panel">
+            <span class="guide-face" aria-hidden="true"><span class="guide-eye"></span><span class="guide-eye"></span></span>
+            <span class="guide-txt">
+              <span class="guide-nn">Rewriter</span>
+              <span class="guide-ns">new query, back to Retriever</span>
+            </span>
+          </button>
+          </div>
+          <div class="guide-row">
+          <button type="button" class="guide-node guide-lib" data-k="ledger" aria-controls="guide-panel">
+            <span class="guide-txt">
+              <span class="guide-nn">Ledger</span>
+              <span class="guide-ns">records every attempt, its candidates, the choice and the reason</span>
+            </span>
+          </button>
+          </div>
+          <p class="guide-loop">The full loop is described in the <a href="https://arxiv.org/abs/2603.09758" target="_blank" rel="noopener">FoodOntoRAG preprint</a>.</p>
+        </div>
+        <!-- What the chosen box did with the mention. Announced once per step: its
+             content is written in one go and then only revealed, never retyped. -->
+        <div class="guide-panel" id="guide-panel" aria-live="polite"></div>
+      </div>
+      <span class="guide-token" id="guide-token" aria-hidden="true"></span>
     </div>
 
     <!-- One box for a run that failed: a title, what to do, one action. Limits get the
