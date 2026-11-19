@@ -57,6 +57,8 @@ async function main() {
     page.on("pageerror", (err) => problems.push(`page error: ${err.message}`));
     page.on("console", (msg) => {
       if (msg.type() !== "error") return;
+      // Vercel serves /_vercel/insights/script.js; a local server has no such file.
+      if ((msg.location().url || "").includes("/_vercel/insights/") || msg.text().includes("/_vercel/insights/")) return;
       // An expected 4xx answer is logged by Chromium as a failed resource load.
       if (opts.expect === "error" && /status of 4\d\d/.test(msg.text())) return;
       problems.push(`console error: ${msg.text()}`);
