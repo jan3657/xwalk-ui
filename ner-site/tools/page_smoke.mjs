@@ -14,6 +14,10 @@
 // no console error (the missing /_vercel/insights/script.js and an API status the state
 // expects are ignored), no horizontal scroll, and the Run button can be reached.
 //
+// The result states (cards, no-entities, cap, stale, keeps-result, page-hidden) use a
+// response built here in the shape production answers: a pick per entity, one where the
+// model overruled the search, one it declined, one that failed, one not looked up.
+//
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
 
@@ -60,6 +64,86 @@ function productionHealth() {
   return health;
 }
 
+// ---------- a production-shaped response ----------
+
+const SHAPED_TEXT = "Aspirin and metformin with oily fish; BRCA1, warfarin, garlic and cumin.";
+const ONTOLOGY = { chemical: ["chebi", "CHEBI:"], disease: ["ctd-disease", "MESH:D"], food: ["foodon", "FOODON:"] };
+
+function candidates(prefix, labels, from) {
+  return labels.map((label, i) => ({
+    id: `${prefix}${from + i}`,
+    label,
+    score: 0.0328 - i * 0.0004,
+    retrievers: { bm25: i + 1, "dense-qwen3": i + 2 },
+    url: `https://example.org/term/${prefix}${from + i}`,
+  }));
+}
+
+// spec: [mention, type, status, pickIndex]. status null: no pick (search only);
+// type "other": not looked up.
+function shapedEntity(text, n, [mention, type, status, pickIndex]) {
+  const start = text.indexOf(mention);
+  const base = { id: `e${n}`, text: mention, type, start, end: start + mention.length };
+  if (type === "other") return { ...base, ontology: null, matches: [], more: [], notes: ["no ontology for type 'other'"], pick: null };
+  const [slug, prefix] = ONTOLOGY[type];
+  const all = candidates(prefix, [`${mention} (salt)`, mention.toLowerCase(), `${mention} acid`, `${mention} ester`, `${mention} hydrate`, `${mention} oxide`, `${mention} dimer`], n * 100);
+  let pick = null;
+  if (status) {
+    const chosen = Number.isInteger(pickIndex) ? all[pickIndex] : null;
+    pick = {
+      selector: "claude-opus-5-5",
+      status,
+      id: chosen ? chosen.id : null,
+      label: chosen ? chosen.label : null,
+      url: chosen ? chosen.url : null,
+      confidence: status === "failed" ? null : 0.93,
+      explanation: status === "failed" ? "cut off by the request deadline" : `The reason for ${mention}.`,
+    };
+  }
+  return { ...base, ontology: slug, matches: all.slice(0, 5), more: all.slice(5), notes: [], pick };
+}
+
+function shapedResponse(text, specs, extra = {}) {
+  return {
+    ok: true,
+    model: "claude-opus-5-5",
+    mode: "live",
+    selector: "claude-opus-5-5",
+    entities: specs.map((spec, i) => shapedEntity(text, i + 1, spec)),
+    retrieval: { bm25: { status: "ok" }, dense: { status: "ok" } },
+    warnings: [],
+    usage: { llm_calls: 1, prompt_tokens: 1134, completion_tokens: 187, embedding_requests: 1, selector_calls: specs.length, selector_prompt_tokens: 43198, selector_completion_tokens: 729, selector_cost_usd: null },
+    timing_ms: { extract: 3289, map: 2339, select: 3197, total: 8825 },
+    requested_model: "claude-opus-5-5",
+    requested_selector: "claude-opus-5-5",
+    fallbacks: [],
+    notices: [],
+    provider: "site",
+    credential_source: "site",
+    ...extra,
+  };
+}
+
+// Every row a card can be: matched (the top hit), override, declined, not looked up,
+// failed, needs a check, and matched again.
+const SHAPED_SPECS = [
+  ["Aspirin", "chemical", "match", 0],
+  ["metformin", "chemical", "match", 1],
+  ["oily fish", "food", "no_match", null],
+  ["BRCA1", "other", null, null],
+  ["warfarin", "chemical", "failed", null],
+  ["garlic", "food", "review", 0],
+  ["cumin", "food", "match", 0],
+];
+
+function shaped(extra) {
+  return shapedResponse(SHAPED_TEXT, SHAPED_SPECS, extra);
+}
+
+function apiError(code, message) {
+  return { ok: false, error: { code, message } };
+}
+
 function parseArgs(argv) {
   const opts = { only: null, widths: [390, 1280], shots: null, dark: false, list: false, positional: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -91,6 +175,7 @@ class Session {
     this.strayAuthorization = []; // any other request that carried an Authorization header
     this.health = "pass";
     this.ner = "pass";
+    this.failedLoads = false; // a state that cuts the connection expects net::ERR_FAILED
   }
 
   check(ok, message) {
@@ -98,7 +183,10 @@ class Session {
     return ok;
   }
 
-  // health: "pass", "fail", or a JSON body. ner: "pass" or { status, body }.
+  // health: "pass", "fail", or a JSON body. ner: "pass" or { status, body, headers,
+  // raw (a body that is not JSON), gate (a promise the answer waits for), abort (the
+  // connection is cut instead of answered) }. Read when the request arrives and again
+  // after the gate, so a state can decide the answer while the run is under way.
   async install() {
     const { page } = this;
     page.on("pageerror", (err) => this.failures.push(`page error: ${err.message}`));
@@ -109,6 +197,7 @@ class Session {
       if (where.includes("/_vercel/insights/") || text.includes("/_vercel/insights/")) return;
       const status = /status of (\d{3})/.exec(text);
       if (status && where.includes("/api/") && this.expectedStatuses.has(Number(status[1]))) return;
+      if (this.failedLoads && /net::ERR_FAILED/.test(text) && where.includes("/api/ner")) return;
       this.failures.push(`console error: ${text} (${where})`);
     });
     page.on("request", (request) => {
@@ -133,9 +222,13 @@ class Session {
     });
     await page.route("**/api/ner", async (route) => {
       if (this.ner === "pass") return route.continue();
-      let body = this.ner.body;
+      if (this.ner.gate) await this.ner.gate;
+      const ner = this.ner;
+      if (ner.abort) return route.abort("failed");
+      if (ner.raw !== undefined) return route.fulfill({ status: ner.status || 200, contentType: "text/html", body: ner.raw });
+      let body = ner.body;
       if (typeof body === "function") body = body(JSON.parse(route.request().postData() || "{}"));
-      return route.fulfill({ status: this.ner.status || 200, contentType: "application/json", body: JSON.stringify(body) });
+      return route.fulfill({ status: ner.status || 200, contentType: "application/json", headers: ner.headers || {}, body: JSON.stringify(body) });
     });
   }
 
@@ -197,7 +290,7 @@ class Session {
       this.page.waitForSelector("#results:not([hidden]) .card", { state: "visible", timeout: 130000 }).then(() => "results"),
       this.page.waitForSelector("#error:not([hidden])", { state: "visible", timeout: 130000 }).then(() => "error"),
     ]).catch(() => "nothing");
-    if (outcome === "error") this.failures.push(`run failed: ${await this.text("#error-message")}`);
+    if (outcome === "error") this.failures.push(`run failed: ${await this.text("#error-title")} ${await this.text("#error-message")}`);
     else if (outcome !== "results") this.failures.push("no results and no error after a run");
     await this.settled();
     return outcome === "results";
@@ -242,6 +335,58 @@ class Session {
     this.check(this.strayAuthorization.length === 0, `a key left the page outside POST /api/ner: ${this.strayAuthorization.join(", ")}`);
   }
 
+  // A gate for the next answers of /api/ner: they wait until release() is called.
+  gate() {
+    let release;
+    const promise = new Promise((resolve) => {
+      release = resolve;
+    });
+    return { promise, release };
+  }
+
+  // What the browser tells a page when the phone locks or the app changes.
+  async setVisibility(value) {
+    await this.page.evaluate((v) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => v });
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => v === "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, value);
+  }
+
+  // Runs the shaped text against a production health answer and waits for the cards.
+  async runShaped(response) {
+    this.health = productionHealth();
+    this.ner = { body: response || shaped() };
+    await this.open();
+    await this.page.fill("#text", SHAPED_TEXT);
+    await this.run();
+    return this.expectResults();
+  }
+
+  // The error box after a run that failed: its title, look and action.
+  async expectError(title, { look = "alert", action = null, ownKey = false, body = null } = {}) {
+    await this.settled();
+    await this.expectVisible("#error", `the error box (${title})`);
+    const seen = await this.page.evaluate(() => ({
+      title: document.getElementById("error-title").textContent,
+      body: document.getElementById("error-message").textContent,
+      notice: document.getElementById("error").classList.contains("notice"),
+      action: document.getElementById("error-action").hidden ? null : document.getElementById("error-action").textContent,
+      ownKey: !document.getElementById("error-own-key").hidden,
+      text: document.getElementById("text").value.length,
+      status: document.getElementById("status").textContent,
+    }));
+    this.check(seen.title === title, `error title is ${JSON.stringify(seen.title)}, expected ${JSON.stringify(title)}`);
+    this.check(seen.notice === (look === "notice"), `"${title}" has the wrong look (notice: ${seen.notice})`);
+    this.check(seen.action === action, `"${title}" offers ${JSON.stringify(seen.action)}, expected ${JSON.stringify(action)}`);
+    this.check(seen.ownKey === ownKey, `"${title}": 'Use my own key' shown is ${seen.ownKey}`);
+    this.check(/\S/.test(seen.body) && !/^Something went wrong/.test(seen.body), `"${title}" has no body`);
+    if (body) this.check(body.test(seen.body), `"${title}" body should match ${body}, got ${JSON.stringify(seen.body)}`);
+    this.check(seen.text > 0, `"${title}" cleared the text box`);
+    this.check(!/Failed after/.test(seen.status), `"${title}" still prints "Failed after"`);
+    this.check(!/you have used|your allowance|\byou used\b/i.test(seen.title + seen.body), `"${title}" blames the visitor for a per-network limit`);
+  }
+
   async chooseOwnKey(providerId) {
     const { page } = this;
     if (!(await this.optionsOpen())) await page.click("#options > summary");
@@ -262,6 +407,7 @@ const STATES = {
     await s.expectResults();
     s.check((await s.page.locator("#cards .card").count()) > 0, "no result cards");
     s.check(/\S/.test(await s.text("#results-summary")), "the results summary is empty");
+    await s.expectText("#status", /^Done in /, "the one-sentence status");
     await s.expectHidden("#error", "the error box");
     await s.expectHidden("#progress", "the progress bar after the run");
   },
@@ -329,7 +475,7 @@ const STATES = {
 
   async "limit-hour"(s) {
     s.health = fixture("health-blocked");
-    s.ner = { status: 429, body: fixture("error-blocked") };
+    s.ner = { status: 429, headers: { "Retry-After": "1380" }, body: fixture("error-blocked") };
     s.expectedStatuses.add(429);
     await s.open();
     await s.expectVisible("#allowance", "the free-runs line");
@@ -337,8 +483,7 @@ const STATES = {
     await s.expectHidden("#run-hint", "the 'Free, no sign-up' hint");
     await s.expectVisible("#use-own-key", "'Use my own key'");
     await s.runExample();
-    await s.expectVisible("#error", "the error box");
-    await s.settled();
+    await s.expectError("The free runs for your network this hour are used.", { look: "notice", ownKey: true, body: /^You can run again in 23 minutes\.$/ });
     await s.expectHidden("#results", "results");
     s.check((await s.page.inputValue("#text")).length > 0, "the text was cleared by the error");
     await s.page.click("#use-own-key");
@@ -356,8 +501,10 @@ const STATES = {
     await s.expectText("#allowance", /^The free runs for your network today are used\. They come back at .+\.$/);
     await s.expectVisible("#use-own-key", "'Use my own key'");
     await s.runExample();
-    await s.expectVisible("#error", "the error box");
-    await s.settled();
+    await s.expectError("The free runs for your network today are used.", { look: "notice", ownKey: true, body: /^They come back at (.+ \()?midnight UTC\)?\.$/ });
+    await s.page.click("#error-own-key");
+    s.check(await s.optionsOpen(), "'Use my own key' in the error box did not open Options");
+    await s.expectHidden("#error", "the error box after 'Use my own key'");
   },
 
   async "limits-unavailable"(s) {
@@ -367,8 +514,7 @@ const STATES = {
     await s.open();
     await s.expectText("#allowance", /^The demo is briefly unavailable\. Try again in a minute\.$/);
     await s.runExample();
-    await s.expectVisible("#error", "the error box");
-    await s.settled();
+    await s.expectError("The demo is briefly unavailable.", { look: "notice", action: "Try again", ownKey: true });
   },
 
   async sonnet(s) {
@@ -382,6 +528,8 @@ const STATES = {
     await s.expectText("#options-summary", /^Options: Claude Sonnet 5\.5, free runs$/);
     await s.runExample();
     await s.expectResults();
+    await s.expectText("#notices", /The free runs on Claude Opus for your network are used for now, so this ran on Claude Sonnet 5\.5\./, "the step-down note");
+    s.check(!/allowance/i.test(await s.text("#notices")), "the step-down note says 'allowance'");
   },
 
   async degraded(s) {
@@ -396,6 +544,12 @@ const STATES = {
     await s.run();
     await s.expectResults();
     await s.expectVisible("#banner", "the banner after the run");
+    await s.expectText("#notices", /Part of the search \(matching by meaning\) was unavailable for this run, so terms were found by keyword only\./, "the weaker-search note");
+    const shown = await s.page.evaluate(() => ["banner", "notices", "warnings-box", "results-summary", "results-takeaway"].map((id) => document.getElementById(id).innerText).join(" "));
+    s.check(!/BM25|retrieval|build_indexes|no index at/i.test(shown), `search jargon or the operator's reason is shown outside Run details: ${JSON.stringify(shown.slice(0, 200))}`);
+    await s.expectText("#results-takeaway", /^No model chose here: each mention shows its top search result\.$/, "the search-only line");
+    s.check((await s.page.locator("#cards .card.is-search .card-id").count()) > 0, "search-only cards show no top search result");
+    s.check((await s.page.locator("#cards .card-conf").count()) === 0, "a search-only card shows a confidence");
   },
 
   async fallback(s) {
@@ -405,6 +559,10 @@ const STATES = {
     await s.runExample();
     await s.expectResults();
     await s.expectVisible("#notices", "the notice about the model that answered");
+    await s.expectText("#notices", /Claude Opus 5\.5 was busy, so Claude Sonnet 5\.5 read your text instead\./, "the extraction step-down");
+    await s.expectText("#notices", /Claude Sonnet 5\.5 was busy part of the way through, so Gemini 3\.1 Flash Lite chose the terms for the remaining mentions\./, "the selection step-down");
+    await s.expectText("#warnings-box", /The model also named "Hydroxykynurenine", which does not appear in your text word for word, so it was left out\./, "the rewritten warning");
+    s.check(!/you asked for/.test(await s.text("#results")), "the results still say 'you asked for'");
   },
 
   async "own-key-restored"(s) {
@@ -489,16 +647,41 @@ const STATES = {
     s.expectedStatuses.add(401);
     await s.open();
     await s.chooseOwnKey("anthropic");
+    await s.expectText("#own-key-note", /Sent only with your runs.*Kept in this tab.*Anthropic bills you/s, "the three facts about the key");
+    await s.expectText("#selector-own", /^With your own key the top search result is used unless you choose a model here\.$/, "the line under the selector");
     // Closed again by the visitor: the error must bring the key field back.
     await s.page.click("#options > summary");
     await s.runExample();
-    await s.expectVisible("#error", "the error box");
-    await s.expectText("#error-message", /refused this key/);
+    await s.expectVisible("#own-key-error", "the message at the key field");
+    await s.expectText("#own-key-error", /^Anthropic did not accept this key\. Check that it was pasted whole, is still active, has credit, and may use Claude Opus 5\.5\.$/);
     await s.settled();
+    await s.expectHidden("#error", "the error box for a key error");
+    if (s.shot) await s.shot("refused");
     s.check(await s.optionsOpen(), "a refused key did not open Options");
     await s.expectVisible("#own-key", "the key field");
     s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the refused key was removed from the field");
     s.check((s.posts[0] || {}).authorization === `Bearer ${FAKE_KEY}`, "the own-key run did not carry the key");
+    s.check(!(await s.text("#own-key-error")).includes(FAKE_KEY), "the key is echoed in the message");
+    s.ner = { status: 429, body: apiError("provider_rate_limited", "Anthropic is rate limiting this key; try again shortly.") };
+    s.expectedStatuses.add(429);
+    await s.run();
+    await s.settled();
+    await s.expectText("#own-key-error", /^Anthropic is rate limiting your key\. Wait a minute and try again, or choose a smaller model\.$/);
+    s.ner = { status: 400, body: fixture("error-own-bad") };
+    s.expectedStatuses.add(400);
+    await s.run();
+    await s.settled();
+    await s.expectText("#own-key-error", /^This does not look like an API key\. Paste the whole key, with no spaces\.$/);
+    await s.expectHidden("#error", "the error box for a key error");
+    s.ner = { status: 429, headers: { "Retry-After": "600" }, body: apiError("visitor_limit_reached", "too many requests with your own key; try again in 10 minutes") };
+    await s.run();
+    await s.expectError("Too many runs with your own key.", { look: "notice", body: /Try again in 10 minutes\.$/ });
+    await s.page.fill("#own-key", "short");
+    await s.expectHidden("#own-key-error", "the key message after typing");
+    await s.run();
+    await s.expectText("#own-key-error", /^This does not look like an API key/);
+    s.check(s.posts.length === 4, `a malformed key was sent (${s.posts.length} POSTs)`);
+    await s.page.fill("#own-key", FAKE_KEY);
   },
 
   async "own-key-missing"(s) {
@@ -508,9 +691,15 @@ const STATES = {
     await s.page.selectOption("#provider", "openrouter");
     await s.page.click("#options > summary");
     await s.runExample();
-    await s.expectVisible("#error", "the error box");
+    await s.expectVisible("#own-key-error", "the message at the key field");
+    await s.expectText("#own-key-error", /^Paste your OpenRouter API key, or switch back to the free runs\.$/);
+    await s.expectHidden("#error", "the error box for a missing key");
     s.check(await s.optionsOpen(), "a missing key did not open Options");
     s.check(s.posts.length === 0, "a run without a key was sent");
+    await s.page.click("#own-key-error button");
+    s.check((await s.page.inputValue("#provider")) === "site", "'switch back to the free runs' did not choose the site");
+    await s.expectHidden("#own-key-error", "the key message after switching back");
+    await s.expectText("#options-summary", /free runs$/);
   },
 
   async "health-failing"(s) {
@@ -572,8 +761,14 @@ const STATES = {
     await s.open();
     await s.page.click("#options > summary");
     for (const id of ["provider", "model", "selector", "top-k"]) await s.expectVisible(`#${id}`, `#${id} inside Options`);
+    const marker = () => s.page.evaluate(() => getComputedStyle(document.querySelector("#prompt-editor > summary"), "::before").transform);
+    const closed = await marker();
     await s.page.click("#prompt-editor > summary");
     await s.expectVisible("#prompt", "the prompt editor");
+    await s.page.waitForTimeout(400); // the marker turns in 150 ms
+    s.check((await marker()) !== closed, "the prompt editor's marker does not turn when it opens");
+    const size = await s.page.evaluate(() => parseFloat(getComputedStyle(document.getElementById("prompt")).fontSize));
+    s.check(size >= 16, `the prompt box is ${size}px: iOS zooms the page on focus under 16px`);
     const options = await s.page.evaluate(() => [...document.getElementById("selector").options].map((o) => o.textContent));
     s.check(options.includes("Top search result, no model") && options.includes("Claude Opus 5.5 picks"), `selector options read ${options.join(" | ")}`);
     s.check(options.every((o) => !o.includes("/")), "a raw vendor/model id is shown in the selector list");
@@ -584,7 +779,300 @@ const STATES = {
     s.check(s.posts.length === 0, "a too-long prompt was submitted");
     await s.page.click("#prompt-reset");
   },
+
+  // Every kind of row, in the shape production answers.
+  async cards(s) {
+    await s.runShaped();
+    const cards = await s.page.evaluate(() =>
+      [...document.querySelectorAll("#cards .card")].map((c) => ({
+        id: c.id,
+        cls: c.className,
+        text: c.innerText.replace(/\s+/g, " ").trim(),
+        open: c.classList.contains("is-open"),
+        expanded: c.querySelector(".card-more") ? c.querySelector(".card-more").getAttribute("aria-expanded") : null,
+        height: Math.round(c.getBoundingClientRect().height),
+        link: c.querySelector("a.card-id") ? { href: c.querySelector("a.card-id").href, target: c.querySelector("a.card-id").target, h: c.querySelector("a.card-id").getBoundingClientRect().height } : null,
+        more: c.querySelector(".card-more") ? c.querySelector(".card-more").getBoundingClientRect().height : null,
+      })),
+    );
+    s.check(cards.length === 7 && cards.every((c, i) => c.id === `card-e${i + 1}`), `cards are ${cards.map((c) => c.id).join(",")}`);
+    const [aspirin, metformin, fish, brca, warfarin, garlic] = cards;
+    const has = (card, pattern, what) => s.check(pattern.test(card.text), `${what}: ${JSON.stringify(card.text.slice(0, 140))}`);
+    // matched: type and ontology in words, the ID as a link, the readable label, a quiet confidence
+    has(aspirin, /^Chemical · ChEBI 0\.93 (The model's own confidence, not a measured accuracy: 0\.93 )?Aspirin → (is )?CHEBI:100 Aspirin \(salt\) Why, and 7 candidates$/, "the matched card");
+    s.check(aspirin.link && aspirin.link.href === "https://example.org/term/CHEBI:100" && aspirin.link.target === "_blank", "the matched card's ID is not an external link");
+    s.check(!/%/.test(cards.map((c) => c.text).join(" ")), "a confidence is shown as a percentage");
+    s.check(!aspirin.open && aspirin.expanded === "false", "the matched card is open on arrival");
+    // override: the tag, and it opens itself as the first piece of reasoning
+    has(metformin, /not the top search hit/, "the override tag");
+    s.check(metformin.open && metformin.expanded === "true", "the first override card did not open itself");
+    has(metformin, /Search ranked metformin \(salt\) first; Claude Opus 5\.5 chose metformin instead\./, "the override sentence");
+    has(metformin, /The reason for metformin\..*Chosen by Claude Opus 5\.5 from 7 candidates found by xwalk\./, "the reason and who chose");
+    s.check(!/not the top search hit/.test(aspirin.text), "a top-hit pick is tagged as an override");
+    // declined, not looked up, failed, to check
+    has(fish, /^Food · FoodOn oily fish → no term fits Why, and 7 candidates$/, "the declined card");
+    s.check(!fish.open, "more than one card opened itself");
+    has(brca, /^Other BRCA1 → not looked up Recognised as an entity, but this demo has no ontology for it\. Genes, for example, are found but not mapped here\.$/, "the not-looked-up card");
+    s.check(brca.more === null, "the not-looked-up card has something to expand");
+    s.check(!/no ontology for type/.test(brca.text), "the raw server note is shown");
+    has(warfarin, /^Chemical · ChEBI warfarin → could not be matched 7 candidates$/, "the failed card");
+    has(garlic, /needs a check/, "the to-check tag");
+    for (const c of cards) {
+      if (c.more !== null) s.check(c.more >= 44, `${c.id}: the disclosure is ${c.more}px tall, under the 44px touch target`);
+      if (c.link) s.check(c.link.h >= 24, `${c.id}: the ID link is ${c.link.h}px tall, under 24px`);
+      if (!c.open && s.phone) s.check(c.height <= 150, `${c.id}: collapsed it is ${c.height}px tall on a phone`);
+    }
+
+    await s.expectText("#results-summary", /^7 mentions found: 3 matched, 1 to check, 1 where no term fits, 1 that could not be matched, 1 not looked up\.$/, "the summary");
+    await s.expectText("#results-takeaway", /^In 1 of 4 matches Claude Opus 5\.5 chose a different term than the top search hit, and for 1 mention it found no fitting term rather than guess\.$/, "the takeaway");
+    await s.expectText("#status", /^Done in 8\.8 s: 3\.3 s reading the text, 2\.3 s searching, 3\.2 s choosing terms\.$/, "the one-sentence status");
+    await s.expectHidden("#results-cap", "the 25-cap line");
+    await s.expectHidden("#stale", "the earlier-text line");
+    await s.expectHidden("#warnings-box", "the notes box");
+    const outside = await s.page.evaluate(() => ["results-summary", "results-takeaway", "status", "legend"].map((id) => document.getElementById(id).innerText).join(" "));
+    s.check(!/candidate|retrieval|allowance|BM25/i.test(outside), `expert words above the cards: ${JSON.stringify(outside)}`);
+
+    // the type is not said by colour alone
+    const mention = await s.page.evaluate(() => {
+      const m = document.querySelector('#highlighted a[href="#card-e2"]');
+      const other = document.querySelector('#highlighted a[href="#card-e4"]');
+      return { name: m.textContent, title: m.title, tags: document.querySelectorAll("#highlighted .mention-tag").length, other: other.textContent, count: document.querySelectorAll("#highlighted a.mention").length };
+    });
+    s.check(mention.name === "metformin (chemical)" && mention.title === "metformin: chemical", `the mention's accessible name is ${JSON.stringify(mention.name)}`);
+    s.check(mention.other === "BRCA1 (other, not looked up)", `the unmapped mention's accessible name is ${JSON.stringify(mention.other)}`);
+    s.check(mention.tags === 0 && mention.count === 7, "inline type pills are back, or a mention is not highlighted");
+    await s.expectText("#legend", /Chemical\s*ChEBI · 219k terms/, "the legend");
+    await s.expectText("#legend", /Other\s*not looked up/, "the legend for the unmapped type");
+    const conf = await s.page.evaluate(() => {
+      const c = document.querySelector("#card-e1 .card-conf");
+      return { title: c.title, spoken: c.querySelector(".visually-hidden").textContent };
+    });
+    s.check(conf.title === "The model's own confidence, not a measured accuracy" && conf.spoken.startsWith(conf.title), "the confidence has no explanation");
+
+    // after the run: one announcement, focus on the heading, nothing technical read out
+    const after = await s.page.evaluate(() => ({ focus: document.activeElement && document.activeElement.id, said: document.getElementById("announce").textContent, live: document.getElementById("status").getAttribute("aria-live"), summaryLive: document.getElementById("results-summary").getAttribute("aria-live") }));
+    s.check(after.focus === "results-heading", `after a run the focus is on #${after.focus}`);
+    s.check(/^Done\. 7 mentions found/.test(after.said), `the announcement is ${JSON.stringify(after.said)}`);
+    s.check(after.live === null && after.summaryLive === null, "the status or the summary is still a live region of its own");
+
+    // expand and collapse
+    await s.page.click("#card-e1 .card-more");
+    await s.expectVisible("#card-detail-e1", "the opened card's detail");
+    await s.expectText("#card-detail-e1", /The reason for Aspirin\./);
+    s.check((await s.page.locator("#card-detail-e1 tbody tr:visible").count()) === 5, "the opened card does not list the top 5 candidates");
+    s.check((await s.page.locator("#card-detail-e1 tr.is-picked").innerText()).includes("Aspirin (salt)"), "the chosen candidate is not marked");
+    const wide = await s.page.locator("#card-detail-e1 td.cand-score").first().isVisible();
+    s.check(wide === !s.phone, `scores and ranks are ${wide ? "shown" : "hidden"} at ${s.width}px`);
+    await s.page.click("#card-detail-e1 .cands-toggle");
+    s.check((await s.page.locator("#card-detail-e1 tbody tr:visible").count()) === 7, "'Show all' does not list every candidate");
+    await s.page.click("#card-e1 .card-more");
+    await s.expectHidden("#card-detail-e1", "the collapsed card's detail");
+    await s.expectText("#expand-all", /^Expand all$/);
+    await s.page.click("#expand-all");
+    s.check((await s.page.locator("#cards .card-detail:visible").count()) === 6, "'Expand all' did not open every card that has detail");
+    await s.expectText("#card-detail-e3", /Claude Opus 5\.5 looked at 7 candidates and declined to pick one\./, "the declined card's sentence");
+    await s.expectText("#card-detail-e5", /The model did not finish choosing a term\./, "the failed card's sentence");
+    s.check(!/cut off by the request deadline/.test(await s.text("#card-detail-e5")), "the failed card prints the raw reason");
+    s.check(!/\b(null|undefined|NaN)\b/.test(await s.text("#results")), "the results print null, undefined or NaN");
+    await s.expectText("#expand-all", /^Collapse all$/);
+    if (s.shot) await s.shot("expanded");
+    await s.page.click("#expand-all");
+    s.check((await s.page.locator("#cards .card-detail:visible").count()) === 0, "'Collapse all' left a card open");
+
+    // the numbers are one tap away, after the cards
+    s.check(!(await s.page.evaluate(() => document.getElementById("run-details").open)), "Run details is open on arrival");
+    await s.page.click("#run-details > summary");
+    await s.expectText("#run-details", /Extracted by Claude Opus 5\.5\. Terms picked by Claude Opus 5\.5\./);
+    await s.expectText("#run-details", /keyword \(BM25\) ok, embeddings \(dense\) ok/);
+    await s.expectText("#run-details", /1,134 in, 187 out \(extraction\)/);
+    s.check(!/cost unknown|\(live\)/.test(await s.text("#run-details")), "Run details still says 'cost unknown' or '(live)'");
+    const order = await s.page.evaluate(() => document.getElementById("cards").compareDocumentPosition(document.getElementById("run-details")) & Node.DOCUMENT_POSITION_FOLLOWING);
+    s.check(order !== 0, "Run details is not after the cards");
+  },
+
+  async "no-entities"(s) {
+    s.health = productionHealth();
+    s.ner = { body: shapedResponse("hello, testing", [], { timing_ms: { extract: 900, map: 0, total: 900 } }) };
+    await s.open();
+    await s.page.fill("#text", "hello, testing");
+    await s.run();
+    await s.expectVisible("#no-entities", "the no-entities panel");
+    await s.settled();
+    await s.expectText("#no-entities-title", /^No chemicals, diseases or foods found in this text\.$/);
+    await s.expectText("#no-entities-body", /The demo looks for those kinds of terms/);
+    for (const id of ["text-panel", "legend", "results-summary", "cards-tools", "error", "results-takeaway"]) await s.expectHidden(`#${id}`, `#${id} with no entities`);
+    s.check((await s.page.locator("#cards .card").count()) === 0, "cards with no entities");
+    s.check(/^Done\. No chemicals, diseases or foods found/.test(await s.page.evaluate(() => document.getElementById("announce").textContent)), "no entities is not announced");
+    await s.page.click("#no-entities-example");
+    s.check((await s.page.inputValue("#text")).startsWith(EXAMPLE_FULL_START), "'Load example' in the panel did not fill the text box");
+    await s.expectVisible("#stale", "the earlier-text line once the example is loaded");
+  },
+
+  // Each failure has its own words and one way on. None clears the text box.
+  async errors(s) {
+    s.health = productionHealth();
+    s.failedLoads = true;
+    for (const status of [400, 429, 500, 502, 503, 504]) s.expectedStatuses.add(status);
+    await s.open();
+    await s.page.fill("#text", "aspirin for a fever");
+    const cases = [
+      [{ status: 429, headers: { "Retry-After": "5" }, body: apiError("visitor_limit_reached", "too many requests at once; try again in a few seconds") }, "One run at a time.", { look: "notice", action: "Try again", body: /from your network/ }],
+      [{ status: 429, body: apiError("visitor_limit_reached", "you have used this hour's requests; try again in 23 minutes") }, "The free runs for your network this hour are used.", { look: "notice", ownKey: true, body: /^You can run again later this hour\.$/ }],
+      [{ status: 502, body: apiError("provider_error", "the model provider failed (OverloadedError: overloaded)") }, "The model is busy right now.", { action: "Try again" }],
+      [{ status: 502, body: apiError("provider_error", "the model did not answer within 60 seconds") }, "The model took too long.", { action: "Try again" }],
+      [{ status: 502, body: apiError("provider_error", "the model provider failed (LLMError: bad answer)") }, "The model could not finish this run.", { action: "Try again" }],
+      [{ status: 429, body: apiError("call_budget_exhausted", "the limit of 40 model calls per request was reached before the model answered; try again later") }, "The model is busy right now.", { action: "Try again" }],
+      [{ status: 504, raw: "<html>Gateway Timeout</html>" }, "The run took too long and was stopped.", { action: "Try again" }],
+      [{ status: 500, body: apiError("internal", "internal error; see the function log") }, "The demo hit an error on its side.", { action: "Try again", body: /open an issue/ }],
+      [{ status: 502, raw: "Bad Gateway" }, "The demo hit an error on its side.", { action: "Try again" }],
+      [{ status: 503, body: apiError("not_configured", "selector 'jev' has no client") }, "The demo hit an error on its side.", { action: "Try again" }],
+      [{ abort: true }, "You seem to be offline.", { action: "Try again" }],
+      [{ status: 400, body: apiError("bad_top_k", "'top_k' must be an integer") }, "Something went wrong.", { action: "Try again", body: /^'top_k' must be an integer$/ }],
+    ];
+    let first = true;
+    for (const [ner, title, expected] of cases) {
+      s.ner = ner;
+      // After the first, the box's own action is the way to run again.
+      if (first || !(await s.visible("#error-action"))) await s.run();
+      else await s.page.click("#error-action");
+      first = false;
+      await s.expectError(title, expected);
+    }
+    s.check(!/function log/.test(await s.text("#error")), "the visitor is sent to a function log");
+    const issue = await s.page.evaluate(() => {
+      const a = [...document.querySelectorAll("#error a")];
+      return a.length;
+    });
+    s.check(issue === 0, "a link from an earlier error is left in the box");
+    // What the server says about the text is said at the text box.
+    s.ner = { status: 400, body: fixture("error") };
+    await s.page.click("#error-action");
+    await s.settled();
+    await s.expectVisible("#text-error", "the message at the text box for a server refusal");
+    await s.expectHidden("#error", "the error box for a text error");
+    await s.page.fill("#text", "aspirin");
+    await s.expectHidden("#text-error", "the text message after typing");
+    // Dismiss does what it says.
+    s.ner = { status: 500, body: apiError("internal", "internal error; see the function log") };
+    await s.run();
+    await s.expectError("The demo hit an error on its side.", { action: "Try again" });
+    s.check((await s.page.evaluate(() => document.activeElement && document.activeElement.id)) === "error-action", "the error's action does not have the focus");
+    if (s.shot) await s.shot("site-fault");
+    await s.page.click("#error-dismiss");
+    await s.expectHidden("#error", "the error box after Dismiss");
+  },
+
+  // A failed run after a good one: the good result stays, the text stays.
+  async "keeps-result"(s) {
+    await s.runShaped();
+    s.expectedStatuses.add(500);
+    s.ner = { status: 500, body: apiError("internal", "internal error; see the function log") };
+    await s.run();
+    await s.expectError("The demo hit an error on its side.", { action: "Try again" });
+    await s.expectVisible("#results", "the last good result after a failed run");
+    s.check((await s.page.locator("#cards .card").count()) === 7, "the cards of the last good result are gone");
+    await s.expectHidden("#stale", "the earlier-text line (the text has not changed)");
+    s.check((await s.page.inputValue("#text")) === SHAPED_TEXT, "the failed run changed the text box");
+    const above = await s.page.evaluate(() => document.getElementById("error").getBoundingClientRect().top < document.getElementById("results").getBoundingClientRect().top);
+    s.check(above, "the error box is below the old result");
+    s.ner = { body: shaped() };
+    await s.page.click("#error-action");
+    await s.expectResults();
+    await s.expectHidden("#error", "the error box after a retry that worked");
+  },
+
+  // A result belongs to the text it was made from.
+  async stale(s) {
+    await s.runShaped();
+    await s.expectHidden("#stale", "the earlier-text line on a fresh result");
+    await s.page.fill("#text", `${SHAPED_TEXT} And more.`);
+    await s.expectVisible("#stale", "the earlier-text line after an edit");
+    await s.expectText("#stale", /^These results are for the earlier text\. Run again to map the text that is in the box now\.$/);
+    s.check(await s.page.evaluate(() => document.getElementById("results").classList.contains("is-stale") && Number(getComputedStyle(document.querySelector(".results-body")).opacity) < 1), "the earlier result is not dimmed");
+    if (s.shot) await s.shot("edited");
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.expectHidden("#stale", "the earlier-text line once the text is the same again");
+    await s.page.click("#clear-text");
+    await s.expectVisible("#stale", "the earlier-text line after Clear");
+
+    // Typing while a request is under way: the answer does not take the caret or the scroll.
+    const gate = s.gate();
+    s.ner = { gate: gate.promise, body: shaped() };
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar");
+    await s.page.waitForTimeout(700); // the smooth scroll to the steps ends
+    await s.page.locator("#text").scrollIntoViewIfNeeded();
+    await s.page.focus("#text");
+    // (The End key would scroll the page on macOS instead of moving the caret.)
+    await s.page.evaluate(() => {
+      const box = document.getElementById("text");
+      box.setSelectionRange(box.value.length, box.value.length);
+    });
+    await s.page.keyboard.type(" Also cumin.");
+    await s.page.waitForTimeout(300);
+    const before = await s.page.evaluate(() => window.scrollY);
+    gate.release();
+    await s.settled();
+    await s.page.waitForTimeout(700);
+    const after = await s.page.evaluate(() => ({ y: window.scrollY, focus: document.activeElement && document.activeElement.id, said: document.getElementById("announce").textContent }));
+    s.check(after.focus === "text", `the answer took the focus from the text box (now #${after.focus})`);
+    s.check(Math.abs(after.y - before) <= 2, `the answer scrolled the page while the visitor typed (${before} -> ${after.y})`);
+    s.check(/^Done\./.test(after.said) && /as it was when you ran it/.test(after.said), `the announcement is ${JSON.stringify(after.said)}`);
+    await s.expectVisible("#stale", "the earlier-text line on a result for a text edited meanwhile");
+    s.check((await s.page.inputValue("#text")).endsWith("Also cumin."), "the typed text was lost");
+    const stored = await s.page.evaluate(() => Object.keys(window.sessionStorage).concat(Object.keys(window.localStorage)));
+    s.check(stored.length === 0, `the page stored something: ${stored.join(", ")}`);
+    s.check(!/aspirin|metformin/i.test(s.page.url()), "the text is in the URL");
+  },
+
+  // 25 entities is the per-run cap, and the page says so beside the summary.
+  async cap(s) {
+    const words = Array.from({ length: 25 }, (_, i) => `compound${String.fromCharCode(97 + i)}`);
+    const text = `${words.join(", ")}.`;
+    s.health = productionHealth();
+    s.ner = { body: shapedResponse(text, words.map((w) => [w, "chemical", "match", 0]), { warnings: ["27 entities found; only the first 25 are kept"] }) };
+    await s.open();
+    await s.page.fill("#text", text);
+    await s.run();
+    await s.expectResults();
+    s.check((await s.page.locator("#cards .card").count()) === 25, "not 25 cards");
+    await s.expectVisible("#results-cap", "the line about the 25-entity cap");
+    await s.expectText("#results-cap", /^25 is the most one run returns, so a long text may hold more mentions than are shown\.$/);
+    await s.expectText("#warnings-box", /The model found 27 mentions; only the first 25 are shown\./, "the rewritten truncation warning");
+    await s.expectHidden("#results-takeaway", "the takeaway when the model overruled nothing");
+    s.check((await s.page.locator("#cards .card.is-open").count()) === 0, "a card opened itself with no override and nothing declined");
+  },
+
+  // The phone locks or the app changes during a run.
+  async "page-hidden"(s) {
+    s.health = productionHealth();
+    s.failedLoads = true;
+    let gate = s.gate();
+    s.ner = { gate: gate.promise, abort: true };
+    await s.open();
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectVisible("#progress", "the progress bar");
+    await s.setVisibility("hidden");
+    await s.setVisibility("visible");
+    gate.release();
+    await s.expectError("The connection dropped before the result arrived.", { action: "Run again", body: /Your text is still here\./ });
+    s.check((await s.page.inputValue("#text")) === SHAPED_TEXT, "the dropped run changed the text box");
+    // Hidden and shown again, and the request survives: the result arrives as usual.
+    gate = s.gate();
+    s.ner = { gate: gate.promise, body: shaped() };
+    await s.page.click("#error-action");
+    await s.expectVisible("#progress", "the progress bar of the second run");
+    await s.setVisibility("hidden");
+    await s.setVisibility("visible");
+    gate.release();
+    await s.expectResults();
+    await s.expectHidden("#error", "the error box after the run that worked");
+    await s.expectHidden("#progress", "the progress bar after the run");
+  },
 };
+
 
 // ---------- runner ----------
 
