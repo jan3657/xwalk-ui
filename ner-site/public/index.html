@@ -103,11 +103,12 @@
                 <div class="key-row">
                   <input id="own-key" type="password" autocomplete="off" spellcheck="false"
                     autocapitalize="off" autocorrect="off" data-1p-ignore data-lpignore="true"
-                    aria-describedby="own-key-note">
+                    aria-describedby="own-key-error own-key-note">
                   <button type="button" id="forget-key" class="ghost">Forget key</button>
                 </div>
+                <p id="own-key-error" class="field-error" role="alert" hidden></p>
               </div>
-              <p id="own-key-note" class="hint key-note" hidden></p>
+              <ul id="own-key-note" class="hint key-facts" hidden></ul>
             </div>
 
             <div class="field" id="model-field" hidden>
@@ -118,7 +119,8 @@
             <div class="field" id="selector-field" hidden>
               <label for="selector">How the final term is chosen</label>
               <span class="hint" id="selector-hint">The search returns several candidate terms per entity. A model reads them and picks one, or you can take the top search result as it is.</span>
-              <select id="selector" name="selector" aria-describedby="selector-hint"></select>
+              <select id="selector" name="selector" aria-describedby="selector-hint selector-own"></select>
+              <span class="hint" id="selector-own" hidden>With your own key the top search result is used unless you choose a model here.</span>
             </div>
             <div class="field narrow">
               <label for="top-k">Candidates listed per entity</label>
@@ -161,29 +163,60 @@
       </div>
     </div>
 
-    <div id="error" class="alert" role="alert" hidden>
-      <p><strong>Something went wrong.</strong> <span id="error-message"></span></p>
-      <button type="button" id="error-dismiss" class="ghost small">Dismiss</button>
+    <!-- One box for a run that failed: a title, what to do, one action. Limits get the
+         amber "notice" look (data-look), real failures the red one. -->
+    <div id="error" class="alert run-error" role="alert" hidden>
+      <div class="run-error-text">
+        <p class="run-error-title"><strong id="error-title">Something went wrong.</strong></p>
+        <p id="error-message"></p>
+      </div>
+      <div class="button-row">
+        <button type="button" id="error-action" class="secondary small" hidden>Try again</button>
+        <button type="button" id="error-own-key" class="secondary small" hidden>Use my own key</button>
+        <button type="button" id="error-dismiss" class="ghost small">Dismiss</button>
+      </div>
     </div>
 
-    <p id="status" class="status" role="status" aria-live="polite"></p>
+    <!-- Spoken, not shown: the start of a run, that it is still going, and its end. -->
+    <p id="announce" class="visually-hidden" role="status" aria-live="polite"></p>
 
     <section id="results" class="results" aria-labelledby="results-heading" hidden>
-      <div class="results-head">
-        <h2 id="results-heading">Results</h2>
-        <p id="results-summary" class="summary" aria-live="polite"></p>
-        <p id="results-models" class="ran-on"></p>
+      <p id="stale" class="stale-note" hidden>These results are for the earlier text. Run again to map the text that is in the box now.</p>
+      <div class="results-body">
+        <div class="results-head">
+          <h2 id="results-heading" tabindex="-1">Results</h2>
+          <p id="results-summary" class="summary"></p>
+          <p id="results-cap" class="results-cap" hidden></p>
+          <p id="results-takeaway" class="takeaway" hidden></p>
+          <p id="status" class="status"></p>
+        </div>
+        <div id="no-entities" class="no-entities" hidden>
+          <p class="no-entities-title"><strong id="no-entities-title">No chemicals, diseases or foods found in this text.</strong></p>
+          <p id="no-entities-body">The demo looks for those kinds of terms, for example "metformin", "type 2 diabetes" or "oat milk". Try a sentence from a paper abstract, a clinical note or a recipe.</p>
+          <button type="button" id="no-entities-example" class="secondary small">Load example</button>
+        </div>
+        <div class="panel text-panel" id="text-panel">
+          <p id="highlighted" class="highlighted"></p>
+          <ul id="legend" class="legend" aria-label="Entity types and their ontologies"></ul>
+        </div>
+        <div id="notices" class="notices" role="note" aria-labelledby="notices-title" hidden>
+          <p id="notices-title" class="notices-title">About this run</p>
+          <ul id="notices-list"></ul>
+        </div>
+        <div id="warnings-box" class="notices" role="note" aria-labelledby="warnings-title" hidden>
+          <p id="warnings-title" class="notices-title">Notes</p>
+          <ul id="warnings"></ul>
+        </div>
+        <div class="cards-tools" id="cards-tools" hidden>
+          <button type="button" id="expand-all" class="pill quiet" aria-expanded="false">Expand all</button>
+        </div>
+        <div id="cards" class="cards"></div>
+        <details id="run-details" class="run-details">
+          <summary>Run details</summary>
+          <p id="results-models" class="ran-on"></p>
+          <dl id="run-details-list" class="run-details-list"></dl>
+        </details>
       </div>
-      <div id="notices" class="notices" role="note" aria-labelledby="notices-title" hidden>
-        <p id="notices-title" class="notices-title">About this run</p>
-        <ul id="notices-list"></ul>
-      </div>
-      <div class="panel">
-        <p id="highlighted" class="highlighted"></p>
-        <ul id="legend" class="legend" aria-label="Entity types and their ontologies"></ul>
-      </div>
-      <ul id="warnings" class="warnings" aria-label="Warnings" hidden></ul>
-      <div id="cards" class="cards"></div>
     </section>
 
     <footer class="footer" id="privacy">
