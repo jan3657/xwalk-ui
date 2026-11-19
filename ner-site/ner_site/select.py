@@ -15,13 +15,24 @@ ever resolve to a candidate retrieved for the entity: Jev chooses among keys, an
 key is resolved by exact lookup, so a malformed or invented answer is a failed pick, never
 an id. Every failure (provider error, timeout, the request deadline) becomes a ``failed``
 pick with its reason, never an exception.
+
+The pick cache (``ner_site.cache``): with `cache`, a question that was answered before
+is not asked again. The question is everything the selector was shown: who pays, the
+model (or ``jev``), the mention with its type and ontology, the exact text on either
+side of it (``CONTEXT_CHARS`` each), and the exact candidates in order. The mention
+alone is never the key: "green tea" after "drank" is the drink, elsewhere the leaf.
+On a fallback chain a pick is looked up under the model the chain would ask now and
+stored under the model of the step that answered, so a pick is only ever reused where
+the same model would have been asked. Stored: a pick that is not ``failed`` and was
+not served by another model than the one asked (a provider's own refusal fallback).
+A hit costs no call and no tokens (``SelectStats.cache_hits`` counts them).
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -42,6 +53,7 @@ from xwalk.stages.screen import Screener
 from xwalk.stages.select import Selector, SelectorPolicy
 from xwalk.templates import TemplateSet
 
+from ner_site.cache import TTLCache, pick_key
 from ner_site.indexes import OntologyIndex
 from ner_site.mapping import MAX_LISTED
 from ner_site.ontologies import DOC_TEMPLATE, term_url
@@ -121,6 +133,11 @@ class SelectStats:
     cost_usd: float | None = 0.0
     cost_reported: bool = True  # False for selectors whose provider reports no cost
     served_elsewhere: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # entity id -> the model of the chain step that answered its pick (the id the
+    # site asks for, which a provider may answer under a dated name).
+    asked: dict[str, str] = field(default_factory=dict)
+    # Picks answered from the pick cache: no call was made for them.
+    cache_hits: int = 0
 
     def add(self, usage: XwalkUsage) -> None:
         self.calls += usage.calls
@@ -309,6 +326,9 @@ async def _with_llm(
     answered = getattr(view, "answered_by", None)
     if answered:
         selector = answered
+        asked = getattr(view, "asked", None)
+        if asked:
+            stats.asked[entity.id] = asked
         if getattr(view, "served_by_fallback", False) and view.asked:
             stats.served_elsewhere[entity.id] = (view.asked, answered)
     choice = outcome.choice
@@ -356,10 +376,18 @@ async def select_entities(
     llm: LLMClient | None = None,
     deadline: float | None = None,
     own_key: bool = False,
+    cache: TTLCache[Pick] | None = None,
+    payer: str = "site",
+    clean: Callable[[str], str] | None = None,
 ) -> list[EntityResult]:
     """`results` with ``pick`` set for every entity that was routed to an ontology and
     has candidates (None otherwise, and for ``retrieval``). `candidates` maps entity ids
-    to their fused candidates; `deadline` (seconds from now) bounds the whole step."""
+    to their fused candidates; `deadline` (seconds from now) bounds the whole step.
+
+    `cache` is the pick cache (module docstring) and `payer` who pays for the calls
+    (``site`` or the own-key provider's id), which is part of its keys. `clean` is
+    applied to a pick's explanation before the pick is stored, so that what the cache
+    holds is what a response may carry (the service scrubs secrets there)."""
     if selector == RETRIEVAL_ONLY:
         return list(results)
     if selector == JEV and decider is None:
@@ -372,6 +400,23 @@ async def select_entities(
     deadline_note = "timeout" if own_key else DEADLINE_NOTE
     deadline_at = None if deadline is None else time.monotonic() + deadline
     semaphore = asyncio.Semaphore(CONCURRENCY)
+    remember = cache if cache is not None and cache.enabled else None
+    # A chain is looked up under the model it would ask now; anything else under the
+    # selector that was asked for.
+    on_chain = selector != JEV and not own_key and callable(getattr(llm, "view", None))
+
+    def key_for(entity: EntityResult, found: Sequence[Candidate], model: str) -> str:
+        source = _source(entity, text)
+        return pick_key(
+            payer=payer,
+            selector=model,
+            entity_type=entity.type,
+            ontology=entity.ontology or "",
+            mention=entity.text,
+            left=str(source.fields["context_left"]),
+            right=str(source.fields["context_right"]),
+            candidate_ids=[c.id for c in found],
+        )
 
     async def one(entity: EntityResult) -> EntityResult:
         found = list(candidates.get(entity.id, ()))[:MAX_CANDIDATES]
@@ -379,6 +424,12 @@ async def select_entities(
         if index is None or not found or entity.type not in POLICIES:
             return entity
         async with semaphore:
+            if remember is not None:
+                asking = str(getattr(llm, "model", selector)) if on_chain else selector
+                hit = remember.get(key_for(entity, found, asking))
+                if hit is not None:
+                    stats.cache_hits += 1
+                    return entity.model_copy(update={"pick": hit[0].model_copy()})
             remaining = None if deadline_at is None else deadline_at - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return entity.model_copy(
@@ -405,6 +456,18 @@ async def select_entities(
                     found,
                     explanation=failure_word(exc) if own_key else f"{type(exc).__name__}: {exc}",
                 )
+            else:
+                if (
+                    remember is not None
+                    and pick.status != "failed"
+                    and entity.id not in stats.served_elsewhere
+                ):
+                    if clean is not None:
+                        pick = pick.model_copy(update={"explanation": clean(pick.explanation)})
+                    # A chain's pick whose step is not known is not stored at all.
+                    answered_on = stats.asked.get(entity.id) if on_chain else selector
+                    if answered_on:
+                        remember.put(key_for(entity, found, answered_on), pick.model_copy())
         return entity.model_copy(update={"pick": pick})
 
     picked = list(await asyncio.gather(*(one(e) for e in results)))

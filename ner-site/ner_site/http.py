@@ -8,8 +8,8 @@ JSON body, ``Cache-Control: no-store`` and no ``Access-Control-*`` header.
 Order of checks for ``POST /api/ner``: path (404), method (405; ``OPTIONS`` too, on
 purpose, so no preflight ever succeeds), body size (413), ``X-Requested-With:
 xwalk-ner`` (400 ``bad_header``), passcode, JSON, credential, site configuration,
-provider-specific validation, indexes and finally admission before any chat client
-is built. Site-key Claude deployments apply the hourly and daily allowances and
+provider-specific validation, the response cache, indexes and finally admission before
+any chat client is built. Site-key Claude deployments apply the hourly and daily allowances and
 refuse a request if the counters cannot be consulted. Own-key runs have separate
 flood limits and can proceed during a counter outage. The visitor is a
 keyed hash of the client address; neither it nor the address is ever logged or returned.
@@ -19,6 +19,14 @@ With ``NER_SITE_STATS_PASSCODE`` set (site analytics design, sections 3 and 4), 
 ``usage.SiteRuns`` once its response is built, and ``GET /api/stats`` (its own passcode,
 no other check) reads the rows back. Unset, neither exists: nothing is built or sent,
 and ``/api/stats`` is the 404 of any unknown path.
+
+The response cache (``ner_site.cache``). A validated request whose text, prompt, model,
+selector, ``top_k`` and payer are those of a recent clean run of this warm instance is
+answered with that run's response: no index is opened, no model is called, and it is
+looked up before admission, so it does not use up one of the visitor's runs. Everything
+that refuses a request before admission still refuses it first, because the lookup
+comes after all of it. The stored value is the response as it was sent, after
+redaction; a hit says so in ``cache`` and reports its own ``timing_ms`` and ``usage``.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ from xwalk.llm.parsing import parse_json_object
 from xwalk.records import Usage
 from xwalk.retrieval.postgres import NeonHTTPExecutor, SQLExecutor
 
+from ner_site import cache as caching
 from ner_site import fake, fallback, limits, providers, usage
 from ner_site.claude import OPUS, SONNET, is_claude
 from ner_site.indexes import OntologyIndex, get_indexes
@@ -76,6 +85,7 @@ from ner_site.service import (
     ClaudeFactory,
     Settings,
     SettingsError,
+    cacheable,
     chain_models,
     check_claude_key,
     check_key,
@@ -943,6 +953,7 @@ async def _run_own(
     indexes: Mapping[str, OntologyIndex],
     started: float,
     log: dict[str, Any],
+    caches: caching.Caches | None = None,
 ) -> NerResponse:
     """Each constructed stage is closed even if construction of the next stage fails.
     A stage that fails to close is named in `log` and nothing more: the request's
@@ -978,6 +989,7 @@ async def _run_own(
             llm=_OwnJSONClient(llm, credential, log),
             select_llm=_OwnJSONClient(selector, credential, log) if selector is not None else None,
             extra_secrets=(credential.token(),),
+            caches=caches,
         )
 
 
@@ -993,6 +1005,7 @@ async def _ner(
     credential: providers.Credential | None = None,
     claude_factory: ClaudeFactory | None = None,
     recorded: dict[str, Any] | None = None,
+    caches: caching.Caches | None = None,
 ) -> dict[str, Any]:
     """Build the clients for a validated, admitted request and run it on `indexes`.
 
@@ -1004,7 +1017,7 @@ async def _ner(
     if credential is not None:
         token = _OWN_RUN.set(True)
         try:
-            response = await _run_own(credential, valid, settings, indexes, started, log)
+            response = await _run_own(credential, valid, settings, indexes, started, log, caches)
         except ServiceError as exc:
             _failed_calls(recorded, exc)
             raise
@@ -1049,6 +1062,7 @@ async def _ner(
                 admitted=() if admitted is None else admitted.notes,
                 claude_blocked=None if admitted is None else admitted.blocked,
                 allowance_window="hour" if admitted is None else admitted.window,
+                caches=caches,
             )
         except BaseException as exc:
             _failed_calls(recorded, exc)
@@ -1083,6 +1097,8 @@ async def _ner(
         dense=response.retrieval["dense"].status if "dense" in response.retrieval else None,
         timing_ms=response.timing_ms,
     )
+    if response.cache is not None:
+        log["cache"] = response.cache.model_dump(mode="json")
     if recorded:  # a run that is being recorded: for its row only, never the log line
         recorded["selector_tokens"] = (
             response.usage.selector_prompt_tokens,
@@ -1256,6 +1272,25 @@ def _dispatch(
     log["model"] = valid.model
     log["top_k"] = valid.top_k
     log["selector"] = valid.selector
+    # The response cache, after every check that can refuse the request and before
+    # admission: an answer this instance already has costs nothing and is not counted
+    # as one of the visitor's runs.
+    caches = caching.caches_for(settings.cache_scope, settings.cache)
+    cache_key: str | None = None
+    if caches is not None and caches.responses.enabled:
+        assert valid.prompt is not None and valid.model is not None
+        cache_key = caching.response_key(
+            text=valid.text,
+            prompt=valid.prompt,
+            model=valid.model,
+            selector=valid.selector or RETRIEVAL_ONLY,
+            top_k=valid.top_k,
+            provider=valid.provider or providers.SITE,
+        )
+        found = caches.responses.get(cache_key)
+        if found is not None:
+            data = _from_cache(found[0], found[1], started, log)
+            return 200, _headers(), _json_body(data, settings, extra_secrets)
     # Opened (once per warm instance) before admission: a request that cannot run
     # because the indexes cannot be opened must not have been counted as a visit.
     indexes = get_indexes(settings.index_settings())
@@ -1272,9 +1307,66 @@ def _dispatch(
             credential=credential,
             claude_factory=claude_factory,
             recorded=recorded,
+            caches=caches,
         )
     )
-    return 200, _headers(), _json_body(data, settings, extra_secrets)
+    # Redacted once, here, so that what is kept is exactly what is sent.
+    safe = _redact(data, (*extra_secrets, *settings.secrets()))
+    body = json.dumps(safe, ensure_ascii=False)
+    if caches is not None and cache_key is not None:
+        stored = cacheable(safe, offline=settings.offline)
+        if stored:
+            caches.responses.put(cache_key, body)
+        if "cache" in log:
+            log["cache"]["stored"] = stored
+    return 200, _headers(), body.encode("utf-8")
+
+
+def _from_cache(stored: str, age: float, started: float, log: dict[str, Any]) -> dict[str, Any]:
+    """The response of a request answered from the response cache: the stored answer,
+    parsed anew (so nothing a request does to it reaches the next one), with what is
+    this request's own put in place of the original run's. ``usage`` says that no
+    call was made and ``timing_ms`` how long the lookup took; the original run's
+    figures move under ``cache.original``. The log line gets the same counts as a run's,
+    with zero calls."""
+    data: dict[str, Any] = json.loads(stored)
+    entities = data.get("entities") or []
+    timing = {"total": round((time.monotonic() - started) * 1000)}
+    data["cache"] = {
+        "response": "hit",
+        "retrieval_hits": 0,
+        "pick_hits": 0,
+        "age_s": int(age),
+        "original": {"timing_ms": data.get("timing_ms"), "usage": data.get("usage")},
+    }
+    data["usage"] = {
+        "llm_calls": 0,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "embedding_requests": 0,
+        "selector_calls": 0,
+        "selector_prompt_tokens": None,
+        "selector_completion_tokens": None,
+        "selector_cost_usd": None,
+    }
+    data["timing_ms"] = timing
+    dense = (data.get("retrieval") or {}).get("dense")
+    log.update(
+        entities=len(entities),
+        matches=sum(len(e.get("matches") or ()) for e in entities),
+        warnings=len(data.get("warnings") or ()),
+        llm_calls=0,
+        prompt_tokens=None,
+        completion_tokens=None,
+        embedding_requests=0,
+        selector_calls=0,
+        selector_cost_usd=None,
+        picks=sum(1 for e in entities if (e.get("pick") or {}).get("id")),
+        dense=dense.get("status") if isinstance(dense, dict) else None,
+        timing_ms=dict(timing),
+        cache={"response": "hit", "age_s": int(age)},
+    )
+    return data
 
 
 # --- Vercel: settings from the process environment, and the shim's I/O -----------
@@ -1303,13 +1395,14 @@ def env_settings(env: Mapping[str, str] | None = None) -> Settings | SettingsErr
 
 
 def reset() -> None:
-    """Forget the settings and the visitor limiter of this instance (tests)."""
+    """Forget the settings, the visitor limiter and the caches of this instance (tests)."""
     with _SETTINGS_LOCK:
         _SETTINGS.clear()
     with _LIMITS_LOCK:
         _LIMITS.clear()
     with _USAGE_LOCK:
         _USAGE.clear()
+    caching.reset()
 
 
 def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Response:

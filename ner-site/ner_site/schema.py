@@ -62,6 +62,16 @@ where the site meters Claude. ``ner_site.http`` adds the operator key probes.
 
 Token counts are ``null`` when the provider did not report them, never 0.
 
+Addition of 19 November 2026 (the in-memory caches, ``ner_site.cache``). On a deployment
+with a cache on, the 200 response also says what the caches did::
+
+    "cache": {"response": "miss", "retrieval_hits": 3, "pick_hits": 2}
+    "cache": {"response": "hit", "retrieval_hits": 0, "pick_hits": 0, "age_s": 240,
+              "original": {"timing_ms": {...}, "usage": {...}}}
+
+On a ``hit`` the top-level ``timing_ms`` (``{"total": 1}``) and ``usage`` (no calls) are
+this request's own; the figures of the run that made the answer are in ``original``.
+
 Error envelope (see :meth:`ServiceError.envelope`)::
 
     {"ok": false, "error": {"code": "text_too_long",
@@ -207,6 +217,33 @@ class FallbackNote(BaseModel):
         return {"stage": self.stage, "from": self.from_, "to": self.to, "reason": self.reason}
 
 
+class CacheInfo(BaseModel):
+    """What the in-memory caches (``ner_site.cache``) did for one request.
+
+    ``response`` is ``hit`` when the whole answer came from a recent identical run
+    (no model, no search), ``miss`` when the request ran, and ``off`` when the response
+    cache is off while another cache is on. ``retrieval_hits`` and ``pick_hits`` count
+    the mentions whose candidates, and whose pick, a run reused (0 on a response hit:
+    nothing was looked up). ``age_s`` (a response hit only) is how long ago the answer
+    was made, in whole seconds, and ``original`` holds that run's own ``timing_ms`` and
+    ``usage``, which the top-level fields of a hit no longer are. Both are omitted
+    when they do not apply."""
+
+    response: Literal["hit", "miss", "off"]
+    retrieval_hits: int = 0
+    pick_hits: int = 0
+    age_s: int | None = None
+    original: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        for name in ("age_s", "original"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
+
+
 class NerResponse(BaseModel):
     """``model`` is the model that produced the extraction; ``requested_model`` and
     ``requested_selector`` are what was asked for, defaults resolved (empty only in
@@ -214,7 +251,11 @@ class NerResponse(BaseModel):
 
     ``selector`` is the selector the request asked for, the same value as
     ``requested_selector``, kept for pages written before that field; the model that
-    made each pick is ``entities[].pick.selector``."""
+    made each pick is ``entities[].pick.selector``.
+
+    ``cache`` is there when the deployment has a cache on, and omitted from the JSON
+    when it has none (``NER_SITE_CACHE=off``): the response is then what it was
+    before there were caches."""
 
     ok: Literal[True] = True
     model: str
@@ -231,6 +272,14 @@ class NerResponse(BaseModel):
     notices: list[str] = []
     provider: str = "site"
     credential_source: Literal["site", "visitor"] = "site"
+    cache: CacheInfo | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_missing_cache(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if data.get("cache") is None:
+            data.pop("cache", None)
+        return data
 
 
 class OntologySummary(BaseModel):

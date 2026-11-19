@@ -19,6 +19,14 @@ not yet started is skipped; the entity keeps its BM25 matches and gets the note
 `LOCAL_GRACE_S` past the deadline, so entities queued behind slow dense searches still
 get their BM25 matches. A cut-off search's thread is abandoned, not joined: it finishes
 in the background and its result goes nowhere (see ``ner_site.http``).
+
+The retrieval cache (``ner_site.cache``): with `cache`, an entity whose ontology, query
+and retrievers were answered cleanly before gets those fused candidates again without a
+search, an embedding or a database round trip (``stats.cache_hits`` counts them). Only a
+clean answer is stored: every retriever answered, none failed, timed out or was cut off.
+A hit asked no retriever anything, so it is in neither ``dense_entities`` nor
+``embedding_requests``. Two entities with the same mention in one request both search
+the first time: in-flight work is not shared.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from xwalk.retrieval.dense import DenseRetriever
 from xwalk.retrieval.postgres import PgVectorRetriever
 from xwalk.retrieve import retrieve
 
+from ner_site.cache import TTLCache, retrieval_key
 from ner_site.indexes import OntologyIndex, PrefetchEncoder
 from ner_site.ontologies import TEMPLATES, route, term_url
 from ner_site.schema import Entity, EntityResult, Match
@@ -69,6 +78,8 @@ class MapStats:
     candidates: dict[str, list[Candidate]] = field(default_factory=dict)
     dense_entities: list[str] = field(default_factory=list)
     dense_failed: dict[str, str] = field(default_factory=dict)
+    # Entities whose candidates came from the retrieval cache: no search was made.
+    cache_hits: int = 0
 
 
 class _CutOff(Exception):
@@ -178,6 +189,7 @@ async def map_entities(
     stats: MapStats | None = None,
     clean: Callable[[str], str] | None = None,
     routes: Mapping[str, str] | None = None,
+    cache: TTLCache[tuple[Candidate, ...]] | None = None,
 ) -> list[EntityResult]:
     """One `EntityResult` per entity, in the order given. `timeout` bounds each
     retriever call; `deadline` (seconds from now) bounds the whole call (see the module
@@ -185,7 +197,8 @@ async def map_entities(
     to every retriever note before it reaches an entity, a warning or `stats` (the
     service scrubs secrets and caps the length there). `routes` maps entity types to
     ontology slugs (``ontologies.ROUTES`` by default; the full catalogs use
-    ``FULL_ROUTES``)."""
+    ``FULL_ROUTES``). `cache` is the retrieval cache (module docstring); None: every
+    entity is searched for."""
     if top_k < 1:
         raise ValueError(f"top_k must be at least 1, got {top_k}")
     stats = stats if stats is not None else MapStats()
@@ -194,6 +207,38 @@ async def map_entities(
     semaphore = asyncio.Semaphore(concurrency)
     degraded: dict[str, list[str]] = {}  # note -> entity ids
     dense_seen: set[str] = set()
+    # entity id -> (cache key, the candidates found under it or None), for every entity
+    # that has a query to search with. Looked up before the batch embedding, so that a
+    # mention answered from memory is not embedded either.
+    remembered: dict[str, tuple[str, tuple[Candidate, ...] | None]] = {}
+    if cache is not None and cache.enabled:
+        for entity in entities:
+            slug = route(entity.type, routes)
+            index = indexes.get(slug) if slug is not None else None
+            if slug is None or index is None or not index.retrievers:
+                continue
+            query = TEMPLATES.render_query(Record(entity.id, {"mention": entity.text}))
+            if not query:
+                continue
+            key = retrieval_key(slug, query, index.retrievers)
+            found = cache.get(key)
+            remembered[entity.id] = (key, None if found is None else found[0])
+
+    def listed(
+        entity: Entity, slug: str, candidates: Sequence[Candidate], notes: list[str]
+    ) -> EntityResult:
+        shown = [
+            Match(
+                id=c.id,
+                label=str(c.record.fields.get("label", "")),
+                score=c.fused_score,
+                retrievers={h.retriever: h.rank for h in c.evidence},
+                url=term_url(c.id),
+            )
+            for c in candidates[: max(top_k, MAX_LISTED)]
+        ]
+        result = _result(entity, slug, shown[:top_k], notes)
+        return result.model_copy(update={"more": shown[top_k:]})
 
     async def one(entity: Entity) -> EntityResult:
         slug = route(entity.type, routes)
@@ -208,6 +253,11 @@ async def map_entities(
         query = TEMPLATES.render_query(source)
         if not query:
             return _result(entity, slug, [], ["empty mention; nothing to search"])
+        key, hit = remembered.get(entity.id, (None, None))
+        if hit is not None:
+            stats.cache_hits += 1
+            stats.candidates[entity.id] = list(hit)
+            return listed(entity, slug, hit, [])
         bounded = [
             _Bounded(
                 r,
@@ -246,20 +296,17 @@ async def map_entities(
         entity_notes = list(notes)
         if all_failed:
             entity_notes.append(ALL_FAILED_NOTE)
-        listed = [
-            Match(
-                id=c.id,
-                label=str(c.record.fields.get("label", "")),
-                score=c.fused_score,
-                retrievers={h.retriever: h.rank for h in c.evidence},
-                url=term_url(c.id),
-            )
-            for c in candidates[: max(top_k, MAX_LISTED)]
-        ]
-        result = _result(entity, slug, listed[:top_k], entity_notes)
-        return result.model_copy(update={"more": listed[top_k:]})
+        if (
+            cache is not None
+            and key is not None
+            and not entity_notes
+            and all(b.failure is None for b in bounded)
+        ):
+            cache.put(key, tuple(candidates))
+        return listed(entity, slug, candidates, entity_notes)
 
-    await _prefetch(entities, indexes, routes, timeout, deadline_at, stats)
+    searched = [e for e in entities if remembered.get(e.id, (None, None))[1] is None]
+    await _prefetch(searched, indexes, routes, timeout, deadline_at, stats)
     results = list(await asyncio.gather(*(one(e) for e in entities)))
     order = {e.id: i for i, e in enumerate(entities)}
     stats.dense_entities = [e.id for e in entities if e.id in dense_seen]

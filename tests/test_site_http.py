@@ -2170,8 +2170,14 @@ def test_disabled_own_health_fixture_matches_live_balances(
     fixture = json.loads((PROJECT / "tools/fixtures/health-own-off.json").read_text())
     now = 56220 - 3600
     monkeypatch.setattr(http_mod, "_now", lambda: now)
+    # Five identical requests, each meant to be counted: the response cache would
+    # answer the later ones before admission (tests/test_site_cache.py).
     s = _open_site(
-        cache_dir, tmp_path, NER_SITE_OWN_PROVIDERS="", NER_SITE_DENSE_DIR=str(PROJECT / "indexes")
+        cache_dir,
+        tmp_path,
+        NER_SITE_OWN_PROVIDERS="",
+        NER_SITE_DENSE_DIR=str(PROJECT / "indexes"),
+        NER_SITE_CACHE="off",
     )
     for _ in range(2):
         assert _ask(s)[0] == 200
@@ -3496,7 +3502,9 @@ def test_a_failing_recorder_leaves_the_answer_untouched_and_is_named_in_the_log(
 ) -> None:
     from xwalk.retrieval.postgres import PostgresError
 
-    s = _stats_site(cache_dir, tmp_path)
+    # The same request twice, compared whole: without the caches, whose counts of
+    # reused work are part of an answer.
+    s = _stats_site(cache_dir, tmp_path, NER_SITE_CACHE="off")
 
     def ask() -> tuple[int, dict[str, str], dict[str, Any]]:
         status, headers, body = _ask(s, {"text": HALO_TEXT}, claude=_Claude(HALO))
