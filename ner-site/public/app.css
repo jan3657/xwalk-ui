@@ -592,6 +592,61 @@ button[aria-busy="true"] .spinner {
   border-color: var(--danger-border);
 }
 
+.progress {
+  scroll-margin-bottom: 20px;
+  margin: 16px 2px 0;
+  max-width: 44rem;
+}
+
+.progress-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.progress-bar span {
+  display: block;
+  width: 35%;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  animation: progress-slide 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(290%);
+  }
+}
+
+.progress-line {
+  margin: 10px 0 2px;
+  font-size: 0.9375rem;
+}
+
+.progress-time {
+  margin-left: 6px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.progress .hint {
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar span {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
 .status {
   margin: 14px 2px 0;
   min-height: 1.5em;
