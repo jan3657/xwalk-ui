@@ -14,8 +14,9 @@ are in [docs/ner-site/PLAN.md](../docs/ner-site/PLAN.md).
 - `api/ner.py`, `api/health.py`: the two Vercel Python functions, thin shims over
   `ner_site.http.handle`.
 - `public/`: the page (`index.html`, `app.js`, `app.css`; no build step, no
-  dependencies). It builds every element with `textContent`, so model output is only
-  ever rendered as text.
+  dependencies) and `example.json`, the recorded run it shows on arrival. The page
+  builds every element with `textContent`, so model output is only ever rendered as
+  text. See [The page](#the-page).
 - `vercel.json`: function duration and bundled files, and the security headers.
 - `tools/serve_local.py`: a standard-library server for `public/` and `/api/*`.
 - `tools/claude_check.py`: posts text files to a running site and prints the model that
@@ -24,8 +25,64 @@ are in [docs/ner-site/PLAN.md](../docs/ner-site/PLAN.md).
   API key of your own, which is then billed).
 - `tools/screenshot.mjs`: Playwright smoke check that loads the page, runs the example
   and writes a PNG.
+- `tools/page_smoke.mjs`: Playwright check of the page's states (results, every error
+  message, limits, own keys, the example on arrival) at a phone and a desktop width.
+  The page has no other tests. See [Run it locally first](#run-it-locally-first).
 - `tools/fixtures/`: canned `/api` responses (`health*.json`, `ner*.json`,
   `error*.json`) for working on the page without the service.
+
+## The page
+
+One page, in this order from the top:
+
+- The headline, one sentence on what the demo does, and the number of ontology terms
+  searched. `index.html` carries the wording for production (full catalog, no genes);
+  `app.js` rewrites it only when `/api/health` reports a sample catalog or offline mode,
+  and replaces "more than 260,000" with the exact sum once health has answered.
+- The form: the text box, **Example** and **Clear**, the **Map this text** button, one
+  line on cost, duration and where the text goes, and a closed **Options** section (who
+  pays, the models, the number of candidates listed, the instructions given to the
+  model). Options opens itself when something in it needs the visitor, for example a
+  restored own-key choice or a refused key. Problems with the text or a key are said at
+  that field.
+- The three steps of a run (Find, Search, Decide). During a run they show what each
+  step does, a moving bar and a clock. No step is ticked: the API answers once.
+- One box for a run that failed, with a title, what to do and one action. Used-up
+  limits are worded per network ("The free runs for your network this hour are
+  used"), because the limit is counted per IP address.
+- The results: a summary in words, the text with its mentions highlighted, one card
+  per mention (collapsed: mention, ID, term label; expanded: the model's reason and
+  the candidates the search found), "Run details" with models, tokens and timing, and
+  a closing panel that links to the xwalk repository. A result belongs to the text it
+  was made from: when the text box holds anything else, the result is marked as being
+  for the earlier text.
+
+**The example on arrival.** `public/example.json` is one real answer of production's
+`POST /api/ner` for the example sentence (`EXAMPLE_FULL` in `app.js`), in the shape
+`{"text", "recorded", "ontologies", "response"}`: `response` is the API's body
+unchanged, `recorded` the date of the run, `ontologies` the three `ontologies` entries
+of `/api/health` at that time (the page needs their names and counts before health has
+answered). The page fetches the file with a plain `fetch` (not the function that
+carries the passcode and a visitor's key), puts the sentence in the text box unless
+the visitor already typed, and renders the answer under the form with the heading
+"Example result" and the line "Recorded from a real run on 19 Nov 2026." It shows no
+timing sentence for it, does not scroll or take the focus, and makes no API request.
+It does not wait for `/api/health`: it is shown when the file arrives and removed
+again (with the sentence it put in the text box) when health reports anything but a
+full catalog in live mode, so local, sample and offline servers never show it. If the
+file does not load, the page is as it is without it. Once the visitor changes the
+text the result is marked "This result is for the example text"; a run replaces it.
+
+The file is kept whole, 38 kB (about 7 kB compressed), with all 30 candidates per
+mention: the cards say "30 candidates" and the model's reasons refer to them.
+Record it again whenever the example sentence, the default model or the catalog
+changes: run the sentence once on production, save the response body as `response`,
+set `recorded`, copy `ontologies` from `/api/health`, and check that the file holds
+nothing but those four fields. `tests/test_site_page.py` checks that `response`
+validates as `ner_site.schema.NerResponse`, that `text` equals `EXAMPLE_FULL`, and
+that every mention sits at its offsets. The older, longer example (`EXAMPLE_TEXT`)
+stays for sample and offline modes; `tools/fixtures/ner.json` and two test files are
+built for it.
 
 ## Deploy
 
@@ -102,10 +159,42 @@ node ner-site/tools/screenshot.mjs http://127.0.0.1:8765 /tmp/ner.png --width 12
 node ner-site/tools/screenshot.mjs http://127.0.0.1:8765 /tmp/ner-360.png --width 360
 ```
 
-It clicks **Load example** and **Run**, waits for the result cards and exits non-zero
-on a page error, a console error, a failed run, or horizontal scrolling. `--expect
-error --text "...ERROR..."` checks the error state instead; `--dark` uses the dark
-colour scheme.
+It clicks **Example** and **Map this text**, waits for the result cards of that run
+and exits non-zero on a page error, a console error, a failed run, or horizontal
+scrolling. `--expect error --text "...ERROR..."` checks the error state instead;
+`--dark` uses the dark colour scheme.
+
+The states of the page (`tools/page_smoke.mjs`). Start a server first; the script
+starts nothing itself, and the offline server is enough because every state but one
+answers `/api/health` and `/api/ner` itself, from `tools/fixtures/` or from a response
+built in the script in production's shape:
+
+```bash
+env -u OPENROUTER_API_KEY -u ANTHROPIC_API_KEY \
+  python ner-site/tools/serve_local.py --offline --port 8765
+node ner-site/tools/page_smoke.mjs http://127.0.0.1:8765
+node ner-site/tools/page_smoke.mjs http://127.0.0.1:8765 --dark
+```
+
+Playwright is resolved from the local `node_modules`, `NODE_PATH`, or `npm root -g`.
+Set `PLAYWRIGHT_CHANNEL=chrome` to drive the installed Chrome instead of Playwright's
+own Chromium (needed where that browser is not downloaded). Options: `--only
+NAME[,NAME]`, `--widths 390,1280` (the default; under 700 px the browser is a touch
+device), `--shots DIR` for a full-page PNG per state, `--dark`, `--list`. It prints
+one line per state and width and exits 1 if any failed. No state costs a model call.
+
+Every state asserts its own result or message and then, for all of them: no page
+error, no console error, no horizontal scroll, Run reachable, at least 44 px tall and
+enabled, and no `Authorization` header on anything but `POST /api/ner`. The states:
+a run on the server's own API; production's copy and first screen; empty and too-long
+text; the hour and day limits and limits that cannot be counted; the Sonnet tier;
+degraded search; a step-down notice; an own key restored after a reload, refused,
+missing, and its payer holds; health failing; progress; Options; the cards; no
+mentions; twelve failures in a row; a result kept through a failed run; a result for
+an earlier text; the 25-mention cap; a run that died while the page was hidden; the
+closing panel; and the example on arrival with `/api/health` answering before
+`example.json`, after it, with an error and never, and with `example.json` missing
+or broken.
 
 ### Deploy on Vercel (operator)
 
@@ -1918,6 +2007,55 @@ the passcode kept, so only passcode holders can use an own key.
 - Production: `NER_SITE_OWN_PROVIDERS=anthropic,openrouter` (OpenAI direct stays off
   until one run with a real key has passed step 4), and `NER_SITE_PASSCODE` removed
   at the operator's request, without the measurements of rollout steps 5 to 8.
+
+### Page redesign, 19 November 2026 (branch `feat/ux-redesign`, not deployed)
+
+The page was rewritten in three steps: header and form; result cards, error messages
+and recovery; the example on arrival and the closing panel. See [The page](#the-page).
+The API did not change.
+
+Run, in Chrome driven by Playwright, against `tools/serve_local.py --offline` on
+127.0.0.1 (Python 3.13, the repository venv):
+
+- `tools/page_smoke.mjs`: 31 states at 390 by 844 px (touch) and 1280 by 800 px, in the
+  light and in the dark colour scheme: all 62 passed in each scheme. The states are
+  listed under "Run it locally first". The example on arrival was run with
+  `/api/health` answering before `example.json`, after it, with a 500, and never, and
+  with `example.json` answering 404 and a body that is not JSON; in each order typed
+  text was kept, and a sample catalog or offline mode removed the example.
+- `tools/screenshot.mjs` at 390 px and at 1280 px `--dark`: exit 0.
+- `node --check` on `public/app.js`, `tools/page_smoke.mjs`, `tools/screenshot.mjs`.
+- `.venv/bin/python -m pytest -q`: 1962 passed, 35 skipped. `.venv/bin/ruff check .`:
+  clean. `tests/test_site_page.py` is new (five tests on `public/example.json`).
+- Looked at, with production's `/api/health` answer of that day served in place of
+  the local one: the arrival at 390 by 844, 360 by 640 and 1280 by 800 px, light and
+  dark; the same after the text was edited; after a run with a canned production
+  answer replaced the example; the closing panel; and the arrival on the offline
+  server (no example). On arrival the example result starts 806 px down at 390 by 844
+  (its highlighted sentence at 969 px), 828 px down at 360 by 640, and 916 px down at
+  1280 by 800; "Map this text" ends at 591, 613 and 752 px.
+- `public/example.json` was read for anything that should not be public before it
+  was copied from the recording: its field names, the hosts of its URLs (the three
+  ontology sites and omim.org), and a search for IP addresses, e-mail addresses, keys,
+  the passcode, header names and internal hosts. It holds the response body and
+  nothing else.
+
+Not run:
+
+- No real phone. Width, touch and the colour scheme were emulated in desktop Chrome.
+  iOS Safari and Android Chrome were not used, so the on-screen keyboard, the drawn
+  select arrow, the focus ring of the form (`:has`) and the screen wake lock are
+  unchecked there.
+- LinkedIn's in-app browser, where most visitors of the announcement arrive. Its
+  visible height is smaller than 844 px, so less of the first screen shows than
+  measured above.
+- No screen reader. The announcements, headings and accessible names are asserted as
+  text and attributes; nothing was listened to.
+- The live site. Nothing was deployed and no run was made against production for
+  this entry; `example.json` is the recording of one production run made earlier
+  that day (7 of 7 mentions matched, 8.8 s).
+- The limits themselves and the countdown beside Run: the page was given canned
+  refusals, not a used-up allowance.
 
 ### For the operator after deploying
 
