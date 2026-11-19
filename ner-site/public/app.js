@@ -163,7 +163,18 @@
     touched: false, // the visitor typed, or used Example or Clear
     prefilled: false, // the text box holds the example because this page put it there
     ran: false, // a run was started: the recorded example is not shown after that
-    limitNotice: false, // the error box is saying that a limit is used up
+    // Which used-up limit the error box is telling of ("hour", "day", "own",
+    // "unavailable"), or false while it tells of none.
+    limitNotice: false,
+    // A health answer that arrived during a run: { health, load, expire }. It is applied
+    // when the run ends (settleHealth), so that who pays and which models run stay, on
+    // the page, what the run was submitted with.
+    heldHealth: null,
+    // The refusal now shown at the key field: { err, provider, model } of the run it is
+    // about. If health then takes that provider away, the refusal moves to the error box.
+    keyError: null,
+    // The intro is the production copy of index.html (a full catalog and a real model).
+    ledeStatic: false,
     // The run under way: { provider, model, selector, started, startedAt, hidden,
     // edited, abort }. The first three are what was submitted: every message about the
     // run is written from them, never from what the form shows by then. `hidden` once
@@ -175,8 +186,9 @@
     payerCheckDue: false,
     // Set while it is not settled who pays for the next run: a key kept from earlier
     // in this tab has not been restored yet ("pending"), could not be because health
-    // did not load ("unknown"), or is for a provider the site no longer offers
-    // ("lost"). Nothing is submitted while it is set; see holdRuns().
+    // did not load ("unknown"), is for a provider the site no longer offers ("lost"),
+    // or a page brought back from the browser's history could not read what the tab
+    // saved ("unread"). Nothing is submitted while it is set; see holdRuns().
     payer: null,
   };
 
@@ -372,7 +384,7 @@
         if (own || /own key/.test(message)) {
           return {
             look: "notice",
-            limit: true,
+            limit: "own",
             title: "Too many runs with your own key.",
             body: [`Runs with an own key are limited per network too. ${wait ? `Try again in ${minutesText(wait)}.` : "Try again later."}`],
           };
@@ -381,7 +393,7 @@
           const at = wait ? new Date(Date.now() + wait * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
           return {
             look: "notice",
-            limit: true,
+            limit: "day",
             title: "The free runs for your network today are used.",
             body: [at ? `They come back at ${at} (midnight UTC).` : "They come back at midnight UTC."],
             ownKey: offerKey,
@@ -389,7 +401,7 @@
         }
         return {
           look: "notice",
-          limit: true,
+          limit: "hour",
           title: "The free runs for your network this hour are used.",
           body: [wait ? `You can run again in ${minutesText(wait)}.` : "You can run again later this hour."],
           ownKey: offerKey,
@@ -397,7 +409,7 @@
       case "limits_unavailable":
         return {
           look: "notice",
-          limit: true,
+          limit: "unavailable",
           title: "The demo is briefly unavailable.",
           body: ["The site cannot count free runs right now, so it is not starting any. This usually clears within a minute."],
           action: "Try again",
@@ -494,6 +506,7 @@
   }
 
   function clearKeyError() {
+    state.keyError = null;
     clear(el.ownKeyError);
     el.ownKeyError.hidden = true;
     el.ownKey.removeAttribute("aria-invalid");
@@ -518,13 +531,22 @@
       if (!calm) el.prompt.focus();
       return;
     }
-    // The provider the run was submitted with, not the one the form shows now. The
-    // payer cannot be changed during a run, so the key field is still that provider's.
+    // The provider the run was submitted with, not the one the form shows now.
     const provider = ctx ? ctx.provider : currentProvider();
     if (KEY_CODES.includes(e.code) && provider) {
-      // A key the server or the provider refused stays in the field, to be corrected.
-      showKeyError(keyErrorText(e, provider, ctx ? ctx.model : el.model.value));
-      if (!calm) el.ownKey.focus();
+      const refused = { err: e, provider, model: ctx ? ctx.model : el.model.value };
+      const shown = currentProvider();
+      if (shown && shown.id === provider.id && !state.payer) {
+        // A key the server or the provider refused stays in the field, to be corrected.
+        showKeyError(keyErrorText(e, provider, refused.model));
+        state.keyError = refused;
+        if (!calm) el.ownKey.focus();
+      } else {
+        // The key field is not that provider's any more (or is not on show): the
+        // refusal is said in the error box, with the provider's name.
+        showRunKeyError(refused);
+        if (!calm) reveal(el.error, "nearest");
+      }
       return;
     }
     const d = describeError(e, ctx);
@@ -537,7 +559,7 @@
     el.errorOwnKey.hidden = !d.ownKey;
     el.error.hidden = false;
     // The box now says what the line beside Run says; the line steps aside for it.
-    state.limitNotice = Boolean(d.limit);
+    state.limitNotice = d.limit || false;
     renderAllowance();
     if (e.code === "passcode_required" || e.code === "passcode_invalid") {
       el.passField.hidden = false;
@@ -548,6 +570,20 @@
     const target = d.action ? el.errorAction : d.ownKey ? el.errorOwnKey : $("error-dismiss");
     target.focus({ preventScroll: true });
     reveal(el.error, "nearest");
+  }
+
+  // A refusal of a visitor's own key, said in the error box: for a run whose provider
+  // the form no longer shows, where the key field is hidden or belongs to another one.
+  function showRunKeyError(refused) {
+    el.error.classList.remove("notice");
+    el.errorTitle.textContent = `The run on your ${refused.provider.name} key did not go through.`;
+    clear(el.errorMsg);
+    el.errorMsg.append(keyErrorText(refused.err, refused.provider, refused.model));
+    el.errorAction.hidden = true;
+    el.errorOwnKey.hidden = true;
+    el.error.hidden = false;
+    state.limitNotice = false;
+    renderAllowance();
   }
 
   function hideError() {
@@ -663,9 +699,10 @@
 
   // The first answer fills the form, from session storage where a choice was saved. An
   // answer applied after that (a retry) keeps what the visitor has chosen since,
-  // wherever the new answer still offers it. While a payer hold is up, storage decides.
+  // wherever the new answer still offers it. While a payer hold is up, storage decides
+  // (except a hold put up because storage could not be read).
   function applyHealth(health) {
-    const again = Boolean(state.health) && !state.payer;
+    const again = Boolean(state.health) && (!state.payer || state.payer.kind === "unread");
     const before = again ? { provider: el.provider.value, model: el.model.value, selector: el.selector.value } : null;
     state.health = health;
     state.visitorAt = Date.now();
@@ -712,6 +749,19 @@
     renderAllowance();
   }
 
+  // On a page brought back from the browser's history: the model and the selector on
+  // record for the own-key provider now shown are the ones the next run uses, also when
+  // the provider itself did not change. An id that is not on record, or is no longer
+  // offered, gives the provider's default (as a fresh load of the page would).
+  function applyStoredModels(choice) {
+    const provider = currentProvider();
+    if (!provider || !choice || choice.provider !== provider.id) return;
+    const offers = (select, value) => Boolean(value) && [...select.options].some((o) => o.value === value);
+    el.model.value = offers(el.model, choice.model) ? choice.model : provider.defaultModel;
+    el.selector.value = offers(el.selector, choice.selector) ? choice.selector : "retrieval";
+    renderAllowance();
+  }
+
   // ---------- own keys ----------
 
   // The own-key providers health offers, cleaned. An API from before own keys sends no
@@ -748,7 +798,11 @@
   }
 
   function storedKey() {
-    const raw = storageGet(OWN_KEY_ENTRY);
+    return keyOf(storageGet(OWN_KEY_ENTRY));
+  }
+
+  // The key entry as it is in session storage, parsed: { provider, key } or null.
+  function keyOf(raw) {
     if (!raw) return null;
     try {
       const entry = JSON.parse(raw);
@@ -774,7 +828,11 @@
   // or null for the site's models. A key kept from before this entry existed counts as
   // that choice.
   function savedChoice() {
-    const raw = storageGet(PAYER_ENTRY);
+    return choiceOf(storageGet(PAYER_ENTRY), storedKey());
+  }
+
+  // The same from the two entries as read: `raw` is the payer entry, `kept` the key.
+  function choiceOf(raw, kept) {
     if (raw && raw !== "site") {
       if (raw.charAt(0) !== "{") return { provider: raw, model: "", selector: "" };
       try {
@@ -786,8 +844,26 @@
         /* not ours: treated as no choice */
       }
     }
-    const kept = storedKey();
     return kept ? { provider: kept.provider, model: "", selector: "" } : null;
+  }
+
+  // What may be written back to the payer entry. Session storage is not trusted: only
+  // ids this page can name go back into it. For a provider on offer, a model or a
+  // selector it offers; for one that is not on offer (a hold), a provider and models
+  // this page knows by name. Anything else is written as "other" or left out.
+  function cleanChoice(choice) {
+    const offered = state.providers.find((p) => p.id === choice.provider);
+    const named = (id) => Object.prototype.hasOwnProperty.call(MODEL_NAMES, id);
+    if (!offered) {
+      const known = Object.prototype.hasOwnProperty.call(PROVIDER_NAMES, choice.provider);
+      const keep = (id) => (known && (id === "retrieval" || named(id)) ? id : "");
+      return { provider: known ? choice.provider : "other", model: keep(choice.model), selector: keep(choice.selector) };
+    }
+    return {
+      provider: offered.id,
+      model: offered.models.includes(choice.model) ? choice.model : "",
+      selector: choice.selector === "retrieval" || offered.models.includes(choice.selector) ? choice.selector : "",
+    };
   }
 
   // The provider of that choice ("" for the site's models).
@@ -804,7 +880,7 @@
     }
     const before = savedChoice();
     const same = Boolean(before) && before.provider === providerId;
-    storageSet(PAYER_ENTRY, JSON.stringify({ provider: providerId, model: same ? before.model : "", selector: same ? before.selector : "" }));
+    storageSet(PAYER_ENTRY, JSON.stringify(cleanChoice({ provider: providerId, model: same ? before.model : "", selector: same ? before.selector : "" })));
   }
 
   // The visitor picked a model or a selector while paying with an own key.
@@ -812,17 +888,6 @@
     const provider = currentProvider();
     if (!provider || state.payer) return;
     storageSet(PAYER_ENTRY, JSON.stringify({ provider: provider.id, model: el.model.value, selector: el.selector.value }));
-  }
-
-  // Whether session storage can be written at all (it cannot in some private modes).
-  function storageWorks() {
-    try {
-      window.sessionStorage.setItem("xwalk-ner-probe", "1");
-      window.sessionStorage.removeItem("xwalk-ner-probe");
-      return true;
-    } catch (_) {
-      return false;
-    }
   }
 
   // ---------- who pays ----------
@@ -845,7 +910,12 @@
       el.payerMsg.textContent =
         `You chose to run on your own ${key}, but the service status could not be loaded, so this page cannot tell whether it can still be used. ` +
         'Nothing has run. Try again, or choose "Use the site\'s models" to forget the key and run on the site\'s models (free, limited).';
+    } else if (kind === "unread") {
+      el.payerMsg.textContent =
+        `This page came back from the browser's history and cannot read what this tab saved about who pays, so your ${key} was cleared from the page. ` +
+        'Nothing has run. Enter the key again, or choose "Use the site\'s models" to run on them (free, limited).';
     } else {
+      // Said only once the key is gone from session storage: every caller removes it first.
       el.payerMsg.textContent =
         `This site no longer accepts your own ${key}, so the key has been forgotten. Nothing has run on the site's models. ` +
         'Choose "Use the site\'s models" to run on them (free, limited)' +
@@ -880,15 +950,32 @@
 
   // A page brought back from the back-forward cache is the old document, with the old
   // key still in its field. Meanwhile another document of this tab may have forgotten
-  // that key or changed who pays; session storage, which the tab's documents share, is
-  // where that is on record. So before the restored page can submit, its payer and key
-  // are made to match storage: an absent key empties the field, a choice that cannot be
-  // settled holds the run. Where storage cannot be used the page is all there is, and
-  // it is left alone.
+  // that key or changed who pays or which models run; session storage, which the tab's
+  // documents share, is where that is on record. So before the restored page can
+  // submit, the payer and key entries are read, directly:
+  // - a read that fails: the key is cleared from the field, and runs are held until the
+  //   visitor enters a key again or picks who pays ("unread");
+  // - no key on record: the field is emptied, and an own-key run asks for the key;
+  // - a payer this page's (older) health answer does not offer: nothing is said to be
+  //   forgotten; runs wait for the health read that follows ("pending"), which restores
+  //   the choice or removes the key and then says so (settleHealth);
+  // - otherwise the payer, its key and its models are put as they are on record.
+  // Whether storage can be written plays no part: a tab whose storage is full can still
+  // have had its key removed.
   function reconcilePayer() {
-    if (!storageWorks()) return;
-    const chosen = savedPayer();
-    const kept = storedKey();
+    let kept;
+    let choice;
+    try {
+      kept = keyOf(window.sessionStorage.getItem(OWN_KEY_ENTRY));
+      choice = choiceOf(window.sessionStorage.getItem(PAYER_ENTRY), kept);
+    } catch (_) {
+      const shown = currentProvider();
+      el.ownKey.value = "";
+      clearKeyError();
+      if (shown && !state.payer) holdRuns("unread", shown.id);
+      return;
+    }
+    const chosen = choice ? choice.provider : "";
     if (!state.health) {
       // Health is still loading or failed: the key field is not on show, and whether
       // the choice can be used is not known.
@@ -903,15 +990,15 @@
         el.provider.value = "site";
         applyProvider();
       }
-      holdRuns("lost", chosen);
+      holdRuns("pending", chosen);
       return;
     }
     const want = chosen || "site";
     if (el.provider.value !== want) {
       el.provider.value = want;
       applyProvider();
-      restoreModels(savedChoice());
     }
+    applyStoredModels(choice);
     const key = chosen && kept && kept.provider === chosen ? kept.key : "";
     if (el.ownKey.value.trim() !== key) {
       el.ownKey.value = key;
@@ -984,11 +1071,14 @@
       renderAllowance();
       return;
     }
+    // A refusal on show at the key field goes with the field; it is said again below.
+    const refused = state.keyError;
     forgetKey();
     el.provider.value = "site";
     applyProvider();
     rememberPayer(chosen.id); // still the visitor's choice, until they make another
     holdRuns("lost", chosen.id);
+    if (refused) showRunKeyError(refused);
   }
 
   // Models, selectors and the key field for the current "Who pays" choice.
@@ -1060,26 +1150,27 @@
     if (currentProvider()) {
       // An own key is outside the site's free runs; only its own flood limit can stop it.
       if (visitor.own_left_today === 0) {
-        return { blocked: true, wait: secondsLeft(visitor.day_resets_in_s), text: "Too many runs with your own key today. They come back at midnight UTC." };
+        return { blocked: true, limit: "own", wait: secondsLeft(visitor.day_resets_in_s), text: "Too many runs with your own key today. They come back at midnight UTC." };
       }
       if (visitor.own_left === 0) {
-        return { blocked: true, wait: secondsLeft(visitor.resets_in_s), text: `Too many runs with your own key; ${tryAgain(secondsLeft(visitor.resets_in_s))}.` };
+        return { blocked: true, limit: "own", wait: secondsLeft(visitor.resets_in_s), text: `Too many runs with your own key; ${tryAgain(secondsLeft(visitor.resets_in_s))}.` };
       }
       return null;
     }
     if (visitor.tier === "blocked") {
       if (visitor.limits === "unavailable") {
-        return { blocked: true, text: "The demo is briefly unavailable. Try again in a minute." };
+        return { blocked: true, limit: "unavailable", text: "The demo is briefly unavailable. Try again in a minute." };
       }
       if (visitor.window === "day") {
         const left = secondsLeft(visitor.day_resets_in_s);
         const at = left === null ? "midnight UTC" : new Date(Date.now() + left * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
         // `wait`: the line is recounted and health read again when the day is over.
-        return { blocked: true, wait: left, text: `The free runs for your network today are used. They come back at ${at}.` };
+        return { blocked: true, limit: "day", wait: left, text: `The free runs for your network today are used. They come back at ${at}.` };
       }
       const left = secondsLeft(visitor.resets_in_s);
       return {
         blocked: true,
+        limit: "hour",
         wait: left,
         text: "The free runs for your network this hour are used." + (left === null ? " Try again later." : ` Next one in ${Math.max(1, Math.ceil(left / 60))} min.`),
       };
@@ -1119,9 +1210,10 @@
     const blocked = Boolean(message && message.blocked);
     el.allowance.textContent = message ? message.text : "";
     el.allowance.classList.toggle("blocked", blocked);
-    // While the error box says the same thing (a used-up limit, with the same way out),
-    // it is not said a second time here.
-    const said = blocked && state.limitNotice;
+    // While the error box says the same thing (the same used-up limit, with the same way
+    // out), it is not said a second time here. A box about another limit (yesterday's
+    // daily one, say, while this hour's is used) does not stand in for this line.
+    const said = blocked && state.limitNotice === message.limit;
     el.allowance.hidden = !message || said;
     el.allowanceRow.classList.toggle("blocked", blocked);
     el.allowanceRow.hidden = !message || said;
@@ -1131,6 +1223,7 @@
     // see which model that is.
     const count = el.model.options.length;
     el.modelField.hidden = count === 0 || (count === 1 && !currentProvider());
+    syncLede();
 
     // While a timed wait is shown, the minutes are recounted, and health is read again
     // when the wait is over.
@@ -1157,7 +1250,7 @@
     if (state.payer) {
       const known = Object.prototype.hasOwnProperty.call(PROVIDER_NAMES, state.payer.provider);
       const key = known ? `${PROVIDER_NAMES[state.payer.provider]} key` : "API key";
-      summary = state.payer.kind === "lost" ? "Options: choose who pays" : `Options: your ${key}, waiting`;
+      summary = state.payer.kind === "lost" || state.payer.kind === "unread" ? "Options: choose who pays" : `Options: your ${key}, waiting`;
     } else if (provider) {
       summary = `Options: your ${provider.name} key`;
     } else if (state.health && state.health.mode === "offline") {
@@ -1198,23 +1291,72 @@
   // still exist (reconcileProviders). A failed read keeps what was shown.
   //
   // `opts.expire`: this read was made because a wait may be over (a timer ran out, the
-  // tab came back). If the error box still says a limit is used up and health no longer
-  // says so, the box is closed. Not after a run: there the box is that run's answer.
+  // tab came back). If the error box still tells of a used-up limit and health no longer
+  // reports that limit, the box is closed. Not after a run: there the box is that run's
+  // answer.
   async function refreshHealth(opts) {
     const read = await readHealth();
-    if (read.superseded || !read.health) return;
-    const health = read.health;
+    if (read.superseded) return;
+    settleHealth({ health: read.health, load: false, expire: Boolean(opts && opts.expire) });
+  }
+
+  // What is done with a health answer (`health` null: the read failed). `load`: it was
+  // read for the whole form (arrival, "Try again"); otherwise for what changes between
+  // requests. While a run is under way nothing is done with it: the payer, the key and
+  // the model lists stay what the run was submitted with, and the answer is kept and
+  // applied when the run ends (run()). Of several kept answers the newest good one counts.
+  function settleHealth(answer) {
+    if (state.running) {
+      const held = state.heldHealth;
+      state.heldHealth = held
+        ? { health: answer.health || held.health, load: held.load || answer.load, expire: held.expire || answer.expire }
+        : answer;
+      return;
+    }
+    const health = answer.health;
+    if (answer.load) {
+      if (health) {
+        applyHealth(health);
+        return;
+      }
+      // A failed read after another read has answered changes nothing: the form is filled.
+      if (state.health) return;
+      state.healthFailed = true;
+      renderBanner(null, null);
+      // Nothing is known about the catalog, so nothing is claimed about its size.
+      el.caveat.hidden = true;
+      fillTopK(DEFAULT_LIMITS.top_k_max);
+      el.modelField.hidden = true;
+      updateCounter();
+      // Still chosen (the visitor may have picked the site's models while waiting).
+      const still = savedPayer();
+      if (still) holdRuns("unknown", still);
+      else releaseRuns();
+      return;
+    }
+    // A restored page waiting to learn whether its saved payer is offered (reconcilePayer).
+    const waiting = Boolean(state.health) && Boolean(state.payer) && state.payer.kind === "pending";
+    if (!health) {
+      if (waiting) holdRuns("unknown", state.payer.provider);
+      return;
+    }
     if (!state.health) {
       applyHealth(health);
       return;
     }
     state.health = { ...state.health, visitor: health.visitor, claude: health.claude, own_keys: health.own_keys };
     state.visitorAt = Date.now();
-    reconcileProviders(health);
+    if (waiting) {
+      // As on arrival, from session storage: the payer comes back with its key and its
+      // models, or, if it is not offered, its key is removed and the hold then says so.
+      fillProviders(health);
+      applyProvider();
+      applyStoredModels(savedChoice());
+    } else reconcileProviders(health);
     renderAllowance();
-    if (opts && opts.expire && state.limitNotice && health.visitor && typeof health.visitor === "object") {
+    if (answer.expire && state.limitNotice && health.visitor && typeof health.visitor === "object") {
       const now = allowanceMessage();
-      if (!(now && now.blocked)) hideError();
+      if (!(now && now.blocked && now.limit === state.limitNotice)) hideError();
     }
   }
 
@@ -1246,6 +1388,8 @@
     const offline = health.mode === "offline";
     const ontologies = Array.isArray(health.ontologies) ? health.ontologies : [];
     el.caveat.hidden = false;
+    state.ledeStatic = full && !offline;
+    syncLede();
     if (full) {
       const total = ontologies.reduce((sum, o) => sum + (Number(o.count) || 0), 0);
       if (total > 0) {
@@ -1270,6 +1414,18 @@
       h("strong", { text: "200-term sample" }),
       ", not the full vocabulary, so many real-world terms will not be found. Every ID comes from the sample; the model never writes one.",
     );
+  }
+
+  // The production lede names Claude, the default reader. With another model chosen to
+  // read the text it says "A language model". Only the production copy is touched; the
+  // sample and offline ledes (renderIntro) name no model.
+  const LEDE = el.lede.textContent;
+
+  function syncLede() {
+    if (!state.ledeStatic) return;
+    const reader = el.model.value;
+    const text = !reader || isClaude(reader) ? LEDE : LEDE.replace("Claude finds", "A language model finds");
+    if (el.lede.textContent !== text) el.lede.textContent = text;
   }
 
   // What the Search and Decide steps say while a run is under way, written from what
@@ -1402,23 +1558,7 @@
     if (chosen && !state.health) holdRuns("pending", chosen);
     const read = await readHealth();
     if (read.superseded) return;
-    if (read.health) {
-      applyHealth(read.health);
-      return;
-    }
-    // A failed read after another read has answered changes nothing: the form is filled.
-    if (state.health) return;
-    state.healthFailed = true;
-    renderBanner(null, null);
-    // Nothing is known about the catalog, so nothing is claimed about its size.
-    el.caveat.hidden = true;
-    fillTopK(DEFAULT_LIMITS.top_k_max);
-    el.modelField.hidden = true;
-    updateCounter();
-    // Still chosen (the visitor may have picked the site's models while waiting).
-    const still = savedPayer();
-    if (still) holdRuns("unknown", still);
-    else releaseRuns();
+    settleHealth({ health: read.health, load: true, expire: false });
   }
 
   // ---------- results ----------
@@ -1718,16 +1858,51 @@
   // The selectors that made the picks, in order of first appearance. After a step-down
   // this differs from the selector the request asked for. A pick that failed names a
   // selector too, but nothing was chosen there, so it does not count.
+  // Answering is not choosing: a selector that declined every candidate it was shown,
+  // or was not sure of any, reviewed them and chose no term. `chose` lists the selectors
+  // with at least one term chosen; the whole list is everyone who answered.
   const DECIDED = ["matched", "check", "unsure", "declined"];
+  const CHOSEN = ["matched", "check"];
 
   function pickersOf(entities) {
     const pickers = [];
+    pickers.chose = [];
     for (const e of entities) {
-      if (!e || !DECIDED.includes(outcomeOf(e))) continue;
+      const outcome = e ? outcomeOf(e) : "";
+      if (!DECIDED.includes(outcome)) continue;
       const who = typeof e.pick.selector === "string" ? e.pick.selector : "";
-      if (who && !pickers.includes(who)) pickers.push(who);
+      if (!who) continue;
+      if (!pickers.includes(who)) pickers.push(who);
+      if (CHOSEN.includes(outcome) && !pickers.chose.includes(who)) pickers.chose.push(who);
     }
     return pickers;
+  }
+
+  // What a result actually holds, counted from its entities: how many mentions there
+  // are, for how many the search returned at least one term (`hits`), how many have a
+  // term a model chose (`picked`), and how many show the top search result because no
+  // model was asked (`top`). Every sentence about "this run" is written from these.
+  function tally(entities) {
+    const outcomes = entities.map(outcomeOf);
+    const count = (...kinds) => outcomes.filter((o) => kinds.includes(o)).length;
+    return {
+      mentions: entities.length,
+      hits: entities.filter((e) => Array.isArray(e.matches) && e.matches.length > 0).length,
+      picked: count("matched", "check"),
+      top: count("search"),
+      failed: count("failed"),
+    };
+  }
+
+  // The kinds of search that ranked at least one candidate of this result.
+  function rankedBy(entities) {
+    const ranked = new Set();
+    for (const e of entities) {
+      for (const m of (Array.isArray(e.matches) ? e.matches : []).concat(Array.isArray(e.more) ? e.more : [])) {
+        for (const name of Object.keys((m && m.retrievers) || {})) ranked.add(name.split("-")[0]);
+      }
+    }
+    return ranked;
   }
 
   // Who answered, in one sentence for the line under the summary: the model that read
@@ -1736,7 +1911,9 @@
     if (data.mode === "offline" || typeof data.model !== "string" || !data.model) return "";
     const own = data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site";
     const read = `Read by ${modelName(data.model)}` + (own ? ` on your ${providerName(data.provider)} key` : "");
-    if (pickers.length) return `${read}; terms chosen by ${joinNames(pickers.map(selectorName))}.`;
+    if (pickers.chose.length) return `${read}; terms chosen by ${joinNames(pickers.chose.map(selectorName))}.`;
+    // It answered, and declined every candidate or was sure of none: no term was chosen.
+    if (pickers.length) return `${read}; candidates reviewed by ${joinNames(pickers.map(selectorName))}, which chose no term.`;
     const outcomes = entities.map(outcomeOf);
     return outcomes.includes("search") && !outcomes.includes("failed") ? `${read}; no model chose the terms.` : `${read}.`;
   }
@@ -1754,17 +1931,18 @@
       }
       el.ranOn.append(".");
     }
-    if (pickers.length) {
-      el.ranOn.append(" Terms picked by ");
-      pickers.forEach((who, i) => {
-        if (i) el.ranOn.append(i === pickers.length - 1 ? " and " : ", ");
+    const named = pickers.chose.length ? pickers.chose : pickers;
+    if (named.length) {
+      el.ranOn.append(pickers.chose.length ? " Terms picked by " : " Candidates reviewed by ");
+      named.forEach((who, i) => {
+        if (i) el.ranOn.append(i === named.length - 1 ? " and " : ", ");
         el.ranOn.append(h("strong", { text: selectorName(who) }));
       });
-      el.ranOn.append(".");
+      el.ranOn.append(pickers.chose.length ? "." : "; no term was picked.");
     } else if (data.mode !== "offline" && outcomes.includes("failed")) {
       el.ranOn.append(" The model did not finish choosing the terms.");
     } else if (data.mode !== "offline" && outcomes.includes("search")) {
-      el.ranOn.append(" No model picked the terms: each entity shows its top search result.");
+      el.ranOn.append(" No model picked the terms: where the search found any, the top result is shown.");
     }
     el.ranOn.hidden = !el.ranOn.firstChild;
   }
@@ -1838,7 +2016,14 @@
   // "About this run": a different model answered, or part of the search was missing.
   // The sentences are written here from `fallbacks`; the server's own `notices` are
   // used as they are when a step-down has a reason this page does not know.
-  function renderNotices(data, searched) {
+  // The search status of a response is one flag per kind of search for the whole
+  // catalog, and it reads "unavailable" as soon as one ontology lacks that kind. So what
+  // is said of this run is checked against its own entities: a kind of search that
+  // ranked a candidate here was not off for the whole run, and a run with a term found
+  // was not without its search.
+  function renderNotices(data, searched, entities) {
+    const ranked = rankedBy(entities);
+    const hits = tally(entities).hits;
     clear(el.noticesList);
     const served = (Array.isArray(data.notices) ? data.notices : []).filter((n) => typeof n === "string" && n.trim());
     const mine = (Array.isArray(data.fallbacks) ? data.fallbacks : []).map(fallbackSentence);
@@ -1846,11 +2031,23 @@
     const retrieval = data.retrieval || {};
     const off = (name) => Boolean(retrieval[name]) && retrieval[name].status !== "ok";
     if (searched && off("dense") && off("bm25")) {
-      lines.push("The search was unavailable for this run, so the mentions could not be looked up.");
+      lines.push(
+        hits
+          ? "Parts of the search were unavailable for this run, so some mentions may have been found by one kind of search only, or not at all."
+          : "The search was unavailable for this run, so the mentions could not be looked up.",
+      );
     } else if (searched && off("dense")) {
-      lines.push("Part of the search (matching by meaning) was unavailable for this run, so terms were found by keyword only. Synonyms and paraphrases may be missed.");
+      lines.push(
+        ranked.has("dense")
+          ? "Matching by meaning was unavailable for part of this run, so some terms were found by keyword only. Synonyms and paraphrases may be missed."
+          : "Part of the search (matching by meaning) was unavailable for this run, so terms were found by keyword only. Synonyms and paraphrases may be missed.",
+      );
     } else if (searched && off("bm25")) {
-      lines.push("Part of the search (matching by keyword) was unavailable for this run, so terms were found by meaning only.");
+      lines.push(
+        ranked.has("bm25")
+          ? "Matching by keyword was unavailable for part of this run, so some terms were found by meaning only."
+          : "Part of the search (matching by keyword) was unavailable for this run, so terms were found by meaning only.",
+      );
     }
     for (const line of new Set(lines)) el.noticesList.append(h("li", { text: line }));
     el.notices.hidden = !el.noticesList.firstChild;
@@ -1904,7 +2101,11 @@
       const s = over && none ? `${over}, and ${none}.` : `${over || none}.`;
       return s.charAt(0).toUpperCase() + s.slice(1);
     }
-    if (!pickers.length && outcomes.includes("search")) return "No model chose here: each mention shows its top search result.";
+    if (!pickers.length && outcomes.includes("search")) {
+      const top = outcomes.filter((o) => o === "search").length;
+      if (top === outcomes.length) return "No model chose here: each mention shows its top search result.";
+      return `No model chose here: ${top} of the ${outcomes.length} mentions ${top === 1 ? "shows its" : "show their"} top search result.`;
+    }
     return "";
   }
 
@@ -1916,30 +2117,33 @@
   }
 
   // The closing panel: what the visitor just watched, and where the library is. Only
-  // what this result shows is said. The kinds of search are read from the candidates
-  // themselves (which search ranked them), and "the model chose" from picks that were
-  // made. The term count is the size of the catalog: a mention is looked up in the one
-  // ontology of its type, so no run searches all of it. With no candidate at all (the
-  // search failed, or found nothing) there is no lookup to point at, and no panel.
+  // what this result shows is said, counted from its entities (tally): for how many
+  // mentions the search returned a term, how many of those a model chose a term for, and
+  // how many show the top search result. "Each mention" is said only when it is each
+  // one. The kinds of search are read from the candidates themselves (which search
+  // ranked them). The term count is the size of the catalog: a mention is looked up in
+  // the one ontology of its type, so no run searches all of it. With no candidate at all
+  // (the search failed, or found nothing) there is no lookup to point at, and no panel.
   function renderNext(data, entities, pickers) {
-    const ranked = new Set();
-    for (const e of entities) {
-      for (const m of (Array.isArray(e.matches) ? e.matches : []).concat(Array.isArray(e.more) ? e.more : [])) {
-        for (const name of Object.keys((m && m.retrievers) || {})) ranked.add(name.split("-")[0]);
-      }
-    }
-    const found = entities.some((e) => Array.isArray(e.matches) && e.matches.length > 0);
-    el.next.hidden = !found;
-    if (!found) return;
-    const outcomes = entities.map(outcomeOf);
+    const ranked = rankedBy(entities);
+    const t = tally(entities);
+    el.next.hidden = t.hits === 0;
+    if (!t.hits) return;
     const total = state.ontologies.reduce((sum, o) => sum + (Number(o.count) || 0), 0);
     const kinds = [ranked.has("bm25") ? "by keyword" : "", ranked.has("dense") ? "by meaning" : ""].filter(Boolean);
     const how = kinds.length ? ` ${kinds.join(" and ")}` : "";
-    let chose = "";
-    if (pickers.length) chose = ", and the model chose among real candidates";
-    else if (outcomes.includes("search") && !outcomes.includes("failed")) chose = ", and each mention shows the top search result";
+    const all = t.hits === t.mentions;
+    const looked = all ? `xwalk looked up each mention${how}` : `xwalk's search found terms for ${t.hits} of the ${t.mentions} mentions${how}`;
+    const then = [];
+    if (t.picked && pickers.chose.length) {
+      then.push(t.picked === t.hits ? "the model chose among real candidates" : `the model chose a term for ${t.picked} of ${all ? "them" : "those"}`);
+    }
+    if (t.top && !t.failed) {
+      if (t.top === t.hits) then.push(all ? "each mention shows the top search result" : t.hits === 1 ? "that one shows its top search result" : "each of those shows its top search result");
+      else then.push(`${t.top} ${t.top === 1 ? "shows" : "show"} the top search result`);
+    }
     el.nextBody.textContent =
-      `The model never writes an ID. xwalk looked up each mention${how}${chose}. ` +
+      `The model never writes an ID. ${looked}${then.map((part) => `, and ${part}`).join("")}. ` +
       (total > 0 ? `The catalog holds ${total.toLocaleString("en")} terms. ` : "") +
       "xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.";
   }
@@ -2008,7 +2212,7 @@
     el.exampleNote.textContent = example ? `Recorded from a real run on ${state.example.recorded}.` : "";
     el.exampleNote.hidden = !example;
 
-    renderNotices(data, entities.some((e) => e.ontology));
+    renderNotices(data, entities.some((e) => e.ontology), entities);
     renderRunDetails(data, pickers, outcomes);
     el.runDetailsSummary.textContent = example ? "Details of the recorded run" : "Run details";
     el.runDetails.open = false;
@@ -2229,10 +2433,17 @@
       setRunning(false);
       state.runCtx = null;
     }
+    // The run is over and what it has to say is on the page (an error, against what it
+    // was submitted with). Now the form may change for the next run: who pays, as session
+    // storage has it if the page was restored meanwhile, and then a health answer that
+    // arrived during the run.
     if (state.payerCheckDue) {
       state.payerCheckDue = false;
       reconcilePayer();
     }
+    const held = state.heldHealth;
+    state.heldHealth = null;
+    if (held) settleHealth(held);
     refreshHealth();
   }
 
@@ -2371,6 +2582,8 @@
   el.ownKey.addEventListener("input", () => {
     clearKeyError();
     rememberKey();
+    // A key entered again settles who pays on a page that could not read its storage.
+    if (state.payer && state.payer.kind === "unread" && currentProvider() && el.ownKey.value.trim()) releaseRuns();
   });
   el.forgetKey.addEventListener("click", () => {
     if (state.running) return;

@@ -240,9 +240,10 @@
       <h2 class="footer-title">How this site handles data</h2>
       <ul>
         <li>Your text is sent to the model provider to find the mentions and choose the terms: Anthropic by default; OpenRouter, and the model host it routes to, if the run falls back or you choose it; the provider of your own key if you use one.</li>
-        <li>The mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory for a while so it does not compute them twice.</li>
-        <li>This site writes no text, prompt or result to its logs or its database. Each run is recorded as a row of counts: time, model, status, text length, mention and token counts, timings, country, and a visitor hash that changes every day.</li>
-        <li>Runs are limited per network, using a salted hash of the IP address. Entries older than a day are deleted by a clean-up that runs from time to time.</li>
+        <li>When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory for a while so it does not compute them twice.</li>
+        <li>This site is built not to keep your text, prompt or results: its logs and its database hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day.</li>
+        <li>When run recording is enabled, this site attempts to save one row of that metadata for each run.</li>
+        <li>Runs on this site's own models are limited per network, and runs with your own key are counted the same way, using a salted hash of the IP address. Entries older than a day are deleted by a clean-up that runs from time to time.</li>
         <li>Visits are counted without cookies.</li>
         <li>If you use your own API key, it stays in this browser tab's session storage and is sent only with your runs.</li>
       </ul>
