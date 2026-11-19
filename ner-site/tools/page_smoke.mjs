@@ -42,6 +42,15 @@
 // result resetting it; and reduced motion. They answer the API from the recorded example
 // (public/example.json) and from fixtures/guide-run.json, a recorded production run.
 //
+// The cache states cover what the server's caches and the recorded example save
+// (ner_site/cache.py). cache-hit: an answer that came whole from the cache says so in
+// place of the timing sentence, and "Run details" shows what was reused, also for a run
+// that reused only some searches or picks. cache-live does the same against the server's
+// own API (the second identical request). example-pressed, example-live and
+// example-early: "Map this text" on the untouched example sends nothing and shows the
+// recorded result with "Run it live"; an edited text, a changed option, an own key, a
+// second press after a live run, and a press before health has answered all run for real.
+//
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
 
@@ -734,7 +743,9 @@ const STATES = {
     await s.expectResults();
     s.check((await s.page.locator("#cards .card").count()) > 0, "no result cards");
     s.check(/\S/.test(await s.text("#results-summary")), "the results summary is empty");
-    await s.expectText("#status", /^Done in /, "the one-sentence status");
+    // The server remembers the example from the width or the scheme before this one
+    // (cache-live holds the two sentences apart).
+    await s.expectText("#status", /^(Done in |Answered from a recent identical run \()/, "the one-sentence status");
     await s.expectHidden("#error", "the error box");
     await s.expectHidden("#progress", "the progress bar after the run");
   },
@@ -755,7 +766,7 @@ const STATES = {
     await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\. Use public or de-identified text: it is sent to the model provider\.$/, "the hint under Run");
     const footer = await s.text("#privacy");
     s.check(!/not saved|stores no|kept for one day|writes no text|Each run is recorded/i.test(footer), "the footer still promises more than the site does");
-    await s.expectText("#privacy", /When embedding search is used, the mentions found in your text are sent to OpenRouter .* may keep recently embedded mentions in memory/, "the footer's line about the embedding cache");
+    s.check(footer.includes("When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings. The server may keep recent mentions, search results and answers in memory for a few hours so that it does not compute them twice; none of that is written to its database."), "the footer's line about what the server keeps in memory is not the agreed one");
     s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
     s.check(/When run recording is enabled, this site attempts to save/.test(footer), "the footer says runs are recorded without its condition");
     s.check(/Runs on this site's own models are limited per network/.test(footer), "the footer's line about limits has no condition");
@@ -2835,6 +2846,261 @@ const STATES = {
     s.check(still.every((a) => a === "none"), `with reduced motion the faces are ${still.join(",")} during a run`);
     gate.release();
     await s.expectResults();
+  },
+
+  // An answer the server already had, and a run that reused part of its work.
+  async "cache-hit"(s) {
+    const original = { timing_ms: { extract: 3289, map: 2339, select: 3197, total: 8825 }, usage: { llm_calls: 1, prompt_tokens: 1134, completion_tokens: 187, embedding_requests: 1, selector_calls: 7 } };
+    const noCalls = { llm_calls: 0, prompt_tokens: null, completion_tokens: null, embedding_requests: 0, selector_calls: 0, selector_prompt_tokens: null, selector_completion_tokens: null, selector_cost_usd: null };
+    const hit = (age) => shaped({ usage: noCalls, timing_ms: { total: 1 }, cache: { response: "hit", retrieval_hits: 0, pick_hits: 0, age_s: age, original } });
+    s.health = productionHealth();
+    s.ner = { body: hit(245) };
+    await s.open();
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectResults();
+    await s.expectText("#status", /^Answered from a recent identical run \(4 minutes ago\)\. No model was called\. That run was read by Claude Opus 5\.5; terms chosen by Claude Opus 5\.5\.$/, "the status of a cached answer");
+    let seen = await s.shown();
+    s.check(seen.kind === "run" && seen.heading === "Results" && seen.cards === SHAPED_SPECS.length, `a cached answer is shown as ${seen.kind}, ${JSON.stringify(seen.heading)}, ${seen.cards} cards`);
+    s.check(!/Done in/.test(await s.text("#results")), "a cached answer still shows a timing sentence");
+    await s.page.click("#run-details > summary");
+    const rows = () => s.page.evaluate(() => Object.fromEntries([...document.querySelectorAll("#run-details-list dt")].map((dt) => [dt.textContent, dt.nextElementSibling.textContent])));
+    let details = await rows();
+    s.check(details.Cache === "the whole answer was reused from a recent identical run (4 minutes ago); no model call and no search for this request", `Run details say of the cache: ${JSON.stringify(details.Cache)}`);
+    s.check(details["That run"] === "extract 3.29 s, search 2.34 s, pick 3.20 s, total 8.82 s; 1 model call for extraction, 7 for picking" || details["That run"] === "extract 3.29 s, search 2.34 s, pick 3.20 s, total 8.83 s; 1 model call for extraction, 7 for picking", `Run details say of the original run: ${JSON.stringify(details["That run"])}`);
+    s.check(details["Model calls"] === "0 for extraction" && details.Timing === "total 1 ms" && details.Tokens === undefined, `a cached answer's own figures are ${JSON.stringify([details["Model calls"], details.Timing, details.Tokens])}`);
+    if (s.shot) await s.shot("hit");
+
+    // How old the answer is, in the words a visitor reads.
+    for (const [age, words] of [[20, "less than a minute ago"], [60, "1 minute ago"], [3599, "59 minutes ago"], [7300, "2 hours ago"]]) {
+      s.ner = { body: hit(age) };
+      await s.run();
+      await s.settled();
+      const status = await s.text("#status");
+      s.check(status.startsWith(`Answered from a recent identical run (${words}). No model was called.`), `an answer ${age} s old is said as ${JSON.stringify(status.slice(0, 80))}`);
+    }
+
+    // A run that reused some searches and one pick: an ordinary result, and only "Run
+    // details" says what was reused.
+    s.ner = { body: shaped({ cache: { response: "miss", retrieval_hits: 3, pick_hits: 1 } }) };
+    await s.run();
+    await s.settled();
+    await s.expectText("#status", /^Done in 8\.8 s: /, "the status of a run that reused part of its work");
+    await s.page.evaluate(() => (document.getElementById("run-details").open = false));
+    s.check(!/reused|recent identical/i.test(await s.text("#results")), "a partial reuse is said outside Run details");
+    await s.page.click("#run-details > summary");
+    details = await rows();
+    s.check(details.Cache === "search results reused for 3 mentions, 1 pick reused (from recent runs, at no model cost)" && details["That run"] === undefined, `Run details say of a partial reuse: ${JSON.stringify(details.Cache)}`);
+    s.ner = { body: shaped({ cache: { response: "miss", retrieval_hits: 0, pick_hits: 0 } }) };
+    await s.run();
+    await s.settled();
+    s.check((await rows()).Cache === "nothing reused from recent runs", `Run details say of a run that reused nothing: ${JSON.stringify((await rows()).Cache)}`);
+    // A server without caches says nothing about one.
+    s.ner = { body: shaped() };
+    await s.run();
+    await s.settled();
+    s.check((await rows()).Cache === undefined, "Run details have a cache row for a response without one");
+    seen = await s.shown();
+    s.check(/^Done in /.test(seen.status || ""), `after a plain run the status is ${JSON.stringify(seen.status)}`);
+  },
+
+  // The same, end to end, against the server's own API: the second identical request is
+  // answered from its cache. A server that reports no cache (the canned one, or
+  // NER_SITE_CACHE=off) has nothing to show here.
+  async "cache-live"(s) {
+    await s.open();
+    const text = `Note ${Date.now()}-${s.width}: she took haloperidol, later ketamine.`;
+    const answers = [];
+    s.page.on("response", async (response) => {
+      if (new URL(response.url()).pathname !== "/api/ner") return;
+      try {
+        answers.push(await response.json());
+      } catch (_) {
+        answers.push(null);
+      }
+    });
+    // The n-th answer, once this listener has read its body (the page may be done first).
+    const answer = async (n) => {
+      for (let i = 0; i < 100 && answers.length < n; i += 1) await s.page.waitForTimeout(50);
+      return answers[n - 1];
+    };
+    await s.page.fill("#text", text);
+    await s.run();
+    await s.expectResults();
+    const first = await answer(1);
+    if (!first || !first.cache) {
+      console.log(`        (cache-live @ ${s.width}px: this server reports no cache; nothing checked)`);
+      return;
+    }
+    s.check(first.cache.response === "miss", `the first run of a new text was a ${first.cache.response}`);
+    await s.expectText("#status", /^Done in /, "the status of the first run");
+    await s.run();
+    await s.expectResults();
+    const second = await answer(2);
+    s.check(second && second.cache && second.cache.response === "hit" && second.usage.llm_calls === 0, `the second identical run answered ${JSON.stringify(second && second.cache)}`);
+    await s.expectText("#status", /^Answered from a recent identical run \(less than a minute ago\)\. No model was called\./, "the status of the second identical run");
+    s.check(s.posts.length === 2, `${s.posts.length} requests were sent for two presses`);
+    // One more character: a run again, which reuses what was looked up for the mentions.
+    await s.page.fill("#text", text + " ");
+    await s.run();
+    await s.expectResults();
+    const third = await answer(3);
+    s.check(third && third.cache && third.cache.response === "miss" && third.cache.retrieval_hits >= 1, `a text sharing its mentions answered ${JSON.stringify(third && third.cache)}`);
+    await s.expectText("#status", /^Done in /, "the status of a run that reused part of its work");
+    await s.page.click("#run-details > summary");
+    await s.expectText("#run-details", /Cache\s*search results reused for \d+ mentions?/, "the cache row of Run details");
+  },
+
+  // "Map this text" on the untouched example: nothing is sent.
+  async "example-pressed"(s) {
+    s.health = productionHealth();
+    s.ner = { body: shaped() };
+    await s.open();
+    await s.expectExample("on arrival");
+    await s.expectHidden("#recorded-note", "the line about the recorded result, before the button is pressed");
+    await s.run();
+    await s.expectVisible("#recorded-note", "the line about the recorded result");
+    await s.page.waitForTimeout(700); // the scroll
+    await s.expectText("#recorded-note", /^This is the recorded result for the example, so nothing was sent\.\s*Run it live$/, "the line about the recorded result");
+    let seen = await s.shown();
+    s.check(s.posts.length === 0, `pressing the button on the untouched example sent ${s.posts.length} request(s)`);
+    s.check(seen.kind === "example" && seen.heading === "Example result" && EXAMPLE_NOTE.test(seen.note || ""), `the recorded result is labelled ${JSON.stringify([seen.kind, seen.heading, seen.note])}`);
+    s.check(seen.status === null && seen.stale === null && seen.details === "Details of the recorded run", `beside the recorded result: status ${JSON.stringify(seen.status)}, stale ${JSON.stringify(seen.stale)}, details ${JSON.stringify(seen.details)}`);
+    s.check(seen.cards === EXAMPLE_FILE.response.entities.length, `${seen.cards} cards after the press`);
+    s.check(seen.focus === "results-heading", `after the press the focus is on #${seen.focus}`);
+    s.check(seen.announce === "This is the recorded result for the example, so nothing was sent.", `the press was announced as ${JSON.stringify(seen.announce)}`);
+    // Brought into view as a finished run is: the result starts at the top of the screen.
+    const place = await s.page.evaluate(() => Math.round(document.getElementById("results").getBoundingClientRect().top));
+    s.check(place >= -4 && place <= seen.screen / 2, `after the press the result starts ${place}px from the top of a ${seen.screen}px screen`);
+    const button = await s.page.evaluate(() => {
+      const b = document.getElementById("run-live");
+      const r = b.getBoundingClientRect();
+      return { tag: b.tagName, type: b.type, height: r.height, seen: r.top >= 0 && r.bottom <= window.innerHeight };
+    });
+    s.check(button.tag === "BUTTON" && button.type === "button" && button.seen, `"Run it live" is ${JSON.stringify(button)}`);
+    s.check(button.height >= (s.phone ? 44 : 32), `"Run it live" is ${button.height}px tall`);
+    const contrast = await s.contrast("#recorded-text");
+    s.check(contrast >= 4.5, `the line about the recorded result has a contrast of ${contrast}:1`);
+    s.check(seen.stored.length === 0, `the press stored something: ${seen.stored.join(", ")}`);
+    if (s.shot) await s.shot("pressed");
+
+    // Ctrl+Enter is the same button.
+    await s.page.focus("#text");
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 0, "Ctrl+Enter on the untouched example sent a request");
+
+    // The figure still follows the recorded result.
+    await s.page.click("#guide-toggle");
+    await s.page.waitForFunction(() => document.getElementById("pipe").getAttribute("data-play") === "done", null, { timeout: 25000 });
+    const g = await s.guide();
+    s.check(g.view === "expanded" && g.chips.length === EXAMPLE_FILE.response.entities.length && g.nodes.result.label === "CHEBI:6801", `after the press the figure shows ${g.view}, ${g.chips.length} mentions, ${g.nodes.result.label}`);
+    await s.page.click("#guide-toggle");
+
+    // Another text: the line goes, and the result is said to be the example's.
+    await s.page.fill("#text", EXAMPLE_FILE.text + " And more.");
+    await s.expectHidden("#recorded-note", "the line about the recorded result once the text was edited");
+    await s.expectText("#stale", EXAMPLE_STALE);
+    await s.page.fill("#text", EXAMPLE_FILE.text);
+    await s.expectVisible("#recorded-note", "the line about the recorded result once the box holds the example again");
+
+    // A changed option: the button runs for real, with that option.
+    await s.page.click("#options > summary");
+    await s.page.selectOption("#top-k", "3");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text && s.posts[0].body.top_k === 3 && !s.posts[0].authorization, `with another option the page sent ${JSON.stringify(s.posts.map((p) => p.body && p.body.top_k))}`);
+    seen = await s.shown();
+    s.check(seen.kind === "run" && seen.heading === "Results" && seen.note === null, `after a real run the result is labelled ${JSON.stringify([seen.kind, seen.heading, seen.note])}`);
+    await s.expectHidden("#recorded-note", "the line about the recorded result after a real run");
+  },
+
+  // "Run it live", and the other ways the example is run for real.
+  async "example-live"(s) {
+    s.health = productionHealth();
+    s.ner = { status: 500, body: apiError("internal", "boom") };
+    s.expectedStatuses.add(500);
+    await s.open();
+    await s.expectExample("on arrival");
+    await s.run();
+    await s.expectVisible("#recorded-note", "the line about the recorded result");
+    s.check(s.posts.length === 0, "the first press sent a request");
+
+    // A live run that fails: the recorded result stays, and "Try again" is a live run
+    // again, not the recording.
+    await s.page.click("#run-live");
+    await s.expectError("The demo hit an error on its side.", { action: "Try again" });
+    let seen = await s.shown();
+    s.check(s.posts.length === 1 && seen.kind === "example" && seen.heading === "Example result", `after a failed live run: ${s.posts.length} request(s), ${seen.kind}, ${JSON.stringify(seen.heading)}`);
+    const gate = s.gate();
+    s.ner = { gate: gate.promise, body: shaped() };
+    await s.page.click("#error-action");
+    await s.expectVisible("#progress", "the progress bar of the live run");
+    await s.expectHidden("#recorded-note", "the line about the recorded result while the live run is under way");
+    s.check(s.posts.length === 2, `"Try again" after a failed live run sent ${s.posts.length - 1} more request(s)`);
+    const sent = s.posts[1];
+    s.check(sent.body.text === EXAMPLE_FILE.text && sent.body.prompt === null && sent.body.top_k === 5 && sent.body.model === "claude-opus-5-5" && !("provider" in sent.body) && !sent.authorization, `the live run sent ${JSON.stringify({ ...sent.body, text: sent.body.text.slice(0, 20) })}`);
+    gate.release();
+    await s.expectResults();
+    seen = await s.shown();
+    s.check(seen.kind === "run" && seen.heading === "Results" && seen.note === null && /^Done in /.test(seen.status || ""), `the live run is shown as ${JSON.stringify([seen.kind, seen.heading, seen.note, seen.status])}`);
+    await s.expectHidden("#recorded-note", "the line about the recorded result after the live run");
+
+    // Pressed again with the live result of this text on display: it runs again.
+    s.ner = { body: shaped() };
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 3, `a second press after a live run sent ${s.posts.length - 2} more request(s)`);
+
+    // Another text, run; then the example again from the Example button: recorded again.
+    await s.page.fill("#text", SHAPED_TEXT);
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 4, "the visitor's own text was not run");
+    await s.loadExample();
+    await s.run();
+    await s.expectVisible("#recorded-note", "the line about the recorded result, the example loaded again");
+    seen = await s.shown();
+    s.check(s.posts.length === 4 && seen.kind === "example" && seen.heading === "Example result" && EXAMPLE_NOTE.test(seen.note || ""), `the example loaded again was answered with ${JSON.stringify([s.posts.length, seen.kind, seen.heading])}`);
+    s.check(seen.cards === EXAMPLE_FILE.response.entities.length && seen.stale === null, `the recorded result came back with ${seen.cards} cards, stale ${JSON.stringify(seen.stale)}`);
+
+    // Another model that reads the text: a real run.
+    if (!(await s.optionsOpen())) await s.page.click("#options > summary");
+    await s.page.selectOption("#model", "claude-sonnet-5-5");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 5 && s.posts[4].body.model === "claude-sonnet-5-5", "another model did not run the example for real");
+    await s.page.selectOption("#model", "claude-opus-5-5");
+
+    // An own key: a real run, on that key.
+    await s.chooseOwnKey("anthropic");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 6 && s.posts[5].body.provider === "anthropic" && s.posts[5].authorization === `Bearer ${FAKE_KEY}`, "an own key did not run the example for real");
+  },
+
+  // Before health has answered the page does not know that the defaults are the ones
+  // the example was recorded with: the press is a run, as it was.
+  async "example-early"(s) {
+    const health = s.gate();
+    s.health = productionHealth();
+    s.healthGate = health.promise;
+    s.ner = { body: shaped() };
+    await s.openHeld();
+    await s.expectExample("before health answers", { counts: false });
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text, `a press before health answered sent ${s.posts.length} request(s)`);
+    await s.expectHidden("#recorded-note", "the line about the recorded result");
+    health.release();
+    await s.page.waitForLoadState("networkidle").catch(() => {});
+    // A prompt of the visitor's own: a real run too.
+    await s.page.click("#options > summary");
+    await s.page.click("#prompt-editor > summary");
+    await s.page.fill("#prompt", "Find only the foods.");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 2 && s.posts[1].body.prompt === "Find only the foods.", "an edited prompt did not run the example for real");
   },
 };
 

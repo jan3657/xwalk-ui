@@ -1843,6 +1843,35 @@ button.guide-play:hover:not(:disabled) {
   font-size: 0.875rem;
 }
 
+/* "Map this text" on the untouched example: what was shown in place of a run, and the
+   way to a real one. */
+.recorded-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 10px 0 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  font-size: 0.9375rem;
+}
+
+.recorded-note[hidden] {
+  display: none;
+}
+
+/* On the tinted line the button takes the surface, as in the closing panel. */
+.recorded-note button.secondary {
+  background: var(--surface);
+  border-color: var(--control-border);
+}
+
+.recorded-note button.secondary:hover {
+  border-color: var(--accent);
+}
+
 /* ---------- the closing panel: what that was, and where the library is ---------- */
 
 .next {

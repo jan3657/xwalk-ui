@@ -125,6 +125,8 @@
     results: $("results"),
     resultsHeading: $("results-heading"),
     exampleNote: $("example-note"),
+    recorded: $("recorded-note"),
+    runLive: $("run-live"),
     stale: $("stale"),
     summary: $("results-summary"),
     cap: $("results-cap"),
@@ -164,10 +166,11 @@
     healthFailed: false, // the status read on arrival failed; said in the top banner
     visitorAt: 0, // when health.visitor was read, for "next one in N min"
     textError: null, // "empty", "long" or "server" while the line under the text box is shown
-    // The result on display: { text, data, example }. A result belongs to the text it
-    // was made from: once the box holds something else the result is marked as being for
-    // the earlier text. `example` is true for the recorded example, which is never the
-    // visitor's own run.
+    // The result on display: { text, data, example, pressed }. A result belongs to the
+    // text it was made from: once the box holds something else the result is marked as
+    // being for the earlier text. `example` is true for the recorded example, which is
+    // never the visitor's own run; `pressed` once the visitor pressed "Map this text" on
+    // it and was shown the recorded result in place of a run (showRecorded).
     shown: null,
     // example.json once it has loaded: { text, recorded, data, ontologies }.
     example: null,
@@ -253,6 +256,22 @@
   function safeHref(url) {
     if (typeof url !== "string") return null;
     return /^https?:\/\//i.test(url) ? url : null;
+  }
+
+  // How long ago a cached answer was made: " (4 minutes ago)", or "" when not told.
+  function agoText(seconds) {
+    if (typeof seconds !== "number" || !(seconds >= 0)) return "";
+    if (seconds < 60) return " (less than a minute ago)";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return ` (${minutes} minute${minutes === 1 ? "" : "s"} ago)`;
+    const hours = Math.floor(minutes / 60);
+    return ` (${hours} hour${hours === 1 ? "" : "s"} ago)`;
+  }
+
+  // What the server's caches did for a response: its `cache` object, or null from a
+  // server that has none (or the recorded example, which predates them).
+  function cacheOf(data) {
+    return data && data.cache && typeof data.cache === "object" ? data.cache : null;
   }
 
   function fmtSeconds(ms) {
@@ -1919,10 +1938,12 @@
 
   // Who answered, in one sentence for the line under the summary: the model that read
   // the text and the models that chose terms, as the response names them. "" offline.
-  function answeredText(data, entities, pickers) {
+  // `cached`: the answer came from the server's cache, so the models named are those of
+  // the run that made it, not of this request (which called none).
+  function answeredText(data, entities, pickers, cached) {
     if (data.mode === "offline" || typeof data.model !== "string" || !data.model) return "";
-    const own = data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site";
-    const read = `Read by ${modelName(data.model)}` + (own ? ` on your ${providerName(data.provider)} key` : "");
+    const own = !cached && data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site";
+    const read = `${cached ? "That run was read" : "Read"} by ${modelName(data.model)}` + (own ? ` on your ${providerName(data.provider)} key` : "");
     if (pickers.chose.length) return `${read}; terms chosen by ${joinNames(pickers.chose.map(selectorName))}.`;
     // It answered, and declined every candidate or was sure of none: no term was chosen.
     if (pickers.length) return `${read}; candidates reviewed by ${joinNames(pickers.map(selectorName))}, which chose no term.`;
@@ -1988,13 +2009,35 @@
       if (num(usage.embedding_requests)) row("Embedding requests", String(usage.embedding_requests));
       if (num(usage.selector_cost_usd)) row("Picking cost", "$" + usage.selector_cost_usd.toFixed(5));
     }
-    const timing = data.timing_ms || {};
-    const parts = [];
-    if (typeof timing.extract === "number") parts.push(`extract ${fmtSeconds(timing.extract)}`);
-    if (typeof timing.map === "number") parts.push(`search ${fmtSeconds(timing.map)}`);
-    if (typeof timing.select === "number") parts.push(`pick ${fmtSeconds(timing.select)}`);
-    if (typeof timing.total === "number") parts.push(`total ${fmtSeconds(timing.total)}`);
-    if (parts.length) row("Timing", parts.join(", "));
+    const timingText = (timing) => {
+      const parts = [];
+      if (typeof timing.extract === "number") parts.push(`extract ${fmtSeconds(timing.extract)}`);
+      if (typeof timing.map === "number") parts.push(`search ${fmtSeconds(timing.map)}`);
+      if (typeof timing.select === "number") parts.push(`pick ${fmtSeconds(timing.select)}`);
+      if (typeof timing.total === "number") parts.push(`total ${fmtSeconds(timing.total)}`);
+      return parts.join(", ");
+    };
+    const timed = timingText(data.timing_ms || {});
+    if (timed) row("Timing", timed);
+    // What the server reused from its memory of recent runs. A whole answer reused is
+    // also said in the status line; mentions and picks reused inside a run only here.
+    const cache = cacheOf(data);
+    const count = (v) => (typeof v === "number" && v > 0 ? v : 0);
+    if (cache && cache.response === "hit") {
+      row("Cache", `the whole answer was reused from a recent identical run${agoText(cache.age_s)}; no model call and no search for this request`);
+      const original = cache.original && typeof cache.original === "object" ? cache.original : {};
+      const was = [];
+      const before = timingText(original.timing_ms && typeof original.timing_ms === "object" ? original.timing_ms : {});
+      if (before) was.push(before);
+      const used = original.usage && typeof original.usage === "object" ? original.usage : {};
+      if (typeof used.llm_calls === "number") was.push(`${plural(used.llm_calls, "model call")} for extraction` + (count(used.selector_calls) ? `, ${used.selector_calls} for picking` : ""));
+      if (was.length) row("That run", was.join("; "));
+    } else if (cache) {
+      const reused = [];
+      if (count(cache.retrieval_hits)) reused.push(`search results reused for ${plural(cache.retrieval_hits, "mention")}`);
+      if (count(cache.pick_hits)) reused.push(`${plural(cache.pick_hits, "pick")} reused`);
+      row("Cache", reused.length ? `${reused.join(", ")} (from recent runs, at no model cost)` : "nothing reused from recent runs");
+    }
     el.runDetails.hidden = !el.ranOn.firstChild && !el.runDetailsList.firstChild;
   }
 
@@ -2213,10 +2256,15 @@
       if (typeof timing.select === "number") steps.push(`${fmtShort(timing.select)} choosing terms`);
       done = `Done in ${fmtShort(timing.total)}` + (steps.length ? `: ${steps.join(", ")}.` : ".");
     }
+    // An answer the server already had: said plainly, in place of a time that would
+    // read as a very fast model.
+    const cache = cacheOf(data);
+    const cached = !example && Boolean(cache) && cache.response === "hit";
+    if (cached) done = `Answered from a recent identical run${agoText(cache.age_s)}. No model was called.`;
     // After a run the page names the models that answered, which need not be the ones
     // the intro names or the ones that were asked for. "Done in 8.8 s" on the example
     // would read as the visitor's own wait.
-    const answered = answeredText(data, entities, pickers);
+    const answered = answeredText(data, entities, pickers, cached);
     el.status.textContent = example ? "" : [done, answered].filter(Boolean).join(" ");
 
     el.results.setAttribute("data-kind", example ? "example" : "run");
@@ -2232,7 +2280,7 @@
     // Before a run the banner speaks for the service; after one, the run's own search
     // status is said beside its results ("About this run"). The example is not a run.
     if (!example) renderBanner(data.mode, state.health && state.health.retrieval);
-    state.shown = { text, data, example };
+    state.shown = { text, data, example, pressed: false };
     el.results.hidden = false;
     syncStale();
     // The figure follows the result on display, from its first mention again.
@@ -2252,6 +2300,11 @@
         ? 'This result is for the example text. Press "Map this text" to map yours.'
         : "These results are for the earlier text. Run again to map the text that is in the box now.";
     el.stale.hidden = !stale;
+    // "This is the recorded result for the example, so nothing was sent": only under the
+    // recorded example, once the visitor pressed the button on it, while the box still
+    // holds that text and no run is under way.
+    const recorded = Boolean(state.shown) && state.shown.example && state.shown.pressed && !el.results.hidden;
+    el.recorded.hidden = !(recorded && !other && !state.running);
   }
 
   // ---------- the guide: the figure that plays ----------
@@ -2930,7 +2983,45 @@
     releaseRuns();
   }
 
-  async function run() {
+  // Whether a run started now would ask for exactly what the recorded example already
+  // answers: the example's text, the site paying, and every option as it comes (the
+  // prompt, the reading model, the selector, five candidates). Only once health has
+  // said that this is the deployment the example was recorded on, with the defaults it
+  // was recorded with.
+  function exampleAsked() {
+    const example = state.example;
+    const health = state.health;
+    if (!example || !health || exampleFits() !== true) return false;
+    if (el.text.value !== example.text || currentProvider()) return false;
+    const prompt = el.prompt.value;
+    if (prompt.trim() && prompt !== state.defaultPrompt) return false;
+    if ((el.model.value || health.default_model) !== health.default_model) return false;
+    const selector = el.selectorField.hidden ? health.default_selector : el.selector.value || health.default_selector;
+    if (selector !== health.default_selector) return false;
+    if ((Number(el.topK.value) || 5) !== 5) return false;
+    const data = example.data;
+    if (data.requested_model && data.requested_model !== health.default_model) return false;
+    if (data.requested_selector && data.requested_selector !== health.default_selector) return false;
+    return true;
+  }
+
+  // "Map this text" on the untouched example: nothing is sent. The recorded result is
+  // brought into view as a finished run would be, still under its "Example result"
+  // heading and its date, with one line that says so and offers a real run.
+  const RECORDED_TEXT = "This is the recorded result for the example, so nothing was sent.";
+
+  function showRecorded() {
+    const example = state.example;
+    if (!(state.shown && state.shown.example) || el.results.hidden) renderResults(example.text, example.data, { example: true });
+    state.shown.pressed = true;
+    syncStale();
+    announce(RECORDED_TEXT);
+    el.resultsHeading.focus({ preventScroll: true });
+    revealResults();
+  }
+
+  // `opts.live`: "Run it live" was pressed, so the example is run for real.
+  async function run(opts) {
     if (state.running) return;
     // Both ways to submit end here (the button and Ctrl/Cmd+Enter).
     if (state.payer) {
@@ -2938,6 +3029,14 @@
       return;
     }
     hideError();
+    // The untouched example is answered by its recorded result. Not when the visitor
+    // asked for a live run, and not when a live run of this very text is already what
+    // is on display: pressing the button again then means "run it again".
+    const ownRun = state.shown && !state.shown.example && state.shown.text === el.text.value;
+    if (!(opts && opts.live) && !ownRun && exampleAsked()) {
+      showRecorded();
+      return;
+    }
     const text = el.text.value;
     const n = codePointLength(text);
     if (!text.trim() || n > state.limits.max_chars) {
@@ -3108,6 +3207,7 @@
       renderAllowance();
     });
   }
+  el.runLive.addEventListener("click", () => run({ live: true }));
   el.example.addEventListener("click", loadExample);
   el.noEntitiesExample.addEventListener("click", loadExample);
   el.clear.addEventListener("click", () => {
@@ -3192,9 +3292,11 @@
     clearKeyError();
     el.ownKey.focus();
   });
+  // "Try again" follows a request that failed, so it is a request again: also on the
+  // untouched example, where the button itself would show the recorded result.
   el.errorAction.addEventListener("click", () => {
     hideError();
-    run();
+    run({ live: true });
   });
   el.errorOwnKey.addEventListener("click", () => {
     hideError();
