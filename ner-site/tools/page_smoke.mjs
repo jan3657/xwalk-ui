@@ -28,7 +28,12 @@
 // review found and that must not come back: a native form submission without the script,
 // a page restored from the back-forward cache after its key was forgotten, the payer or
 // model changed during a run, health answers arriving out of order or late, and an
-// answer whose body stalls.
+// answer whose body stalls. The states of the second review (restore-storage-fails,
+// restore-models, health-during-run, restore-stale-health, run-claims, payer-entry-clean)
+// do the same for: a restored page whose session storage cannot be written or read, model
+// ids changed in another copy of the page, a health answer released during a run, a
+// restored page with an older health answer than the tab's saved payer, what a result
+// claims about picks and search hits, and what is written back to the payer entry.
 //
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
@@ -495,6 +500,12 @@ class Session {
     await this.page.waitForLoadState("networkidle").catch(() => {});
   }
 
+  // The same, without waiting for the network: for a state that holds the health read
+  // the restored page makes.
+  async restoredHeld() {
+    await this.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+  }
+
   // What a screen reader says after the Run button's name: its aria-describedby.
   runDescription() {
     return this.page.evaluate(() =>
@@ -592,8 +603,12 @@ const STATES = {
     await s.expectText("#caveat", /^Searches 261,018 real ontology terms\. Every ID comes from the ontology; the model never writes one\.$/, "the trust line");
     await s.expectText("#options-summary", /^Options: Claude Opus 5\.5, free runs$/, "the Options summary");
     await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\. Use public or de-identified text: it is sent to the model provider\.$/, "the hint under Run");
-    s.check(!/not saved|stores no|kept for one day/i.test(await s.text("#privacy")), "the footer still promises more than the site does");
-    await s.expectText("#privacy", /may keep recently embedded mentions in memory/, "the footer's line about the embedding cache");
+    const footer = await s.text("#privacy");
+    s.check(!/not saved|stores no|kept for one day|writes no text|Each run is recorded/i.test(footer), "the footer still promises more than the site does");
+    await s.expectText("#privacy", /When embedding search is used, the mentions found in your text are sent to OpenRouter .* may keep recently embedded mentions in memory/, "the footer's line about the embedding cache");
+    s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
+    s.check(/When run recording is enabled, this site attempts to save/.test(footer), "the footer says runs are recorded without its condition");
+    s.check(/Runs on this site's own models are limited per network/.test(footer), "the footer's line about limits has no condition");
     const described = await s.runDescription();
     s.check(/^Runs on this site's models, free\.$/.test(described), `Run is described as ${JSON.stringify(described)}`);
     await s.expectHidden("#banner", "the banner");
@@ -610,6 +625,13 @@ const STATES = {
     s.check(focus === (s.phone ? "run" : "text"), `after Example the focus is on #${focus}`);
     await s.page.click("#clear-text");
     s.check((await s.page.inputValue("#text")) === "", "Clear left text behind");
+    await s.page.click("#options > summary");
+    // The lede names Claude while Claude reads the text, and no model by name otherwise.
+    await s.page.selectOption("#model", "google/gemini-3.1-flash-lite");
+    await s.expectText("#lede", /^Paste a sentence\. A language model finds the chemicals, diseases and foods in it, and xwalk links each one to a term in ChEBI, MeSH or FoodOn\.$/, "the lede with Gemini reading the text");
+    await s.page.selectOption("#model", "claude-sonnet-5-5");
+    await s.expectText("#lede", /^Paste a sentence\. Claude finds the chemicals/, "the lede with Claude Sonnet reading the text");
+    await s.page.selectOption("#model", "claude-opus-5-5");
   },
 
   async empty(s) {
@@ -698,8 +720,17 @@ const STATES = {
     await s.runExample();
     await s.expectError("The free runs for your network today are used.", { look: "notice", ownKey: true, body: /^They come back at (.+ \()?midnight UTC\)?\.$/ });
     await s.expectHidden("#allowance", "the free-runs line while the notice says the same");
-    // The tab is left open past midnight UTC and looked at again: the limit is over,
-    // and neither the notice nor the line beside Run goes on saying that it is not.
+    // The tab is left open past midnight UTC and looked at again while this hour's runs
+    // are used: yesterday's notice goes, and the line beside Run gives the wait that
+    // holds now.
+    s.health = fixture("health-blocked");
+    await s.setVisibility("hidden");
+    await s.setVisibility("visible");
+    await s.expectHidden("#error", "the daily-limit notice once it is the hourly limit that blocks");
+    await s.expectVisible("#allowance", "the hourly line after the daily notice");
+    await s.expectText("#allowance", /^The free runs for your network this hour are used\. Next one in \d+ min\.$/, "the wait that holds now");
+    // Looked at again later: the limit is over, and neither the notice nor the line
+    // beside Run goes on saying that it is not.
     s.health = fixture("health");
     await s.setVisibility("hidden");
     await s.setVisibility("visible");
@@ -754,7 +785,8 @@ const STATES = {
     await s.expectText("#notices", /Part of the search \(matching by meaning\) was unavailable for this run, so terms were found by keyword only\./, "the weaker-search note");
     const shown = await s.page.evaluate(() => ["banner", "notices", "warnings-box", "results-summary", "results-takeaway"].map((id) => document.getElementById(id).innerText).join(" "));
     s.check(!/BM25|retrieval|build_indexes|no index at/i.test(shown), `search jargon or the operator's reason is shown outside Run details: ${JSON.stringify(shown.slice(0, 200))}`);
-    await s.expectText("#results-takeaway", /^No model chose here: each mention shows its top search result\.$/, "the search-only line");
+    // Counted from the result: two of its eleven mentions have no term to show.
+    await s.expectText("#results-takeaway", /^No model chose here: 9 of the 11 mentions show their top search result\.$/, "the search-only line");
     s.check((await s.page.locator("#cards .card.is-search .card-id").count()) > 0, "search-only cards show no top search result");
     s.check((await s.page.locator("#cards .card-conf").count()) === 0, "a search-only card shows a confidence");
   },
@@ -1488,7 +1520,9 @@ const STATES = {
     await s.runShaped();
     await s.expectVisible("#next", "the closing panel");
     await s.expectText("#next-title", /^That lookup is xwalk$/);
-    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning, and the model chose among real candidates\. The catalog holds 261,018 terms\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/);
+    // Counted from the result: BRCA1 was not looked up, and of the six mentions with
+    // candidates the model chose a term for four (it declined one; one pick failed).
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk's search found terms for 6 of the 7 mentions by keyword and by meaning, and the model chose a term for 4 of those\. The catalog holds 261,018 terms\. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary\.$/);
     s.check(!/searched [\d,]+/.test(await s.text("#next-body")), "the closing panel says the run searched the whole catalog");
     const link = await s.page.evaluate(() => {
       const a = document.getElementById("next-github");
@@ -1518,7 +1552,7 @@ const STATES = {
     s.ner = { body: shaped({ entities: searchOnly, retrieval: { bm25: { status: "ok" }, dense: { status: "unavailable", reason: "no index" } } }) };
     await s.run();
     await s.settled();
-    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword, and each mention shows the top search result\. The catalog holds 261,018 terms\./, "the closing panel for a keyword-only run with no model");
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk's search found terms for 6 of the 7 mentions by keyword, and each of those shows its top search result\. The catalog holds 261,018 terms\./, "the closing panel for a keyword-only run with no model");
     await s.expectText("#status", /Read by Claude Opus 5\.5; no model chose the terms\.$/, "the status line of a run where no model chose");
 
     // Every pick failed: a selector is named on each, but no model chose anything, and
@@ -1527,7 +1561,7 @@ const STATES = {
     s.ner = { body: shaped({ entities: failed }) };
     await s.run();
     await s.settled();
-    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning\. The catalog holds 261,018 terms\./, "the closing panel when every pick failed");
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk's search found terms for 6 of the 7 mentions by keyword and by meaning\. The catalog holds 261,018 terms\./, "the closing panel when every pick failed");
     s.check(!/chose|top search result/.test(await s.text("#next-body")), "the closing panel claims a choice that was not made");
     await s.expectText("#status", /Read by Claude Opus 5\.5\.$/, "the status line when every pick failed");
     await s.expectHidden("#results-takeaway", "the takeaway when every pick failed");
@@ -1810,14 +1844,17 @@ const STATES = {
     await s.run();
     await s.expectVisible("#progress", "the progress bar");
     health.release();
-    await s.page.waitForFunction(() => /200-term sample/.test(document.getElementById("caveat").textContent), null, { timeout: 5000 }).catch(() => s.failures.push("health did not arrive during the run"));
-    await s.page.waitForTimeout(300);
+    // The answer arrives during the run and is kept until the run ends: the form the
+    // run was submitted with does not change under it.
+    await s.page.waitForTimeout(500);
+    s.check((await s.page.evaluate(() => document.getElementById("model").options.length)) === 0, "a health answer filled the model list during a run");
     s.check((await s.page.inputValue("#text")) === EXAMPLE_FILE.text, `health arriving during the run changed the text box to ${JSON.stringify((await s.page.inputValue("#text")).slice(0, 40))}`);
-    await s.expectHidden('#results[data-kind="example"]', "the recorded example on a sample catalog");
     s.healthGate = null;
     answer.release();
     await s.expectVisible('#results[data-kind="run"] .card', "the result of the run");
     await s.settled();
+    await s.page.waitForFunction(() => /200-term sample/.test(document.getElementById("caveat").textContent), null, { timeout: 5000 }).catch(() => s.failures.push("the health answer kept during the run was not applied after it"));
+    await s.expectHidden('#results[data-kind="example"]', "the recorded example on a sample catalog");
     s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text, "the run did not send the example text");
     s.check((await s.page.inputValue("#text")) === EXAMPLE_FILE.text, "the text box does not hold the text that was mapped");
     await s.expectHidden("#stale", "the earlier-text line on a result for the text in the box");
@@ -1928,6 +1965,301 @@ const STATES = {
     gate.release();
     await s.expectResults();
     await s.expectText("#status", /no model chose the terms\.$/, "the status line when no model chose");
+  },
+
+  // ---------- what the second review found ----------
+
+  // A restored page whose session storage is full (writes fail, reads and removals
+  // work) or cannot be read at all. The key that was forgotten in another copy of the
+  // page must not be sent: what is on record is read directly, whether or not anything
+  // can be written, and where it cannot be read the key is cleared from the field and
+  // runs are held until the visitor enters a key again or picks who pays.
+  async "restore-storage-fails"(s) {
+    const OTHER_KEY = "sk-smoke-typed-again-11111111";
+    s.health = fixture("health");
+    s.ner = { body: (request) => ({ ...fixture("ner-own"), provider: request.provider || "site" }) };
+    await s.open();
+    await s.chooseOwnKey("anthropic");
+    // The tab's storage is full from here on.
+    await s.page.evaluate(() => {
+      window.smokeSetItem = Storage.prototype.setItem;
+      Storage.prototype.setItem = function setItem() {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      };
+    });
+    // "Forget key" in another copy of the page (a removal still works), then Back.
+    await s.page.evaluate((k) => window.sessionStorage.removeItem(k), OWN_KEY_ENTRY);
+    await s.restoredFromCache();
+    s.check((await s.page.inputValue("#own-key")) === "", "with storage full, a restored page kept a key that was forgotten");
+    s.check((await s.page.inputValue("#provider")) === "anthropic", "with storage full, forgetting the key changed who pays");
+    await s.runExample();
+    await s.expectVisible("#own-key-error", "the request for a key");
+    await s.expectText("#own-key-error", /^Paste your Anthropic API key/);
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 0, "with storage full, a restored page ran after its key was forgotten");
+
+    // Storage that cannot be read: nothing tells the restored page whether its key is
+    // still the tab's. The key leaves the field and nothing is submitted.
+    await s.page.fill("#own-key", FAKE_KEY);
+    await s.page.evaluate(() => {
+      window.smokeGetItem = Storage.prototype.getItem;
+      Storage.prototype.getItem = function getItem() {
+        throw new DOMException("The operation is insecure.", "SecurityError");
+      };
+    });
+    await s.restoredFromCache();
+    s.check((await s.page.inputValue("#own-key")) === "", "a restored page that cannot read its storage kept the key in its field");
+    await s.expectVisible("#payer", "the hold on a restored page that cannot read its storage");
+    await s.expectText("#payer-message", /cannot read what this tab saved about who pays, so your Anthropic key was cleared from the page\. Nothing has run\./, "the hold's message");
+    s.check(await s.page.evaluate(() => document.getElementById("run").disabled), "Run is enabled on a restored page that cannot read its storage");
+    s.check(/on hold until you choose who pays/.test(await s.runDescription()), "Run's description does not say that runs are held");
+    await s.page.focus("#text");
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 0, "a run was sent from a restored page that cannot read its storage");
+    // A key entered again settles it, and that key (no older one) is the one sent.
+    await s.page.fill("#own-key", OTHER_KEY);
+    await s.expectHidden("#payer", "the hold after the key was entered again");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].authorization === `Bearer ${OTHER_KEY}` && s.posts[0].body.provider === "anthropic", "the run after the key was entered again did not carry that key");
+    // Or the visitor picks the site's models: no key goes with that run.
+    await s.restoredFromCache();
+    await s.expectVisible("#payer", "the hold after a second restore");
+    s.check((await s.page.inputValue("#own-key")) === "", "the second restore kept the key in its field");
+    await s.page.click("#payer-site");
+    await s.expectHidden("#payer", "the hold after choosing the site");
+    s.check((await s.page.inputValue("#provider")) === "site", "'Use the site's models' did not change who pays");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 2 && s.posts[1].authorization === "" && !s.posts[1].body.provider, "the run on the site's models carried a key or a provider");
+    await s.page.evaluate(() => {
+      Storage.prototype.setItem = window.smokeSetItem;
+      Storage.prototype.getItem = window.smokeGetItem;
+    });
+  },
+
+  // The payer is the same on the restored page and on record, and the models are not:
+  // another copy of the page chose a cheaper model for both steps. The next run is
+  // billed to the visitor, so it uses the models on record, not the ones the old
+  // document still shows.
+  async "restore-models"(s) {
+    s.health = fixture("health");
+    s.ner = { body: (request) => ({ ...fixture("ner-own"), provider: request.provider || "site" }) };
+    const record = (choice) => s.page.evaluate(([k, v]) => window.sessionStorage.setItem(k, JSON.stringify(v)), [PAYER_ENTRY, choice]);
+    const models = () => s.page.evaluate(() => `${document.getElementById("model").value} / ${document.getElementById("selector").value}`);
+    await s.open();
+    await s.chooseOwnKey("anthropic");
+    s.check((await models()) === "claude-opus-5-5 / retrieval", `an Anthropic key starts on ${await models()}`);
+    await record({ provider: "anthropic", model: "claude-haiku-5-5", selector: "claude-haiku-5-5" });
+    await s.restoredFromCache();
+    s.check((await models()) === "claude-haiku-5-5 / claude-haiku-5-5", `a restored page kept ${await models()} over the models on record`);
+    s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the restore lost the key that is on record");
+    await s.runExample();
+    await s.expectResults();
+    const post = s.posts[0] || { body: {}, authorization: "" };
+    s.check(post.body.provider === "anthropic" && post.body.model === "claude-haiku-5-5" && post.body.selector === "claude-haiku-5-5", `the run after the restore was submitted with ${post.body.model} and ${post.body.selector}`);
+    s.check(post.authorization === `Bearer ${FAKE_KEY}`, "the run after the restore did not carry the key");
+    // The payer was chosen afresh in the other copy, with no models picked: its defaults.
+    await record({ provider: "anthropic", model: "", selector: "" });
+    await s.restoredFromCache();
+    s.check((await models()) === "claude-opus-5-5 / retrieval", `with no models on record a restored page shows ${await models()}`);
+  },
+
+  // A health read is under way when Run is pressed, and it answers during the run with
+  // the run's provider turned off. Nothing on the form changes under the run; when the
+  // run is refused, the refusal names the provider and the model it was submitted with,
+  // in a place that is on show; only then is the form put right for the next run.
+  async "health-during-run"(s) {
+    s.health = fixture("health");
+    s.expectedStatuses.add(401);
+    await s.open();
+    await s.chooseOwnKey("anthropic");
+    await s.page.selectOption("#model", "claude-haiku-5-5");
+    const controls = () =>
+      s.page.evaluate(() => {
+        const $ = (id) => document.getElementById(id);
+        const options = (id) => [...$(id).options].map((o) => o.value).join(",");
+        return {
+          provider: $("provider").value,
+          providers: options("provider"),
+          key: $("own-key").value,
+          keyShown: $("own-key").getClientRects().length > 0,
+          model: $("model").value,
+          models: options("model"),
+          selector: $("selector").value,
+          selectors: options("selector"),
+          hold: !$("payer").hidden,
+          summary: $("options-summary").textContent,
+        };
+      });
+    const before = await controls();
+    const late = s.gate();
+    const answer = s.gate();
+    s.healthQueue = [{ gate: late.promise, health: fixture("health-own-off") }];
+    s.health = fixture("health-own-off");
+    s.ner = { gate: answer.promise, status: 401, body: fixture("error-own-refused") };
+    await s.restoredHeld();
+    await s.runExample();
+    await s.expectVisible("#progress", "the progress bar");
+    late.release();
+    await s.page.waitForTimeout(700);
+    const during = await controls();
+    s.check(JSON.stringify(during) === JSON.stringify(before), `a health answer changed the form during a run: ${JSON.stringify(before)} -> ${JSON.stringify(during)}`);
+    await s.expectText("#run-hint", /^Runs on your Anthropic key\./, "the hint during the run");
+    answer.release();
+    await s.settled();
+    s.check((s.posts[0] || { body: {} }).body.provider === "anthropic" && s.posts[0].body.model === "claude-haiku-5-5" && s.posts[0].authorization === `Bearer ${FAKE_KEY}`, "the run was not the Anthropic run on Haiku");
+    // The refusal is on show, against the submitted provider and model.
+    await s.expectVisible("#error", "the refusal, in a place that is on show");
+    await s.expectText("#error-title", /^The run on your Anthropic key did not go through\.$/, "the title of the refusal");
+    await s.expectText("#error-message", /^Anthropic did not accept this key\. .* may use Claude Haiku 5\.5\.$/, "the refusal, bound to the submitted provider and model");
+    const hiddenAlerts = await s.page.evaluate(() => [...document.querySelectorAll('[role="alert"]')].filter((n) => n.textContent.trim() && n.getClientRects().length === 0).map((n) => n.id));
+    s.check(hiddenAlerts.length === 0, `a message is written into an element that is not on show: ${hiddenAlerts.join(", ")}`);
+    // And the form is put right for the next run: the provider is gone, its key with it.
+    s.check((await s.page.inputValue("#provider")) === "site", "the provider that was turned off is still chosen after the run");
+    await s.expectVisible("#payer", "the payer hold after the run");
+    await s.expectText("#payer-message", /no longer accepts your own Anthropic key, so the key has been forgotten/);
+    s.check((await s.page.evaluate((k) => window.sessionStorage.getItem(k), OWN_KEY_ENTRY)) === null, "the page says the key was forgotten while it is still in session storage");
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 1, "a run was sent while the payer was unsettled");
+    await s.page.click("#payer-site");
+    await s.expectHidden("#payer", "the payer hold after choosing the site");
+    await s.page.click("#error-dismiss");
+  },
+
+  // A restored page holds an older health answer than the one another copy of the page
+  // saved its payer under. The page does not say that the key was forgotten while the
+  // key is still in session storage: it waits for the health read it makes, and then
+  // either brings the payer back with its key, or removes the key and says so.
+  async "restore-stale-health"(s) {
+    const stored = (entry) => s.page.evaluate((k) => window.sessionStorage.getItem(k), entry);
+    const save = (provider, model) =>
+      s.page.evaluate(
+        ([keyEntry, payerEntry, key, p, m]) => {
+          window.sessionStorage.setItem(keyEntry, JSON.stringify({ provider: p, key }));
+          window.sessionStorage.setItem(payerEntry, JSON.stringify({ provider: p, model: m, selector: "retrieval" }));
+        },
+        [OWN_KEY_ENTRY, PAYER_ENTRY, FAKE_KEY, provider, model],
+      );
+    const forgottenWhileStored = async (when) => {
+      const message = (await s.visible("#payer-message")) ? await s.text("#payer-message") : "";
+      s.check(!(/forgotten/.test(message) && (await stored(OWN_KEY_ENTRY)) !== null), `${when}: the page says the key was forgotten while it is still in session storage`);
+      return message;
+    };
+    s.health = fixture("health-own-off");
+    s.ner = { body: (request) => ({ ...fixture("ner-own"), provider: request.provider || "site" }) };
+    s.expectedStatuses.add(500);
+    await s.open();
+    s.check(!(await s.visible("#run-with")) && (await s.page.evaluate(() => document.getElementById("provider").options.length)) === 1, "this page's health answer offers own keys");
+
+    // Another copy, loaded when own keys were on offer, saved an OpenAI key. Back.
+    await save("openai", "gpt-6-luna");
+    const fresh = s.gate();
+    s.healthQueue = [{ gate: fresh.promise, health: fixture("health") }];
+    s.health = fixture("health");
+    await s.restoredHeld();
+    await s.expectVisible("#payer", "the hold while the restored page waits for health");
+    const waiting = await forgottenWhileStored("before fresh health");
+    s.check(/Checking whether it can still be used/.test(waiting), `while it waits the page says ${JSON.stringify(waiting)}`);
+    s.check(await s.page.evaluate(() => document.getElementById("run").disabled), "Run is enabled while the saved payer is unsettled");
+    fresh.release();
+    await s.expectHidden("#payer", "the hold once fresh health offers the saved payer");
+    s.check((await s.page.inputValue("#provider")) === "openai", `fresh health offers OpenAI, and the payer is ${await s.page.inputValue("#provider")}`);
+    s.check((await s.page.inputValue("#own-key")) === FAKE_KEY, "the key on record did not come back with its payer");
+    s.check(!(await s.page.evaluate(() => document.getElementById("run").disabled)), "Run stayed held although the saved payer is offered");
+    await s.runExample();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].body.provider === "openai" && s.posts[0].authorization === `Bearer ${FAKE_KEY}`, "the run after the restore was not the OpenAI run on the saved key");
+
+    // A saved payer that fresh health cannot be asked about: no word of "forgotten".
+    await save("mistral", "mistral-large");
+    s.healthQueue = [{ health: "fail" }];
+    await s.restoredFromCache();
+    await s.expectVisible("#payer-retry", "'Try again' when the health read of a restored page fails");
+    const unknown = await forgottenWhileStored("after a failed health read");
+    s.check(/could not be loaded/.test(unknown), `after a failed read the page says ${JSON.stringify(unknown)}`);
+    s.check((await stored(OWN_KEY_ENTRY)) !== null, "a failed health read removed the key");
+    // Health answers and does not offer it: the key is removed, and then the page says so.
+    await s.page.click("#payer-retry");
+    await s.page.waitForLoadState("networkidle").catch(() => {});
+    await s.expectHidden("#payer-retry", "'Try again' once health answered");
+    const lost = await forgottenWhileStored("after health answered without the payer");
+    s.check(/so the key has been forgotten/.test(lost), `once health does not offer the payer the page says ${JSON.stringify(lost)}`);
+    s.check((await stored(OWN_KEY_ENTRY)) === null, "the key of a payer that is not offered is still in session storage");
+    await s.page.keyboard.press("Control+Enter");
+    await s.page.waitForTimeout(300);
+    s.check(s.posts.length === 1, "a run was sent while the payer was unsettled");
+    await s.page.click("#payer-site");
+    await s.expectHidden("#payer", "the payer hold after choosing the site");
+  },
+
+  // What a result says about its own run is counted from its entities: a selector that
+  // declined every candidate reviewed them and chose nothing; "each mention" is said
+  // only when it is each one; and the catalog-wide search flags do not overrule a term
+  // that this run did find.
+  async "run-claims"(s) {
+    const text = () => s.page.evaluate(() => document.getElementById("results").innerText);
+    const rerun = async (response) => {
+      s.ner = { body: response };
+      await s.run();
+      await s.settled();
+    };
+    // One mention, and the model declined all its candidates.
+    await s.runShaped(shapedResponse(SHAPED_TEXT, [["oily fish", "food", "no_match", null]]));
+    await s.expectText("#status", /Read by Claude Opus 5\.5; candidates reviewed by Claude Opus 5\.5, which chose no term\.$/, "the status line when the model declined every candidate");
+    s.check(!/terms chosen by|chose among|Terms picked by/.test(await text()), "a model that declined every candidate is credited with choosing terms");
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk looked up each mention by keyword and by meaning\. The catalog holds/, "the closing panel when the model declined every candidate");
+    await s.page.click("#run-details > summary");
+    await s.expectText("#results-models", /^Extracted by Claude Opus 5\.5\. Candidates reviewed by Claude Opus 5\.5; no term was picked\.$/, "Run details when the model declined every candidate");
+
+    // One mention with a top search result, one that was not looked up; no model.
+    await rerun(shapedResponse(SHAPED_TEXT, [["Aspirin", "chemical", null, null], ["BRCA1", "other", null, null]], { selector: "retrieval" }));
+    await s.expectText("#next-body", /^The model never writes an ID\. xwalk's search found terms for 1 of the 2 mentions by keyword and by meaning, and that one shows its top search result\. The catalog holds/, "the closing panel with one hit and one mention not looked up");
+    await s.expectText("#results-takeaway", /^No model chose here: 1 of the 2 mentions shows its top search result\.$/, "the search-only line with one hit of two");
+    s.check(!/each mention|each entity/.test(await text()), "the result credits each mention with a search result while one was not looked up");
+    s.check((await s.page.locator("#cards .card.is-unsearched").count()) === 1, "no card is marked as not looked up");
+
+    // Both catalog-wide flags say "unavailable" (one ontology lacks an index) while this
+    // run's mentions were found, by both kinds of search.
+    const off = { bm25: { status: "unavailable", reason: "x" }, dense: { status: "unavailable", reason: "y" } };
+    await rerun(shaped({ retrieval: off }));
+    await s.expectText("#notices", /Parts of the search were unavailable for this run, so some mentions may have been found by one kind of search only, or not at all\./, "the notice when both flags are off and terms were found");
+    s.check(!/could not be looked up|search was unavailable for this run/.test(await text()), "the result says the search was unavailable beside a term it found");
+    // One flag off, and candidates ranked by that kind of search all the same.
+    await rerun(shaped({ retrieval: { bm25: { status: "ok" }, dense: { status: "unavailable", reason: "y" } } }));
+    await s.expectText("#notices", /Matching by meaning was unavailable for part of this run, so some terms were found by keyword only\./, "the notice when matching by meaning was off for part of the run");
+    s.check(!/Part of the search \(matching by meaning\)/.test(await text()), "the result says every term was found by keyword only beside terms ranked by meaning");
+  },
+
+  // The payer entry is rewritten on arrival. Only ids the page can name go back into
+  // it: strings that were put into the entry and are no offered model, selector or
+  // known provider are not preserved.
+  async "payer-entry-clean"(s) {
+    s.health = fixture("health");
+    const entry = () => s.page.evaluate((k) => window.sessionStorage.getItem(k), PAYER_ENTRY);
+    const seed = (value) => s.page.evaluate(([k, v]) => window.sessionStorage.setItem(k, JSON.stringify(v)), [PAYER_ENTRY, value]);
+    await s.open();
+    await seed({ provider: "anthropic", model: "Patient Jane Roe takes warfarin", selector: "sk-not-an-offered-selector" });
+    await s.page.reload({ waitUntil: "networkidle" });
+    s.check((await entry()) === JSON.stringify({ provider: "anthropic", model: "", selector: "" }), `strings that are no offered ids were written back: ${await entry()}`);
+    s.check((await s.page.inputValue("#model")) === "claude-opus-5-5" && (await s.page.inputValue("#selector")) === "retrieval", "ids that are not offered changed the lists");
+    // Ids that are offered are kept as they are.
+    await seed({ provider: "anthropic", model: "claude-haiku-5-5", selector: "claude-sonnet-5-5" });
+    await s.page.reload({ waitUntil: "networkidle" });
+    s.check((await entry()) === JSON.stringify({ provider: "anthropic", model: "claude-haiku-5-5", selector: "claude-sonnet-5-5" }), `offered ids were not kept: ${await entry()}`);
+    // A provider this page cannot name: the hold stays (after every reload), the string does not.
+    await seed({ provider: "Patient Jane Roe", model: "claude-haiku-5-5", selector: "x" });
+    await s.page.reload({ waitUntil: "networkidle" });
+    await s.expectVisible("#payer", "the payer hold for a provider that is not offered");
+    s.check((await entry()) === JSON.stringify({ provider: "other", model: "", selector: "" }), `an unknown provider string was written back: ${await entry()}`);
+    await s.page.reload({ waitUntil: "networkidle" });
+    await s.expectVisible("#payer", "the payer hold after another reload");
+    await s.page.click("#payer-site");
+    await s.expectHidden("#payer", "the payer hold after choosing the site");
+    s.check((await entry()) === null, "choosing the site left a payer entry");
   },
 };
 

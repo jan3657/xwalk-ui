@@ -202,7 +202,14 @@ back-forward cache after its key was forgotten or its payer changed; the payer a
 models locked during a run, and errors bound to what was submitted; health answers
 arriving out of order; health arriving during a run on the prefilled example; an
 answer whose body stalls or is cut off; and the free-runs line, the Decide step and
-the result's models following what was submitted and what answered.
+the result's models following what was submitted and what answered. Six more hold
+what the second review found: a restored page whose session storage is full or cannot
+be read (a forgotten key is not sent; runs are held until a key is entered again or a
+payer picked); model ids changed in another copy of the page; a health answer that
+arrives during a run (kept until the run ends, and a refusal shown against the
+submitted provider); a restored page with an older health answer than the tab's saved
+payer (nothing is called forgotten while it is still stored); what a result claims
+about picks and search hits; and what is written back to the payer entry.
 
 ### Deploy on Vercel (operator)
 
@@ -1391,14 +1398,18 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   started on, its step-downs, the model that ran, the provider and whose credential
   it ran on (`site` or `visitor`), and never the visitor id, the client address or
   any part of a visitor's key. The page's footer ("How this site handles data") says
-  where the text and the mentions go, that the server may keep recently embedded
-  mentions in memory (the query-vector cache of a warm instance, up to 4,096 entries),
-  that no text, prompt or result is written to the log or the database, what a run's
-  row holds (time, model, status, text length, mention and token counts, timings,
-  country and the per-day visitor hash), and that runs are limited per network using a
-  salted hash of the IP address whose entries, once older than a day, are deleted by a
-  clean-up that runs on a share of later requests. It does not say that the site
-  "stores nothing" or that anything is deleted "after one day".
+  where the text goes, that the mentions go to OpenRouter when embedding search is used
+  and that the server may keep recently embedded mentions in memory (the query-vector
+  cache of a warm instance, up to 4,096 entries), that the site is built not to keep
+  text, prompt or results (its logs and its database are designed to hold run metadata only, with time,
+  model, token counts, country and the per-day visitor hash given as examples), that it
+  attempts to save one row of that metadata per run when run recording is enabled, and
+  that runs on the site's own models are limited per network, and runs with an own key
+  counted the same way, using a salted hash of the IP address whose entries, once older
+  than a day, are deleted by a clean-up that runs on a share of later requests. It does
+  not say that the site "stores nothing", that anything is deleted "after one day", that
+  every run is recorded, or that nothing a provider sends back can reach a log line (the
+  log's `ran` field is the model name the provider reports).
 
 ## Verified
 
@@ -2096,6 +2107,24 @@ then to pass. Run as above (Chrome, `serve_local.py --offline`):
 Not verified: a real back-forward cache restore (the state fires the browser's event
 and also goes Back in a real tab, without telling which of the two Chrome did), the
 reduced-motion spinner, and anything on a phone or in an in-app browser.
+
+### Second review of the redesigned page, 19 November 2026 (same branch, not deployed)
+
+The nine findings that remained after the fixes above; the API did not change. Each new
+state of `tools/page_smoke.mjs` was run against the commit before (`3393ce5`), where it
+failed as the review describes, and then against the page. Run as above:
+
+- `tools/page_smoke.mjs`: 44 states at both widths, light and dark: all 88 passed in
+  each scheme.
+- `tools/screenshot.mjs` at 390 px, at 1280 px `--dark`, and with
+  `--text "" --expect error`: exit 0.
+- `node --check` on `public/app.js`, `tools/page_smoke.mjs`, `tools/screenshot.mjs`.
+- `.venv/bin/python -m pytest -q`: 1966 passed, 35 skipped (one new test in
+  `tests/test_site_page.py`, for the footer). `.venv/bin/ruff check .`: clean.
+
+Not verified: session storage that is full or unreadable is simulated by replacing
+`Storage.prototype.setItem` and `getItem`, and the restore by firing the browser's
+`pageshow` event with `persisted`; no real quota, private mode or phone was used.
 
 ### For the operator after deploying
 
