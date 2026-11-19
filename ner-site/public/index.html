@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
-  <title>xwalk NER demo</title>
+  <title>xwalk: biomedical text to ontology IDs</title>
   <meta name="description" content="Paste biomedical text. A language model finds the chemicals, diseases and foods, and xwalk maps each one to its term in ChEBI, MeSH or FoodOn.">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="xwalk">
@@ -26,115 +26,144 @@
 </head>
 <body>
   <a class="skip-link" href="#text">Skip to the text box</a>
-  <main class="page">
-    <header class="intro">
-      <p class="eyebrow">xwalk demo</p>
-      <h1>Text to ontology terms</h1>
-      <p class="lede" id="lede">
-        Paste some text. A language model extracts chemicals, diseases, genes and foods,
-        then xwalk retrieval (BM25 keyword search plus dense embeddings, fused by rank)
-        looks each one up in a matching ontology: ChEBI, CTD diseases, NCBI Gene or FoodOn.
-      </p>
-      <p class="caveat" id="caveat">
-        Each ontology here is a <strong>200-term sample</strong>, not the full vocabulary,
-        so many real-world terms will not be found. Candidate IDs always come from the
-        sample; the model never writes them.
-      </p>
-    </header>
+  <!-- This file is the production copy. app.js rewrites the intro only for a sample
+       catalog or offline mode, so a visitor never reads the local wording first. -->
+  <header class="shell topbar">
+    <span class="brand">
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 14 14" focusable="false"><path d="M3 3l8 8M11 3l-8 8"/></svg></span>
+      xwalk
+    </span>
+    <a class="bar-link" href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">GitHub <span aria-hidden="true">&rarr;</span></a>
+  </header>
+  <main class="shell">
+    <div class="hero">
+      <h1>Turn biomedical text into ontology IDs</h1>
+      <p class="lede" id="lede">Paste a sentence. Claude finds the chemicals, diseases and foods in it, and xwalk links each one to a term in ChEBI, MeSH or FoodOn.</p>
+      <p class="trust" id="caveat">Searches more than 260,000 real ontology terms. Every ID comes from the ontology; the model never writes one.</p>
+    </div>
+
+    <noscript><p class="banner">This demo needs JavaScript.</p></noscript>
 
     <div id="banner" class="banner" hidden></div>
 
-    <form id="ner-form" class="panel" novalidate>
-      <div class="field">
-        <div class="label-row">
-          <label for="text">Text</label>
+    <form id="ner-form" class="composer" novalidate>
+      <div class="composer-text">
+        <label for="text" class="visually-hidden">Biomedical text</label>
+        <textarea id="text" name="text" rows="7" spellcheck="false" enterkeyhint="enter" autocapitalize="sentences"
+          aria-describedby="text-help text-counter"
+          placeholder="Paste a sentence or a paragraph of biomedical text"></textarea>
+        <p id="text-error" class="field-error" role="alert" hidden></p>
+        <div class="text-tools">
           <span id="text-counter" class="counter">0 / 5,000 characters</span>
-        </div>
-        <textarea id="text" name="text" rows="7" spellcheck="false" aria-describedby="text-counter"
-          placeholder="e.g. The patient with Alkaptonuria took haloperidol."></textarea>
-        <div class="button-row">
-          <button type="button" id="load-example" class="secondary">Load example</button>
-          <button type="button" id="clear-text" class="ghost">Clear</button>
+          <button type="button" id="load-example" class="pill">Example</button>
+          <button type="button" id="clear-text" class="pill quiet">Clear</button>
         </div>
       </div>
 
-      <details class="prompt-editor">
-        <summary>Extraction prompt</summary>
-        <div class="field">
-          <label for="prompt" class="visually-hidden">Extraction prompt</label>
-          <textarea id="prompt" name="prompt" rows="6" aria-describedby="prompt-hint"></textarea>
-          <div class="label-row">
-            <span id="prompt-hint" class="hint">Edits apply to this run only; the output format is fixed.</span>
-            <button type="button" id="prompt-reset" class="ghost small">Reset to default</button>
+      <div class="composer-foot">
+        <div class="run-row">
+          <button type="submit" id="run" class="primary run" aria-busy="false" aria-describedby="allowance">
+            <span class="spinner" aria-hidden="true"></span><span class="run-label">Map this text</span>
+            <kbd class="run-kbd" aria-hidden="true"><span id="shortcut-key">Ctrl</span> &crarr;</kbd>
+          </button>
+          <p class="hint run-hint">
+            <span id="run-hint">Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider and not saved by this site.</span>
+            <span id="text-help">Up to 5,000 characters and 25 mentions per run.</span>
+          </p>
+        </div>
+
+        <div id="allowance-row" class="allowance-row" hidden>
+          <p id="allowance" class="allowance" hidden></p>
+          <button type="button" id="use-own-key" class="secondary small" hidden>Use my own key</button>
+        </div>
+
+        <div id="payer" class="payer" role="alert" hidden>
+          <p id="payer-message"></p>
+          <div class="button-row">
+            <button type="button" id="payer-retry" class="secondary" hidden>Try again</button>
+            <button type="button" id="payer-site" class="secondary">Use the site's models</button>
           </div>
         </div>
-      </details>
 
-      <div class="run-with" id="run-with" hidden>
-        <div class="field">
-          <label for="provider">Run with</label>
-          <select id="provider"></select>
-        </div>
-        <div class="field key-field" id="own-key-field" hidden>
-          <label for="own-key" id="own-key-label">Your API key</label>
-          <div class="key-row">
-            <input id="own-key" type="password" autocomplete="off" spellcheck="false"
-              autocapitalize="off" autocorrect="off" data-1p-ignore data-lpignore="true"
-              aria-describedby="own-key-note">
-            <button type="button" id="forget-key" class="ghost">Forget key</button>
-          </div>
-        </div>
-        <p id="own-key-note" class="hint key-note" hidden></p>
-      </div>
-
-      <div class="options">
-        <div class="field" id="model-field">
-          <label for="model">Extraction model</label>
-          <select id="model" name="model" aria-describedby="allowance"></select>
-          <p id="allowance" class="hint allowance" hidden></p>
-        </div>
-        <div class="field" id="selector-field" hidden>
-          <label for="selector">Pick the match with</label>
-          <select id="selector" name="selector"></select>
-        </div>
-        <div class="field narrow">
-          <label for="top-k">Matches per entity</label>
-          <select id="top-k" name="top_k"></select>
-        </div>
         <div class="field" id="passcode-field" hidden>
           <label for="passcode">Passcode</label>
           <input id="passcode" name="passcode" type="password" autocomplete="current-password">
         </div>
-      </div>
 
-      <div id="payer" class="payer" role="alert" hidden>
-        <p id="payer-message"></p>
-        <div class="button-row">
-          <button type="button" id="payer-retry" class="secondary" hidden>Try again</button>
-          <button type="button" id="payer-site" class="secondary">Use the site's models</button>
-        </div>
-      </div>
+        <details id="options" class="options">
+          <summary><span id="options-summary">Options</span></summary>
+          <div class="options-body">
+            <div class="run-with" id="run-with" hidden>
+              <div class="field">
+                <label for="provider">Who pays for the model</label>
+                <select id="provider"></select>
+              </div>
+              <div class="field key-field" id="own-key-field" hidden>
+                <label for="own-key" id="own-key-label">Your API key</label>
+                <div class="key-row">
+                  <input id="own-key" type="password" autocomplete="off" spellcheck="false"
+                    autocapitalize="off" autocorrect="off" data-1p-ignore data-lpignore="true"
+                    aria-describedby="own-key-note">
+                  <button type="button" id="forget-key" class="ghost">Forget key</button>
+                </div>
+              </div>
+              <p id="own-key-note" class="hint key-note" hidden></p>
+            </div>
 
-      <div class="run-row">
-        <button type="submit" id="run" class="primary" aria-busy="false">
-          <span class="spinner" aria-hidden="true"></span><span class="run-label">Run</span>
-        </button>
-        <span class="hint"><kbd id="shortcut-key">Ctrl</kbd> + <kbd>Enter</kbd> runs from anywhere in the form</span>
+            <div class="field" id="model-field" hidden>
+              <label for="model">Model that reads the text</label>
+              <span class="hint" id="model-hint">Finds the chemicals, diseases and foods in your text.</span>
+              <select id="model" name="model" aria-describedby="model-hint"></select>
+            </div>
+            <div class="field" id="selector-field" hidden>
+              <label for="selector">How the final term is chosen</label>
+              <span class="hint" id="selector-hint">The search returns several candidate terms per entity. A model reads them and picks one, or you can take the top search result as it is.</span>
+              <select id="selector" name="selector" aria-describedby="selector-hint"></select>
+            </div>
+            <div class="field narrow">
+              <label for="top-k">Candidates listed per entity</label>
+              <span class="hint" id="top-k-hint">How many search results to show under each entity.</span>
+              <select id="top-k" name="top_k" aria-describedby="top-k-hint"></select>
+            </div>
+
+            <details class="prompt-editor" id="prompt-editor">
+              <summary>Instructions given to the model</summary>
+              <div class="field">
+                <label for="prompt" class="visually-hidden">Instructions given to the model</label>
+                <textarea id="prompt" name="prompt" rows="6" aria-describedby="prompt-hint"></textarea>
+                <p id="prompt-error" class="field-error" role="alert" hidden></p>
+                <span id="prompt-hint" class="hint">This is the text the model is given before yours. Change it to try other entity types or stricter rules. Your edit is used for your runs in this tab only. Up to 4,000 characters.</span>
+                <div class="button-row">
+                  <button type="button" id="prompt-reset" class="ghost small">Reset to default</button>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
       </div>
     </form>
+
+    <!-- The three steps of a run. Idle: one compact row. While a run is under way the
+         same element shows what each step does, a moving bar and a clock. Nothing here
+         is ticked by a timer; data-step is ready for real events once the API streams. -->
+    <div id="pipe" class="pipe" data-state="idle">
+      <ol class="pipe-steps" aria-label="How a run works">
+        <li data-step="find"><b>Find</b><span class="pipe-desc" id="pipe-find">The language model reads your text and marks every chemical, disease and food.</span></li>
+        <li data-step="search"><b>Search</b><span class="pipe-desc" id="pipe-search">xwalk looks each one up in the full ontology with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.</span></li>
+        <li data-step="decide"><b>Decide</b><span class="pipe-desc" id="pipe-decide">The model picks the best term from the shortlist, or says none fits, and gives a confidence and a reason.</span></li>
+      </ol>
+      <div id="progress" class="pipe-run" hidden>
+        <div class="progress-bar" aria-hidden="true"><span></span></div>
+        <p class="hint pipe-clock">
+          <span id="progress-hint">This usually takes 10 to 30 seconds. Keep this page open.</span>
+          <span id="progress-time" class="progress-time" aria-hidden="true"></span>
+        </p>
+      </div>
+    </div>
 
     <div id="error" class="alert" role="alert" hidden>
       <p><strong>Something went wrong.</strong> <span id="error-message"></span></p>
       <button type="button" id="error-dismiss" class="ghost small">Dismiss</button>
-    </div>
-
-    <div id="progress" class="progress" hidden>
-      <div class="progress-bar" aria-hidden="true"><span></span></div>
-      <p class="progress-line">
-        <span id="progress-text">The model reads your text and extracts the entities, then each one is matched to ontology terms.</span>
-        <span id="progress-time" class="progress-time" aria-hidden="true"></span>
-      </p>
-      <p id="progress-hint" class="hint">This usually takes 20 to 40 seconds. Keep this page open.</p>
     </div>
 
     <p id="status" class="status" role="status" aria-live="polite"></p>
@@ -157,16 +186,17 @@
       <div id="cards" class="cards"></div>
     </section>
 
-    <footer class="footer">
-      <p>
-        Built with <a href="https://github.com/jan3657/xwalk">xwalk</a>. Text you submit is
-        sent to the model provider for extraction and is not stored by this site.
-      </p>
-      <p>
-        Requests are limited per visitor using a salted hash of your IP address, kept for
-        one day. Runs are counted without your text.
-      </p>
-      <p>This site counts visits without cookies.</p>
+    <footer class="footer" id="privacy">
+      <h2 class="footer-title">How this site handles data</h2>
+      <ul>
+        <li>Your text is sent to the model provider for extraction and term choice: Anthropic by default, OpenRouter if the run falls back or you choose it.</li>
+        <li>The extracted mentions are sent to OpenRouter to compute search embeddings.</li>
+        <li>This site stores no text, prompt or result. Each run is counted (time, model, token counts, country) without the text.</li>
+        <li>Requests are limited per network, using a salted hash of the IP address that is kept for one day.</li>
+        <li>Visits are counted without cookies.</li>
+        <li>If you use your own API key, it stays in this browser tab's session storage and is sent only with your runs.</li>
+      </ul>
+      <p>Built with <a href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">xwalk</a>.</p>
     </footer>
   </main>
 </body>
