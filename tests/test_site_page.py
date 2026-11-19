@@ -65,3 +65,43 @@ def test_example_holds_only_the_expected_fields(example: dict[str, Any]) -> None
     assert set(example) == {"text", "recorded", "ontologies", "response"}
     raw = (PUBLIC / "example.json").read_text(encoding="utf-8")
     assert not re.search(r"sk-[A-Za-z0-9_-]{8,}|authorization|bearer|passcode", raw, re.IGNORECASE)
+
+
+# ---------- the form without its script ----------
+#
+# If app.js is slow or never loads, the browser is left with a plain form. Three things
+# keep a visitor's text out of the address bar, the history and the request log then;
+# each is held here by itself, and tools/page_smoke.mjs ("no-script") checks them in a
+# browser.
+
+
+def _index() -> str:
+    return (PUBLIC / "index.html").read_text(encoding="utf-8")
+
+
+def test_no_form_field_of_the_page_has_a_name() -> None:
+    # A native submission sends named fields only: with none, it carries nothing.
+    form = re.search(r"<form id=\"ner-form\".*?</form>", _index(), re.DOTALL)
+    assert form, "the form is gone from index.html"
+    controls = re.findall(r"<(?:input|textarea|select|button)\b[^>]*>", form.group(0))
+    assert len(controls) >= 10
+    assert [c for c in controls if re.search(r"\sname\s*=", c)] == []
+
+
+def test_run_is_disabled_until_the_script_enables_it() -> None:
+    run = re.search(r"<button type=\"submit\" id=\"run\"[^>]*>", _index())
+    assert run and re.search(r"\sdisabled>$", run.group(0))
+    source = (PUBLIC / "app.js").read_text(encoding="utf-8")
+    assert "el.run.disabled = state.running || Boolean(state.payer);" in source
+    assert '<noscript><p class="banner">This demo needs JavaScript.</p></noscript>' in _index()
+
+
+def test_the_policy_refuses_every_form_submission() -> None:
+    config = json.loads((PUBLIC.parent / "vercel.json").read_text(encoding="utf-8"))
+    everywhere = next(rule for rule in config["headers"] if rule["source"] == "/(.*)")
+    policy = next(
+        h["value"] for h in everywhere["headers"] if h["key"] == "Content-Security-Policy"
+    )
+    directives = [d.strip() for d in policy.split(";")]
+    assert "form-action 'none'" in directives
+    assert "default-src 'self'" in directives

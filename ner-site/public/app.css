@@ -560,9 +560,10 @@ main.shell {
   line-height: 1.55;
 }
 
+/* Full strength: with any opacity --muted falls under 4.5:1 on the text box. */
 #text::placeholder {
   color: var(--muted);
-  opacity: 0.85;
+  opacity: 1;
 }
 
 .field-error {
@@ -972,8 +973,9 @@ button.linklike {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* A still ring: "Mapping…" and aria-busy say that the run is under way. */
   .spinner {
-    animation-duration: 2.4s;
+    animation: none;
   }
   .options > summary::before,
   .prompt-editor > summary::before {
@@ -1137,6 +1139,12 @@ button.linklike {
 .results.is-stale .results-body {
   opacity: 0.85;
   --muted: var(--muted-dimmed);
+}
+
+/* A control in a dimmed result is still a control: its label takes the stronger accent
+   so that it reads at 4.5:1 through the dim ("Load example" under "no mentions found"). */
+.results.is-stale .results-body button.secondary {
+  color: var(--accent-hover);
 }
 
 /* The heading with, for the recorded example, when it was recorded. */

@@ -3,6 +3,10 @@
 // write a full-page PNG. Exits non-zero on page errors, console errors, a failed run,
 // or a page wider than the viewport (horizontal scroll).
 //
+// With --expect error the run is expected to end in a message: the error box, or the
+// line the page puts at the field at fault (the text box, the key, the instructions).
+// Whichever appears first is the end of the run, and its text is printed.
+//
 //   node ner-site/tools/screenshot.mjs URL OUTPUT.png [--width N] [--height N]
 //        [--text "custom text"] [--expect results|error] [--dark]
 //
@@ -39,6 +43,15 @@ function parseArgs(argv) {
   if (!["results", "error"].includes(opts.expect)) throw new Error("--expect is results or error");
   return opts;
 }
+
+// Where a failed run can say so: [the element that appears, the element whose text is
+// reported, what it is called in the output].
+const ERRORS = [
+  ["#error", "#error-message", "error box"],
+  ["#text-error", "#text-error", "text box"],
+  ["#own-key-error", "#own-key-error", "key field"],
+  ["#prompt-error", "#prompt-error", "instructions"],
+];
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -78,7 +91,7 @@ async function main() {
         }),
       ]);
     } else {
-      await page.waitForSelector("#error:not([hidden])", { timeout: 130000 });
+      await page.waitForSelector(ERRORS.map(([selector]) => `${selector}:not([hidden])`).join(", "), { state: "visible", timeout: 130000 });
     }
     await page.waitForFunction(() => !document.querySelector("#run").disabled);
 
@@ -91,7 +104,15 @@ async function main() {
     }
 
     await page.screenshot({ path: output, fullPage: true });
-    const summary = await page.textContent(opts.expect === "results" ? "#results-summary" : "#error-message");
+    let summary = "";
+    if (opts.expect === "results") summary = await page.textContent("#results-summary");
+    else {
+      for (const [selector, text, name] of ERRORS) {
+        if (!(await page.isVisible(selector))) continue;
+        summary = `${name}: ${(await page.textContent(text)).trim()}`;
+        break;
+      }
+    }
     console.log(`wrote ${output} (${opts.width}px): ${summary}`);
   } finally {
     await browser.close();

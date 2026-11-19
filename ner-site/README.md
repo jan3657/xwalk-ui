@@ -71,7 +71,9 @@ It does not wait for `/api/health`: it is shown when the file arrives and remove
 again (with the sentence it put in the text box) when health reports anything but a
 full catalog in live mode, so local, sample and offline servers never show it. If the
 file does not load, the page is as it is without it. Once the visitor changes the
-text the result is marked "This result is for the example text"; a run replaces it.
+text the result is marked "This result is for the example text" (not while the box is
+empty or a run is under way); a run replaces it. A run started on the prefilled
+sentence keeps that sentence in the box whatever health then says.
 
 The file is kept whole, 38 kB (about 7 kB compressed), with all 30 candidates per
 mention: the cards say "30 candidates" and the model's reasons refer to them.
@@ -194,7 +196,13 @@ mentions; twelve failures in a row; a result kept through a failed run; a result
 an earlier text; the 25-mention cap; a run that died while the page was hidden; the
 closing panel; and the example on arrival with `/api/health` answering before
 `example.json`, after it, with an error and never, and with `example.json` missing
-or broken.
+or broken. Seven more hold what a review of the redesign found: the page without
+`app.js` (no native form submission, nothing in the address); a page restored from the
+back-forward cache after its key was forgotten or its payer changed; the payer and the
+models locked during a run, and errors bound to what was submitted; health answers
+arriving out of order; health arriving during a run on the prefilled example; an
+answer whose body stalls or is cut off; and the free-runs line, the Decide step and
+the result's models following what was submitted and what answered.
 
 ### Deploy on Vercel (operator)
 
@@ -1364,10 +1372,16 @@ re-pinning `requirements.txt` to an xwalk commit that contains
 - The keys live only in the function environment. `/api/health` never returns them, and
   error messages pass URLs through redaction. Do not put a key in `NER_SITE_BASE_URL`.
 - `vercel.json` sends `Content-Security-Policy: default-src 'self'; connect-src
-  'self'; img-src 'self' data:; style-src 'self'`, `X-Content-Type-Options: nosniff`,
+  'self'; img-src 'self' data:; style-src 'self'; form-action 'none'`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on `/api/*`. No CORS
   headers are sent, and the API requires `X-Requested-With: xwalk-ner`, so other
   sites cannot call it from a browser.
+- The page's form is only ever submitted by `app.js` (a `fetch`). So that a script
+  that is slow or never loads cannot turn "Map this text" into a `GET` with the text
+  in the address, no field of the form has a `name`, the button is `disabled` in
+  `index.html` until `app.js` has installed its handler, and the policy's
+  `form-action 'none'` refuses any form submission (`tests/test_site_page.py` and the
+  `no-script` state of `tools/page_smoke.mjs` hold all three).
 - Visitors' text is sent to the model provider (Anthropic for the Claude models;
   OpenRouter and the model's host for the others, and OpenRouter for query embeddings
   and Jev). With an own key it is sent to the provider the visitor chose, on their
@@ -1376,8 +1390,15 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   the text, the prompt or a key; since 18 November 2026 also the tier a request
   started on, its step-downs, the model that ran, the provider and whose credential
   it ran on (`site` or `visitor`), and never the visitor id, the client address or
-  any part of a visitor's key. The page's footer tells visitors that requests are
-  limited per visitor using a salted hash of their IP address, kept for one day.
+  any part of a visitor's key. The page's footer ("How this site handles data") says
+  where the text and the mentions go, that the server may keep recently embedded
+  mentions in memory (the query-vector cache of a warm instance, up to 4,096 entries),
+  that no text, prompt or result is written to the log or the database, what a run's
+  row holds (time, model, status, text length, mention and token counts, timings,
+  country and the per-day visitor hash), and that runs are limited per network using a
+  salted hash of the IP address whose entries, once older than a day, are deleted by a
+  clean-up that runs on a share of later requests. It does not say that the site
+  "stores nothing" or that anything is deleted "after one day".
 
 ## Verified
 
@@ -2056,6 +2077,25 @@ Not run:
   that day (7 of 7 mentions matched, 8.8 s).
 - The limits themselves and the countdown beside Run: the page was given canned
   refusals, not a used-up allowance.
+
+### Review fixes to the redesigned page, 19 November 2026 (same branch, not deployed)
+
+Two reviews of the redesign were worked through; the API did not change. Each finding
+was first made to fail in `tools/page_smoke.mjs` against the commit before the fixes,
+then to pass. Run as above (Chrome, `serve_local.py --offline`):
+
+- `tools/page_smoke.mjs`: 38 states at both widths, light and dark: all 76 passed in
+  each scheme.
+- `tools/screenshot.mjs` at 390 px, at 1280 px `--dark`, and with
+  `--text "" --expect error` (the message at the text box): exit 0.
+- `node --check` on `public/app.js`, `tools/page_smoke.mjs`, `tools/screenshot.mjs`.
+- `.venv/bin/python -m pytest -q`: 1965 passed, 35 skipped (three new tests in
+  `tests/test_site_page.py`). `.venv/bin/ruff check .`: clean.
+- Looked at: the arrival and an expanded result at 390 px, light.
+
+Not verified: a real back-forward cache restore (the state fires the browser's event
+and also goes Back in a real tab, without telling which of the two Chrome did), the
+reduced-motion spinner, and anything on a phone or in an in-app browser.
 
 ### For the operator after deploying
 
