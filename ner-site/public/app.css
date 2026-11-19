@@ -11,6 +11,7 @@
   --ink: #171b26;
   --text: #262b36;
   --muted: #5b6472;
+  --muted-dimmed: #4a5260; /* stands in for --muted inside a result dimmed to 0.85: stays 4.5:1 */
   --faint: #8a919c; /* under 4.5:1 on --bg: never for anything a visitor must read */
   --border: #e3e1da;
   --border-strong: #cfccc3;
@@ -74,6 +75,7 @@
     --ink: #f2f3f6;
     --text: #dfe2e8;
     --muted: #9da5b3;
+    --muted-dimmed: #9da5b3;
     --faint: #6f7786;
     --border: #272c36;
     --border-strong: #3a404c;
@@ -1130,8 +1132,78 @@ button.linklike {
   font-weight: 600;
 }
 
+/* A light dim only: the line above carries the message. The quiet text is drawn a
+   shade stronger so that it still reads at 4.5:1 through the dim. */
 .results.is-stale .results-body {
-  opacity: 0.6;
+  opacity: 0.85;
+  --muted: var(--muted-dimmed);
+}
+
+/* The heading with, for the recorded example, when it was recorded. */
+.results-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+
+.example-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* ---------- the closing panel: what that was, and where the library is ---------- */
+
+.next {
+  margin: 28px 0 0;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--accent-soft);
+}
+
+.next h2 {
+  font-size: 1.25rem;
+}
+
+.next p {
+  margin: 8px 0 0;
+  max-width: 36rem;
+  color: var(--text);
+}
+
+.next .button-row {
+  margin-top: 16px;
+  gap: 10px;
+}
+
+/* A link that is the primary action of its panel. */
+a.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: var(--button-shadow);
+}
+
+a.button-link:hover {
+  background: var(--accent-hover);
+}
+
+.next button.secondary {
+  background: var(--surface);
+  border-color: var(--control-border);
+}
+
+.next button.secondary:hover {
+  border-color: var(--accent);
 }
 
 .no-entities {
@@ -1682,6 +1754,32 @@ button.card-more[aria-expanded="true"]::before {
     padding: 16px;
   }
 
+  /* Tighter above the result, so the heading of the example result shows at the foot of
+     the first phone screen and its highlighted sentence is one short scroll away. */
+  .topbar {
+    height: 48px;
+  }
+
+  .hero {
+    padding: 18px 0 14px;
+  }
+
+  .text-tools {
+    padding: 2px 12px 8px 20px;
+  }
+
+  .pipe {
+    margin-top: 14px;
+  }
+
+  .pipe[data-state="idle"] .pipe-steps li {
+    padding-top: 8px;
+  }
+
+  .results {
+    margin-top: 18px;
+  }
+
   /* Five rows instead of seven, so Run is on the first screen. */
   #text {
     height: calc(5 * 1.55em + 26px);
@@ -1729,5 +1827,9 @@ button.card-more[aria-expanded="true"]::before {
 
   .highlighted {
     font-size: 1.125rem;
+  }
+
+  .next .button-row > * {
+    flex: 1 1 100%;
   }
 }

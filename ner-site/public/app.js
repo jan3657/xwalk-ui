@@ -108,6 +108,7 @@
     progressHint: $("progress-hint"),
     results: $("results"),
     resultsHeading: $("results-heading"),
+    exampleNote: $("example-note"),
     stale: $("stale"),
     summary: $("results-summary"),
     cap: $("results-cap"),
@@ -130,6 +131,10 @@
     cards: $("cards"),
     runDetails: $("run-details"),
     runDetailsList: $("run-details-list"),
+    runDetailsSummary: $("run-details-summary"),
+    next: $("next"),
+    nextBody: $("next-body"),
+    nextTry: $("next-try"),
   };
 
   const state = {
@@ -137,14 +142,23 @@
     limits: { ...DEFAULT_LIMITS },
     defaultPrompt: "",
     ontologyNames: {},
+    ontologies: [], // { slug, name, type, count }: from health, or from example.json until health answers
     providers: [], // own-key providers the API offers; empty when it offers none
     running: false,
     healthFailed: false, // the status read on arrival failed; said in the top banner
     visitorAt: 0, // when health.visitor was read, for "next one in N min"
     textError: null, // "empty", "long" or "server" while the line under the text box is shown
-    // The text the result on display was made from. A result belongs to that text: once
-    // the box holds something else the result is marked as being for the earlier text.
+    // The result on display: { text, data, example }. A result belongs to the text it
+    // was made from: once the box holds something else the result is marked as being for
+    // the earlier text. `example` is true for the recorded example, which is never the
+    // visitor's own run.
     shown: null,
+    // example.json once it has loaded: { text, recorded, data, ontologies }.
+    example: null,
+    touched: false, // the visitor typed, or used Example or Clear
+    prefilled: false, // the text box holds the example because this page put it there
+    ran: false, // a run was started: the recorded example is not shown after that
+    limitNotice: false, // the error box is saying that a limit is used up
     // The run under way: { provider, started, hidden, edited }. `hidden` once the page
     // went to the background during it, `edited` once the visitor typed during it.
     runCtx: null,
@@ -334,6 +348,7 @@
         if (own || /own key/.test(message)) {
           return {
             look: "notice",
+            limit: true,
             title: "Too many runs with your own key.",
             body: [`Runs with an own key are limited per network too. ${wait ? `Try again in ${minutesText(wait)}.` : "Try again later."}`],
           };
@@ -342,6 +357,7 @@
           const at = wait ? new Date(Date.now() + wait * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
           return {
             look: "notice",
+            limit: true,
             title: "The free runs for your network today are used.",
             body: [at ? `They come back at ${at} (midnight UTC).` : "They come back at midnight UTC."],
             ownKey: offerKey,
@@ -349,6 +365,7 @@
         }
         return {
           look: "notice",
+          limit: true,
           title: "The free runs for your network this hour are used.",
           body: [wait ? `You can run again in ${minutesText(wait)}.` : "You can run again later this hour."],
           ownKey: offerKey,
@@ -356,6 +373,7 @@
       case "limits_unavailable":
         return {
           look: "notice",
+          limit: true,
           title: "The demo is briefly unavailable.",
           body: ["The site cannot count free runs right now, so it is not starting any. This usually clears within a minute."],
           action: "Try again",
@@ -482,6 +500,9 @@
     el.errorAction.hidden = !d.action;
     el.errorOwnKey.hidden = !d.ownKey;
     el.error.hidden = false;
+    // The box now says what the line beside Run says; the line steps aside for it.
+    state.limitNotice = Boolean(d.limit);
+    renderAllowance();
     if (e.code === "passcode_required" || e.code === "passcode_invalid") {
       el.passField.hidden = false;
       if (!calm) el.passcode.focus();
@@ -496,6 +517,10 @@
   function hideError() {
     el.error.hidden = true;
     clear(el.errorMsg);
+    if (state.limitNotice) {
+      state.limitNotice = false;
+      renderAllowance();
+    }
   }
 
   // One sentence for screen readers, in the one live region kept for that.
@@ -557,7 +582,7 @@
     if (mode === "offline") {
       items.push([
         "Offline mode.",
-        " Entities come from a stand-in extractor, not a language model, so results only illustrate the flow.",
+        " Mentions come from a stand-in extractor, not a language model, so results only illustrate the flow.",
       ]);
     }
     // The operator's reason is never printed here; it is in "Run details" after a run.
@@ -606,7 +631,7 @@
     if (!el.prompt.value) el.prompt.value = state.defaultPrompt;
     el.promptReset.disabled = !state.defaultPrompt;
     el.promptHint.textContent =
-      "This is the text the model is given before yours. Change it to try other entity types or stricter rules. " +
+      "This is the text the model is given before yours. Change it to look for other kinds of mention or to set stricter rules. " +
       `Your edit is used for your runs in this tab only. Up to ${state.limits.max_prompt_chars.toLocaleString("en")} characters.`;
 
     fillProviders(health);
@@ -617,13 +642,15 @@
     if (health.passcode_required) el.passcode.value = storageGet(PASSCODE_KEY);
 
     state.ontologyNames = {};
-    for (const o of health.ontologies || []) {
+    state.ontologies = Array.isArray(health.ontologies) ? health.ontologies : [];
+    for (const o of state.ontologies) {
       state.ontologyNames[o.slug] = o.name;
     }
     renderIntro(health);
     renderBanner(health.mode, health.retrieval);
     applyProvider();
     updateCounter();
+    syncExample();
   }
 
   // ---------- own keys ----------
@@ -928,9 +955,12 @@
     const blocked = Boolean(message && message.blocked);
     el.allowance.textContent = message ? message.text : "";
     el.allowance.classList.toggle("blocked", blocked);
-    el.allowance.hidden = !message;
+    // While the error box says the same thing (a used-up limit, with the same way out),
+    // it is not said a second time here.
+    const said = blocked && state.limitNotice;
+    el.allowance.hidden = !message || said;
     el.allowanceRow.classList.toggle("blocked", blocked);
-    el.allowanceRow.hidden = !message;
+    el.allowanceRow.hidden = !message || said;
     // The own-key way out is only offered where it exists and is not already taken.
     el.useOwnKey.hidden = !(blocked && !currentProvider() && state.providers.length > 0);
     // A single model needs no dropdown, unless the visitor is paying for it and should
@@ -1048,9 +1078,94 @@
   // "Example" loads a sentence the deployment can map: the production one unless
   // health says this is a sample catalog or offline mode.
   function exampleText() {
+    return exampleFits() === false ? EXAMPLE_TEXT : EXAMPLE_FULL;
+  }
+
+  // Whether this is the kind of deployment the production example belongs to: the full
+  // catalog and a real model. null until health has answered.
+  function exampleFits() {
     const health = state.health;
-    if (!health) return EXAMPLE_FULL;
-    return health.neon && health.neon.catalog === "full" && health.mode === "live" ? EXAMPLE_FULL : EXAMPLE_TEXT;
+    if (!health) return null;
+    return Boolean(health.neon && health.neon.catalog === "full" && health.mode === "live");
+  }
+
+  // ---------- the recorded example ----------
+
+  // On arrival the page shows a finished result under the form: one real run of the
+  // example sentence, recorded from production and served as a static file. It is
+  // labelled as an example with its date and is never presented as the visitor's run.
+  // It does not wait for health (a function that can take seconds to wake up): it is
+  // shown as soon as the file arrives and taken away again if health then says this is
+  // not a full-catalog, live deployment. If the file does not load, nothing happens.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  // "2026-11-19" as "19 Nov 2026"; "" for anything else.
+  function recordedDate(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof iso === "string" ? iso : "");
+    const month = m ? MONTHS[Number(m[2]) - 1] : null;
+    return month ? `${Number(m[3])} ${month} ${m[1]}` : "";
+  }
+
+  // A static file: fetched with a plain fetch, never api(), which is the function that
+  // carries the passcode and a visitor's key.
+  async function loadExampleResult() {
+    let file;
+    try {
+      const response = await fetch("example.json", { credentials: "same-origin" });
+      if (!response.ok) return;
+      file = await response.json();
+    } catch (_) {
+      return;
+    }
+    const data = file && typeof file === "object" ? file.response : null;
+    const recorded = file && typeof file === "object" ? recordedDate(file.recorded) : "";
+    // Without its date it could not be labelled, so it is not shown.
+    if (!data || typeof data !== "object" || !Array.isArray(data.entities) || !data.entities.length) return;
+    if (typeof file.text !== "string" || !file.text || !recorded) return;
+    const ontologies = (Array.isArray(file.ontologies) ? file.ontologies : []).filter((o) => o && typeof o.slug === "string" && typeof o.name === "string");
+    state.example = { text: file.text, recorded, data, ontologies };
+    showExampleResult();
+  }
+
+  function showExampleResult() {
+    const example = state.example;
+    // Not on a sample catalog or offline, and not once the visitor has run something.
+    if (!example || exampleFits() === false || state.ran || state.shown) return;
+    if (!state.health) {
+      // The names and sizes as they were when the example was recorded, until health answers.
+      state.ontologies = example.ontologies;
+      for (const o of example.ontologies) state.ontologyNames[o.slug] = o.name;
+    }
+    // Text the visitor typed, or the browser restored, is never overwritten.
+    if (!state.touched && el.text.value === "") {
+      el.text.value = example.text;
+      state.prefilled = true;
+      updateCounter();
+    }
+    // No scroll, no focus, no announcement: nothing has happened yet.
+    renderResults(example.text, example.data, { example: true });
+  }
+
+  // After every health answer. A deployment the example does not belong to loses it,
+  // and the text box goes back to empty if the example in it was put there by this page.
+  function syncExample() {
+    const shown = state.shown;
+    if (!shown) return;
+    if (shown.example && exampleFits() === false) {
+      el.results.hidden = true;
+      state.shown = null;
+      syncStale();
+      if (state.prefilled && !state.touched && el.text.value === state.example.text) {
+        el.text.value = "";
+        updateCounter();
+      }
+      state.prefilled = false;
+      return;
+    }
+    // The legend and the closing panel carry term counts, which come from health.
+    const entities = Array.isArray(shown.data.entities) ? shown.data.entities : [];
+    renderLegend(entities);
+    renderNext(shown.data, entities, pickersOf(entities));
   }
 
   // Until health has answered, an own-key choice made earlier in this tab has no "Run
@@ -1118,7 +1233,7 @@
   function renderLegend(entities) {
     clear(el.legend);
     const byType = {};
-    for (const o of (state.health && state.health.ontologies) || []) byType[o.type] = o;
+    for (const o of state.ontologies) byType[o.type] = o;
     for (const t of TYPES) {
       const mine = entities.filter((e) => typeLabel(e.type) === t);
       if (!mine.length) continue;
@@ -1337,7 +1452,7 @@
       // Only where it is true: a sample catalog does map genes.
       const ontologies = (state.health && state.health.ontologies) || [];
       const genes = ontologies.length > 0 && !ontologies.some((o) => o.type === "gene");
-      card.append(h("p", { class: "card-note", text: "Recognised as an entity, but this demo has no ontology for it." + (genes ? " Genes, for example, are found but not mapped here." : "") }));
+      card.append(h("p", { class: "card-note", text: "The model marked this mention, but this demo has no ontology for its type." + (genes ? " Genes, for example, are found but not mapped here." : "") }));
     } else if (outcome === "none") {
       const full = state.health && state.health.neon && state.health.neon.catalog === "full";
       card.append(h("p", { class: "card-note", text: full ? "The search found no term for this one." : "No term in this 200-term sample matched. The real ontology may well contain it." }));
@@ -1545,7 +1660,28 @@
     return types.length < 2 ? types[0] : `${types.slice(0, -1).join(", ")} or ${types[types.length - 1]}`;
   }
 
-  function renderResults(text, data) {
+  // The closing panel: what the visitor just watched, and where the library is. Only
+  // what is true of this result is said: how many terms were searched (when known), by
+  // which kinds of search, and whether a model chose.
+  function renderNext(data, entities, pickers) {
+    const searched = entities.some((e) => e.ontology);
+    el.next.hidden = !searched;
+    if (!searched) return;
+    const total = state.ontologies.reduce((sum, o) => sum + (Number(o.count) || 0), 0);
+    const terms = total > 0 ? `${total.toLocaleString("en")} ontology terms` : "the ontology terms";
+    const retrieval = data.retrieval || {};
+    const off = (name) => Boolean(retrieval[name]) && retrieval[name].status !== "ok";
+    const how = off("dense") ? "by keyword" : off("bm25") ? "by meaning" : "by keyword and by meaning";
+    const chose = pickers.length ? "and the model chose among real candidates" : "and each mention shows the top search result";
+    el.nextBody.textContent =
+      `The model never writes an ID. xwalk searched ${terms} ${how}, ${chose}. ` +
+      "xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.";
+  }
+
+  // `opts.example`: this is the recorded example, not a run. It gets its own heading and
+  // label, no timing sentence, and leaves the banner alone.
+  function renderResults(text, data, opts) {
+    const example = Boolean(opts && opts.example);
     const entities = Array.isArray(data.entities) ? data.entities : [];
     const outcomes = entities.map(outcomeOf);
     const pickers = pickersOf(entities);
@@ -1573,7 +1709,7 @@
     el.noEntitiesTitle.textContent = `No ${entityTypesText()} found in this text.`;
     el.textPanel.hidden = none;
     el.summary.hidden = none;
-    el.status.hidden = none;
+    el.status.hidden = none || example;
     el.summary.textContent = none ? "" : summaryText(outcomes);
 
     // The model is asked to stop at the cap, so a full list may not be the whole text.
@@ -1595,15 +1731,23 @@
       if (typeof timing.select === "number") steps.push(`${fmtShort(timing.select)} choosing terms`);
       done = `Done in ${fmtShort(timing.total)}` + (steps.length ? `: ${steps.join(", ")}.` : ".");
     }
-    el.status.textContent = done;
+    // "Done in 8.8 s" would read as the visitor's own wait.
+    el.status.textContent = example ? "" : done;
+
+    el.results.setAttribute("data-kind", example ? "example" : "run");
+    el.resultsHeading.textContent = example ? "Example result" : "Results";
+    el.exampleNote.textContent = example ? `Recorded from a real run on ${state.example.recorded}.` : "";
+    el.exampleNote.hidden = !example;
 
     renderNotices(data, entities.some((e) => e.ontology));
     renderRunDetails(data, pickers);
+    el.runDetailsSummary.textContent = example ? "Details of the recorded run" : "Run details";
     el.runDetails.open = false;
+    renderNext(data, entities, pickers);
     // Before a run the banner speaks for the service; after one, the run's own search
-    // status is said beside its results ("About this run").
-    renderBanner(data.mode, state.health && state.health.retrieval);
-    state.shown = { text };
+    // status is said beside its results ("About this run"). The example is not a run.
+    if (!example) renderBanner(data.mode, state.health && state.health.retrieval);
+    state.shown = { text, data, example };
     el.results.hidden = false;
     syncStale();
   }
@@ -1613,6 +1757,10 @@
   function syncStale() {
     const stale = Boolean(state.shown) && !el.results.hidden && el.text.value !== state.shown.text;
     el.results.classList.toggle("is-stale", stale);
+    el.stale.textContent =
+      state.shown && state.shown.example
+        ? 'This result is for the example text. Press "Map this text" to map yours.'
+        : "These results are for the earlier text. Run again to map the text that is in the box now.";
     el.stale.hidden = !stale;
   }
 
@@ -1767,6 +1915,7 @@
 
     const ctx = { provider, started: performance.now(), hidden: document.visibilityState === "hidden", edited: false };
     state.runCtx = ctx;
+    state.ran = true;
     setRunning(true);
     // Said once for screen readers; sighted visitors have the steps and the button.
     announce("Mapping your text. This usually takes 10 to 30 seconds.");
@@ -1798,6 +1947,7 @@
   // ---------- wiring ----------
 
   function loadExample() {
+    state.touched = true;
     el.text.value = exampleText();
     clearTextError();
     updateCounter();
@@ -1820,6 +1970,7 @@
     }
   });
   el.text.addEventListener("input", () => {
+    state.touched = true;
     if (state.textError === "empty" || state.textError === "server") clearTextError();
     if (state.runCtx) state.runCtx.edited = true;
     updateCounter();
@@ -1847,6 +1998,7 @@
   el.example.addEventListener("click", loadExample);
   el.noEntitiesExample.addEventListener("click", loadExample);
   el.clear.addEventListener("click", () => {
+    state.touched = true;
     el.text.value = "";
     clearTextError();
     updateCounter();
@@ -1857,6 +2009,19 @@
     const open = el.expandAll.getAttribute("aria-expanded") !== "true";
     for (const card of el.cards.children) setCardOpen(card, open);
     syncExpandAll();
+  });
+  // "Try your own text": to the text box, ready to type. An example still in the box is
+  // selected, so typing or pasting replaces it.
+  el.nextTry.addEventListener("click", () => {
+    el.text.focus({ preventScroll: true });
+    if (el.text.value === EXAMPLE_FULL || el.text.value === EXAMPLE_TEXT) el.text.select();
+    reveal(el.form, "start");
+  });
+  // A browser that puts typed text back after the scripts ran (back and forward) fires
+  // no input event; the counter and the "earlier text" line are brought up to date.
+  window.addEventListener("pageshow", () => {
+    updateCounter();
+    syncStale();
   });
   el.promptReset.addEventListener("click", () => {
     el.prompt.value = state.defaultPrompt;
@@ -1909,4 +2074,5 @@
   el.topK.value = "5";
   updateCounter();
   loadHealth();
+  loadExampleResult();
 })();

@@ -118,13 +118,13 @@
             </div>
             <div class="field" id="selector-field" hidden>
               <label for="selector">How the final term is chosen</label>
-              <span class="hint" id="selector-hint">The search returns several candidate terms per entity. A model reads them and picks one, or you can take the top search result as it is.</span>
+              <span class="hint" id="selector-hint">The search returns several candidate terms per mention. A model reads them and picks one, or you can take the top search result as it is.</span>
               <select id="selector" name="selector" aria-describedby="selector-hint selector-own"></select>
               <span class="hint" id="selector-own" hidden>With your own key the top search result is used unless you choose a model here.</span>
             </div>
             <div class="field narrow">
-              <label for="top-k">Candidates listed per entity</label>
-              <span class="hint" id="top-k-hint">How many search results to show under each entity.</span>
+              <label for="top-k">Candidates listed per mention</label>
+              <span class="hint" id="top-k-hint">How many search results to show under each mention.</span>
               <select id="top-k" name="top_k" aria-describedby="top-k-hint"></select>
             </div>
 
@@ -134,7 +134,7 @@
                 <label for="prompt" class="visually-hidden">Instructions given to the model</label>
                 <textarea id="prompt" name="prompt" rows="6" aria-describedby="prompt-hint"></textarea>
                 <p id="prompt-error" class="field-error" role="alert" hidden></p>
-                <span id="prompt-hint" class="hint">This is the text the model is given before yours. Change it to try other entity types or stricter rules. Your edit is used for your runs in this tab only. Up to 4,000 characters.</span>
+                <span id="prompt-hint" class="hint">This is the text the model is given before yours. Change it to look for other kinds of mention or to set stricter rules. Your edit is used for your runs in this tab only. Up to 4,000 characters.</span>
                 <div class="button-row">
                   <button type="button" id="prompt-reset" class="ghost small">Reset to default</button>
                 </div>
@@ -184,7 +184,10 @@
       <p id="stale" class="stale-note" hidden>These results are for the earlier text. Run again to map the text that is in the box now.</p>
       <div class="results-body">
         <div class="results-head">
-          <h2 id="results-heading" tabindex="-1">Results</h2>
+          <div class="results-title">
+            <h2 id="results-heading" tabindex="-1">Results</h2>
+            <p id="example-note" class="example-note" hidden></p>
+          </div>
           <p id="results-summary" class="summary"></p>
           <p id="results-cap" class="results-cap" hidden></p>
           <p id="results-takeaway" class="takeaway" hidden></p>
@@ -197,7 +200,7 @@
         </div>
         <div class="panel text-panel" id="text-panel">
           <p id="highlighted" class="highlighted"></p>
-          <ul id="legend" class="legend" aria-label="Entity types and their ontologies"></ul>
+          <ul id="legend" class="legend" aria-label="Mention types and their ontologies"></ul>
         </div>
         <div id="notices" class="notices" role="note" aria-labelledby="notices-title" hidden>
           <p id="notices-title" class="notices-title">About this run</p>
@@ -212,11 +215,21 @@
         </div>
         <div id="cards" class="cards"></div>
         <details id="run-details" class="run-details">
-          <summary>Run details</summary>
+          <summary id="run-details-summary">Run details</summary>
           <p id="results-models" class="ran-on"></p>
           <dl id="run-details-list" class="run-details-list"></dl>
         </details>
       </div>
+      <!-- Where an impressed visitor goes next. Shown under every result with mentions,
+           the recorded example included; app.js writes the exact term count. -->
+      <aside id="next" class="next" aria-labelledby="next-title" hidden>
+        <h2 id="next-title">That lookup is xwalk</h2>
+        <p id="next-body">The model never writes an ID. xwalk searched more than 260,000 ontology terms by keyword and by meaning, and the model chose among real candidates. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.</p>
+        <div class="button-row">
+          <a id="next-github" class="button-link" href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">xwalk on GitHub</a>
+          <button type="button" id="next-try" class="secondary">Try your own text</button>
+        </div>
+      </aside>
     </section>
 
     <footer class="footer" id="privacy">
