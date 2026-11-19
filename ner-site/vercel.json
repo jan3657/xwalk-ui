@@ -13,7 +13,7 @@
       "headers": [
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'"
+          "value": "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; form-action 'none'"
         },
         { "key": "X-Content-Type-Options", "value": "nosniff" },
         { "key": "Referrer-Policy", "value": "no-referrer" }

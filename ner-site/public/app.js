@@ -37,6 +37,9 @@
   // id alone, never the key. It outlives the key (which is forgotten when its provider
   // is no longer offered), so that no number of reloads turns that choice into a run on
   // the site's keys. Only the visitor choosing the site's models removes it.
+  // Beside the provider id it holds the model and the selector chosen for that key
+  // ({provider, model, selector}; ids only), so that a reload does not quietly move the
+  // visitor's bill to another model. A plain provider id, as written before, is read too.
   const PAYER_ENTRY = "xwalk-ner-payer";
   const PROVIDER_NAMES = { anthropic: "Anthropic", openai: "OpenAI", openrouter: "OpenRouter" };
   // What the server accepts as a key: 20 to 512 printable ASCII characters, no spaces.
@@ -83,6 +86,7 @@
     allowanceRow: $("allowance-row"),
     useOwnKey: $("use-own-key"),
     runHint: $("run-hint"),
+    runPayer: $("run-payer"),
     topK: $("top-k"),
     passField: $("passcode-field"),
     passcode: $("passcode"),
@@ -102,6 +106,7 @@
     pipe: $("pipe"),
     pipeFind: $("pipe-find"),
     pipeSearch: $("pipe-search"),
+    pipeDecide: $("pipe-decide"),
     modelHint: $("model-hint"),
     progress: $("progress"),
     progressTime: $("progress-time"),
@@ -159,9 +164,15 @@
     prefilled: false, // the text box holds the example because this page put it there
     ran: false, // a run was started: the recorded example is not shown after that
     limitNotice: false, // the error box is saying that a limit is used up
-    // The run under way: { provider, started, hidden, edited }. `hidden` once the page
-    // went to the background during it, `edited` once the visitor typed during it.
+    // The run under way: { provider, model, selector, started, startedAt, hidden,
+    // edited, abort }. The first three are what was submitted: every message about the
+    // run is written from them, never from what the form shows by then. `hidden` once
+    // the page went to the background during it, `edited` once the visitor typed, or
+    // used Example or Clear, during it. `abort` cancels the request.
     runCtx: null,
+    // A page brought back from the back-forward cache during a run: who pays is checked
+    // against session storage once that run has ended.
+    payerCheckDue: false,
     // Set while it is not settled who pays for the next run: a key kept from earlier
     // in this tab has not been restored yet ("pending"), could not be because health
     // did not load ("unknown"), or is for a provider the site no longer offers
@@ -253,7 +264,8 @@
 
   // `bearer` is a visitor's own provider key. Only the POST /api/ner call may carry it;
   // any other request that tried to would be a bug, so it is refused here.
-  async function api(method, path, payload, bearer) {
+  // `hook`, when given, receives `abort`: a way to cancel this request from outside.
+  async function api(method, path, payload, bearer, hook) {
     const headers = { "X-Requested-With": "xwalk-ner" };
     if (payload !== undefined) headers["Content-Type"] = "application/json";
     const pass = storageGet(PASSCODE_KEY);
@@ -264,8 +276,12 @@
     }
 
     const controller = new AbortController();
+    // Armed until the body has been read: an answer whose headers arrive and whose body
+    // then stalls is cancelled like one that never answers.
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    if (hook) hook.abort = () => controller.abort();
     let response;
+    let raw = "";
     try {
       response = await fetch(path, {
         method,
@@ -278,6 +294,7 @@
         redirect: bearer ? "error" : "follow",
       });
     } catch (err) {
+      clearTimeout(timer);
       const aborted = err && err.name === "AbortError";
       throw new ApiError(
         aborted
@@ -286,15 +303,22 @@
         aborted ? "timeout" : "network",
         0,
       );
-    } finally {
-      clearTimeout(timer);
     }
-
-    let raw = "";
     try {
       raw = await response.text();
     } catch (_) {
-      throw new ApiError(`The server answered ${response.status} but the body could not be read.`, "bad_response", response.status);
+      // The answer had started and did not finish: cut off, or stalled until the timer
+      // cancelled it. Either way the server may have done the work.
+      const stalled = controller.signal.aborted;
+      const cut = new ApiError(
+        stalled ? "The answer stopped arriving and the request was cancelled." : "The connection was lost while the answer was arriving.",
+        stalled ? "timeout" : "network",
+        response.status,
+      );
+      cut.interrupted = true;
+      throw cut;
+    } finally {
+      clearTimeout(timer);
     }
     let data;
     try {
@@ -390,16 +414,25 @@
         }
         return { look: "alert", title: "The model could not finish this run.", body: ["The model provider returned an error. Try again in a minute."], action: "Try again" };
       case "timeout":
+        if (err.interrupted) {
+          return {
+            look: "alert",
+            title: "The result did not finish arriving.",
+            body: ["The connection stalled part of the way through. Your text is still here. The interrupted run may still have been counted."],
+            action: "Run again",
+          };
+        }
         return {
           look: "alert",
           title: "The run took too long and was stopped.",
-          body: ["Long texts with many mentions can run out of time. Try again, or try a shorter text."],
+          body: ["Long texts with many mentions can run out of time. Try again, or try a shorter text. The stopped run may still have been counted."],
           action: "Try again",
         };
       case "network": {
-        // A request that died late, or while the page was in the background, was most
-        // likely cut off by the phone, not refused by the network.
-        const late = Boolean(ctx) && (ctx.hidden || performance.now() - ctx.started > 3000);
+        // A request that died late, part of the way through its answer, or while the
+        // page was in the background, was most likely cut off by the phone, not refused
+        // by the network.
+        const late = Boolean(err.interrupted) || (Boolean(ctx) && (ctx.hidden || performance.now() - ctx.started > 3000));
         if (late) {
           return {
             look: "alert",
@@ -440,10 +473,11 @@
     return { look: "alert", title: "Something went wrong.", body: [message], action: "Try again" };
   }
 
-  // What is said at the key field for an error about the visitor's own key.
-  function keyErrorText(err, provider) {
+  // What is said at the key field for an error about the visitor's own key. `provider`
+  // and `model` are the ones the failed run was submitted with.
+  function keyErrorText(err, provider, model) {
     if (err.code === "provider_key_refused") {
-      return `${provider.name} did not accept this key. Check that it was pasted whole, is still active, has credit, and may use ${modelName(el.model.value)}.`;
+      return `${provider.name} did not accept this key. Check that it was pasted whole, is still active, has credit, and may use ${modelName(model)}.`;
     }
     if (err.code === "provider_rate_limited") {
       return `${provider.name} is rate limiting your key. Wait a minute and try again, or choose a smaller model.`;
@@ -473,7 +507,7 @@
     if (OPTIONS_CODES.includes(e.code)) openOptions();
     if (e.code === "missing_text" || e.code === "text_too_long") {
       const n = codePointLength(el.text.value);
-      if (e.code === "text_too_long" && n > state.limits.max_chars) showTextError("long", tooLongText(n));
+      if (e.code === "text_too_long" && n > state.limits.max_chars) showTextError("long", tooLongText());
       else showTextError("server", e.code === "missing_text" ? "Paste some text first, or tap Example." : "This text is too long for the demo. Shorten it and run again.");
       if (!calm) reveal(el.textError, "center");
       return;
@@ -484,10 +518,12 @@
       if (!calm) el.prompt.focus();
       return;
     }
-    const provider = currentProvider();
+    // The provider the run was submitted with, not the one the form shows now. The
+    // payer cannot be changed during a run, so the key field is still that provider's.
+    const provider = ctx ? ctx.provider : currentProvider();
     if (KEY_CODES.includes(e.code) && provider) {
       // A key the server or the provider refused stays in the field, to be corrected.
-      showKeyError(keyErrorText(e, provider));
+      showKeyError(keyErrorText(e, provider, ctx ? ctx.model : el.model.value));
       if (!calm) el.ownKey.focus();
       return;
     }
@@ -543,9 +579,10 @@
     el.text.removeAttribute("aria-invalid");
   }
 
-  function tooLongText(n) {
-    const max = state.limits.max_chars;
-    return `This text is ${n.toLocaleString("en")} characters; the demo takes up to ${max.toLocaleString("en")}. Shorten it by ${(n - max).toLocaleString("en")}.`;
+  // The same sentence whatever the length: the line is an alert, and a number in it
+  // would be read out again on every keystroke. The counter beside it has the numbers.
+  function tooLongText() {
+    return `This text is over the ${state.limits.max_chars.toLocaleString("en")} character limit. Shorten it to map it.`;
   }
 
   function showPromptError(message) {
@@ -574,7 +611,8 @@
         h(
           "div",
           { class: "banner-row" },
-          h("p", null, h("strong", { text: "Could not reach the service." }), " You can still try a run; some options are missing until the page reloads."),
+          // Not "you can still try a run" while runs are held for an own-key choice.
+          h("p", null, h("strong", { text: "Could not reach the service." }), state.payer ? " Runs are on hold: see the note under the button." : " You can still try a run; some options are missing until the page reloads."),
           retry,
         ),
       );
@@ -586,12 +624,13 @@
       ]);
     }
     // The operator's reason is never printed here; it is in "Run details" after a run.
-    const dense = retrieval && retrieval.dense;
-    if (dense && dense.status !== "ok") {
+    const denseOff = Boolean(retrieval && retrieval.dense && retrieval.dense.status !== "ok");
+    const bm25Off = Boolean(retrieval && retrieval.bm25 && retrieval.bm25.status !== "ok");
+    if (denseOff && bm25Off) {
+      items.push(["The search is unavailable.", " Mentions can be found in your text right now, but they cannot be looked up."]);
+    } else if (denseOff) {
       items.push(["Part of the search is unavailable.", " Matching by meaning is off right now, so terms are found by keyword only. Synonyms and paraphrases may be missed."]);
-    }
-    const bm25 = retrieval && retrieval.bm25;
-    if (bm25 && bm25.status !== "ok") {
+    } else if (bm25Off) {
       items.push(["Part of the search is unavailable.", " Matching by keyword is off right now, so terms are found by meaning only."]);
     }
     for (const [title, rest] of items) {
@@ -605,11 +644,13 @@
   function updateCounter() {
     const n = codePointLength(el.text.value);
     const max = state.limits.max_chars;
-    el.counter.textContent = `${n.toLocaleString()} / ${max.toLocaleString()} characters`;
+    el.counter.textContent = `${n.toLocaleString()} / ${max.toLocaleString()} characters` + (n > max ? `, ${(n - max).toLocaleString()} over` : "");
     el.counter.classList.toggle("over", n > max);
-    // Said as soon as the text passes the limit, not only after Run.
-    if (n > max) showTextError("long", tooLongText(n));
-    else if (state.textError === "long") clearTextError();
+    // Said as soon as the text passes the limit, not only after Run, and said once: the
+    // alert is not rewritten while the text stays over the limit.
+    if (n > max) {
+      if (state.textError !== "long") showTextError("long", tooLongText());
+    } else if (state.textError === "long") clearTextError();
     el.textHelp.textContent = `Up to ${max.toLocaleString("en")} characters and ${state.limits.max_entities} mentions per run.`;
   }
 
@@ -620,7 +661,12 @@
     el.topK.value = String(Math.min(current, max));
   }
 
+  // The first answer fills the form, from session storage where a choice was saved. An
+  // answer applied after that (a retry) keeps what the visitor has chosen since,
+  // wherever the new answer still offers it. While a payer hold is up, storage decides.
   function applyHealth(health) {
+    const again = Boolean(state.health) && !state.payer;
+    const before = again ? { provider: el.provider.value, model: el.model.value, selector: el.selector.value } : null;
     state.health = health;
     state.visitorAt = Date.now();
     state.healthFailed = false;
@@ -634,7 +680,8 @@
       "This is the text the model is given before yours. Change it to look for other kinds of mention or to set stricter rules. " +
       `Your edit is used for your runs in this tab only. Up to ${state.limits.max_prompt_chars.toLocaleString("en")} characters.`;
 
-    fillProviders(health);
+    if (again) reconcileProviders(health);
+    else fillProviders(health);
 
     fillTopK(state.limits.top_k_max || 10);
 
@@ -649,8 +696,20 @@
     renderIntro(health);
     renderBanner(health.mode, health.retrieval);
     applyProvider();
+    restoreModels(before || savedChoice());
+    renderSteps(effectiveSelector());
     updateCounter();
     syncExample();
+  }
+
+  // Puts back a model and a selector chosen earlier (before this health answer, or
+  // before a reload) when they belong to the payer now shown and are still offered.
+  function restoreModels(choice) {
+    if (!choice || choice.provider !== el.provider.value) return;
+    const offers = (select, value) => Boolean(value) && [...select.options].some((o) => o.value === value);
+    if (offers(el.model, choice.model)) el.model.value = choice.model;
+    if (offers(el.selector, choice.selector)) el.selector.value = choice.selector;
+    renderAllowance();
   }
 
   // ---------- own keys ----------
@@ -711,17 +770,59 @@
     storageSet(OWN_KEY_ENTRY, "");
   }
 
-  // The own-key provider the visitor last chose in this tab ("" for the site's models).
-  // A key kept from before this entry existed counts as that choice.
-  function savedPayer() {
-    const chosen = storageGet(PAYER_ENTRY);
-    if (chosen && chosen !== "site") return chosen;
+  // The own-key choice the visitor last made in this tab: { provider, model, selector },
+  // or null for the site's models. A key kept from before this entry existed counts as
+  // that choice.
+  function savedChoice() {
+    const raw = storageGet(PAYER_ENTRY);
+    if (raw && raw !== "site") {
+      if (raw.charAt(0) !== "{") return { provider: raw, model: "", selector: "" };
+      try {
+        const c = JSON.parse(raw);
+        if (c && typeof c.provider === "string" && c.provider && c.provider !== "site") {
+          return { provider: c.provider, model: typeof c.model === "string" ? c.model : "", selector: typeof c.selector === "string" ? c.selector : "" };
+        }
+      } catch (_) {
+        /* not ours: treated as no choice */
+      }
+    }
     const kept = storedKey();
-    return kept ? kept.provider : "";
+    return kept ? { provider: kept.provider, model: "", selector: "" } : null;
   }
 
+  // The provider of that choice ("" for the site's models).
+  function savedPayer() {
+    const choice = savedChoice();
+    return choice ? choice.provider : "";
+  }
+
+  // The models saved for a provider stay until the visitor picks others for it.
   function rememberPayer(providerId) {
-    storageSet(PAYER_ENTRY, providerId && providerId !== "site" ? providerId : "");
+    if (!providerId || providerId === "site") {
+      storageSet(PAYER_ENTRY, "");
+      return;
+    }
+    const before = savedChoice();
+    const same = Boolean(before) && before.provider === providerId;
+    storageSet(PAYER_ENTRY, JSON.stringify({ provider: providerId, model: same ? before.model : "", selector: same ? before.selector : "" }));
+  }
+
+  // The visitor picked a model or a selector while paying with an own key.
+  function rememberModels() {
+    const provider = currentProvider();
+    if (!provider || state.payer) return;
+    storageSet(PAYER_ENTRY, JSON.stringify({ provider: provider.id, model: el.model.value, selector: el.selector.value }));
+  }
+
+  // Whether session storage can be written at all (it cannot in some private modes).
+  function storageWorks() {
+    try {
+      window.sessionStorage.setItem("xwalk-ner-probe", "1");
+      window.sessionStorage.removeItem("xwalk-ner-probe");
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   // ---------- who pays ----------
@@ -755,18 +856,70 @@
     openOptions();
     syncRun();
     renderPayerCopy();
+    if (state.healthFailed) renderBanner(null, null);
   }
 
   function releaseRuns() {
+    const held = Boolean(state.payer);
     state.payer = null;
     el.payer.hidden = true;
     el.payerMsg.textContent = "";
     syncRun();
     renderPayerCopy();
+    if (held && state.healthFailed) renderBanner(null, null);
   }
 
+  // Run ships disabled in index.html and is enabled from here, once the submit handler
+  // is installed. While a run is under way, who pays and which models run cannot be
+  // changed: the run was submitted with them, and what the page says about it (the hint,
+  // the Options summary, an error at the key field) has to stay true of that run.
   function syncRun() {
     el.run.disabled = state.running || Boolean(state.payer);
+    for (const control of [el.provider, el.ownKey, el.forgetKey, el.model, el.selector]) control.disabled = state.running;
+  }
+
+  // A page brought back from the back-forward cache is the old document, with the old
+  // key still in its field. Meanwhile another document of this tab may have forgotten
+  // that key or changed who pays; session storage, which the tab's documents share, is
+  // where that is on record. So before the restored page can submit, its payer and key
+  // are made to match storage: an absent key empties the field, a choice that cannot be
+  // settled holds the run. Where storage cannot be used the page is all there is, and
+  // it is left alone.
+  function reconcilePayer() {
+    if (!storageWorks()) return;
+    const chosen = savedPayer();
+    const kept = storedKey();
+    if (!state.health) {
+      // Health is still loading or failed: the key field is not on show, and whether
+      // the choice can be used is not known.
+      el.ownKey.value = "";
+      if (chosen) holdRuns(state.healthFailed ? "unknown" : "pending", chosen);
+      else if (state.payer) releaseRuns();
+      return;
+    }
+    if (chosen && !state.providers.some((p) => p.id === chosen)) {
+      el.ownKey.value = "";
+      if (el.provider.value !== "site") {
+        el.provider.value = "site";
+        applyProvider();
+      }
+      holdRuns("lost", chosen);
+      return;
+    }
+    const want = chosen || "site";
+    if (el.provider.value !== want) {
+      el.provider.value = want;
+      applyProvider();
+      restoreModels(savedChoice());
+    }
+    const key = chosen && kept && kept.provider === chosen ? kept.key : "";
+    if (el.ownKey.value.trim() !== key) {
+      el.ownKey.value = key;
+      clearKeyError();
+    }
+    if (state.payer) releaseRuns();
+    else renderPayerCopy();
+    if (chosen) openOptions();
   }
 
   function fillProviderOptions() {
@@ -907,7 +1060,7 @@
     if (currentProvider()) {
       // An own key is outside the site's free runs; only its own flood limit can stop it.
       if (visitor.own_left_today === 0) {
-        return { blocked: true, text: "Too many runs with your own key today. They come back at midnight UTC." };
+        return { blocked: true, wait: secondsLeft(visitor.day_resets_in_s), text: "Too many runs with your own key today. They come back at midnight UTC." };
       }
       if (visitor.own_left === 0) {
         return { blocked: true, wait: secondsLeft(visitor.resets_in_s), text: `Too many runs with your own key; ${tryAgain(secondsLeft(visitor.resets_in_s))}.` };
@@ -921,7 +1074,8 @@
       if (visitor.window === "day") {
         const left = secondsLeft(visitor.day_resets_in_s);
         const at = left === null ? "midnight UTC" : new Date(Date.now() + left * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-        return { blocked: true, text: `The free runs for your network today are used. They come back at ${at}.` };
+        // `wait`: the line is recounted and health read again when the day is over.
+        return { blocked: true, wait: left, text: `The free runs for your network today are used. They come back at ${at}.` };
       }
       const left = secondsLeft(visitor.resets_in_s);
       return {
@@ -934,14 +1088,24 @@
     // reached and the request would use Claude at all.
     const counted = visitor.limits === undefined || visitor.limits === "on";
     const claudeDown = health.claude && health.claude.status === "unavailable";
-    const wantsClaude = isClaude(el.model.value) || isClaude(effectiveSelector());
+    // Which step would use Claude: the one that reads the text, or only the choice of
+    // terms. "Runs start on Claude Sonnet" is not said of a run another model starts.
+    const reads = isClaude(el.model.value);
+    const wantsClaude = reads || isClaude(effectiveSelector());
     if (!counted || claudeDown || !wantsClaude) return null;
     if (visitor.tier === "sonnet") {
       const span = visitor.opus_left_today === 0 ? "today" : "this hour";
-      return { blocked: false, sonnet: true, text: `The free runs on Claude Opus for your network ${span} are used. Runs now start on Claude Sonnet, a faster model.` };
+      return {
+        blocked: false,
+        sonnet: true,
+        text: `The free runs on Claude Opus for your network ${span} are used. ` + (reads ? "Runs now start on Claude Sonnet, a faster model." : "The choice of terms now starts on Claude Sonnet, a faster model."),
+      };
     }
     if (visitor.tier === "opus" && visitor.opus_left === 1) {
-      return { blocked: false, text: "1 free run on Claude Opus is left for your network this hour; after that, runs start on Claude Sonnet." };
+      return {
+        blocked: false,
+        text: "1 free run on Claude Opus is left for your network this hour; after that, " + (reads ? "runs start on Claude Sonnet." : "the choice of terms starts on Claude Sonnet."),
+      };
     }
     return null;
   }
@@ -974,7 +1138,7 @@
     if (timed && allowanceTimer === null) {
       allowanceTimer = setInterval(() => {
         const now = allowanceMessage();
-        if (now && typeof now.wait === "number" && now.wait <= 0) refreshHealth();
+        if (now && typeof now.wait === "number" && now.wait <= 0) refreshHealth({ expire: true });
         else renderAllowance();
       }, 30000);
     } else if (!timed && allowanceTimer !== null) {
@@ -1005,10 +1169,19 @@
     }
     el.optionsSummary.textContent = summary;
     el.runHint.textContent = provider
-      ? `Runs on your ${provider.name} key. Use public or de-identified text: it is sent to ${provider.name} and not saved by this site.`
-      : "Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider and not saved by this site.";
+      ? `Runs on your ${provider.name} key. Use public or de-identified text: it is sent to ${provider.name}.`
+      : "Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider.";
     // Not while it would be untrue: a hold, or no free run left.
     el.runHint.hidden = Boolean(state.payer) || Boolean(message && message.blocked);
+    // Who pays, in a few words, as part of the Run button's description: a screen
+    // reader that goes straight to the button hears it without opening Options. The
+    // allowance line, when there is one, follows it (aria-describedby in index.html).
+    let payer = "Runs on this site's models, free.";
+    if (state.payer) payer = "Runs are on hold until you choose who pays.";
+    else if (provider) payer = `Runs on your ${provider.name} key; ${provider.name} bills you.`;
+    else if (state.health && state.health.mode === "offline") payer = "Runs on an offline stand-in, not a model.";
+    else if (message && message.blocked) payer = "Runs on this site's models.";
+    el.runPayer.textContent = payer;
   }
 
   // "Use my own key": show where that is chosen. Nothing changes who pays until the
@@ -1023,13 +1196,14 @@
   // so that an open tab learns when a provider was turned off. Only the parts that
   // change between requests are taken: the form keeps the visitor's choices where they
   // still exist (reconcileProviders). A failed read keeps what was shown.
-  async function refreshHealth() {
-    let health;
-    try {
-      health = await api("GET", "/api/health");
-    } catch (_) {
-      return;
-    }
+  //
+  // `opts.expire`: this read was made because a wait may be over (a timer ran out, the
+  // tab came back). If the error box still says a limit is used up and health no longer
+  // says so, the box is closed. Not after a run: there the box is that run's answer.
+  async function refreshHealth(opts) {
+    const read = await readHealth();
+    if (read.superseded || !read.health) return;
+    const health = read.health;
     if (!state.health) {
       applyHealth(health);
       return;
@@ -1038,6 +1212,31 @@
     state.visitorAt = Date.now();
     reconcileProviders(health);
     renderAllowance();
+    if (opts && opts.expire && state.limitNotice && health.visitor && typeof health.visitor === "object") {
+      const now = allowanceMessage();
+      if (!(now && now.blocked)) hideError();
+    }
+  }
+
+  // Every read of /api/health goes through here and takes a number. Answers can arrive
+  // out of order (the first read of a cold function can take longer than a run and the
+  // read after it): an answer older than one already applied is dropped, so it cannot
+  // put the form back to an earlier state. A failed read never counts as newer.
+  let healthAsked = 0;
+  let healthApplied = 0;
+
+  async function readHealth() {
+    healthAsked += 1;
+    const seq = healthAsked;
+    let health = null;
+    try {
+      health = await api("GET", "/api/health");
+    } catch (_) {
+      /* a failed read: null */
+    }
+    if (seq < healthApplied) return { superseded: true, health: null };
+    if (health) healthApplied = seq;
+    return { superseded: false, health };
   }
 
   // index.html carries the production copy. A full catalog only gets its exact term
@@ -1071,8 +1270,36 @@
       h("strong", { text: "200-term sample" }),
       ", not the full vocabulary, so many real-world terms will not be found. Every ID comes from the sample; the model never writes one.",
     );
-    el.pipeSearch.textContent =
-      "xwalk looks each one up in the sample ontology with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.";
+  }
+
+  // What the Search and Decide steps say while a run is under way, written from what
+  // that run was submitted with and from what health says of the search. `selector` is
+  // the submitted selector ("" when the page does not know which one the server will
+  // use). A step that will not happen is not promised, and where the page cannot know
+  // it says less.
+  function renderSteps(selector) {
+    const health = state.health;
+    const where = !health ? "its ontology" : health.neon && health.neon.catalog === "full" ? "the full ontology" : "the sample ontology";
+    const retrieval = (health && health.retrieval) || {};
+    const off = (name) => Boolean(retrieval[name]) && retrieval[name].status !== "ok";
+    if (off("bm25") && off("dense")) {
+      el.pipeSearch.textContent = "The search is unavailable right now, so the mentions cannot be looked up.";
+    } else if (off("dense")) {
+      el.pipeSearch.textContent = `xwalk looks each one up in ${where} with keyword search (BM25) and makes a shortlist. Embedding search is unavailable right now.`;
+    } else if (off("bm25")) {
+      el.pipeSearch.textContent = `xwalk looks each one up in ${where} with embedding search and makes a shortlist. Keyword search is unavailable right now.`;
+    } else {
+      el.pipeSearch.textContent = `xwalk looks each one up in ${where} with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.`;
+    }
+    if (selector === "retrieval") {
+      el.pipeDecide.textContent = "No model chooses in this run: each mention gets its top search result.";
+    } else if (selector === "jev") {
+      el.pipeDecide.textContent = "Jev, a small trained ranking model, picks a term from the shortlist or says that none fits.";
+    } else if (selector) {
+      el.pipeDecide.textContent = "The model picks the best term from the shortlist, or says none fits, and gives a confidence and a reason.";
+    } else {
+      el.pipeDecide.textContent = "A term is chosen for each mention from its shortlist.";
+    }
   }
 
   // "Example" loads a sentence the deployment can map: the production one unless
@@ -1172,22 +1399,26 @@
   // with" field to show it, and a run would go to the site's models: runs are held.
   async function loadHealth() {
     const chosen = savedPayer();
-    if (chosen) holdRuns("pending", chosen);
-    try {
-      applyHealth(await api("GET", "/api/health"));
-    } catch (err) {
-      state.healthFailed = true;
-      renderBanner(null, null);
-      // Nothing is known about the catalog, so nothing is claimed about its size.
-      el.caveat.hidden = true;
-      fillTopK(DEFAULT_LIMITS.top_k_max);
-      el.modelField.hidden = true;
-      updateCounter();
-      // Still chosen (the visitor may have picked the site's models while waiting).
-      const still = savedPayer();
-      if (still) holdRuns("unknown", still);
-      else releaseRuns();
+    if (chosen && !state.health) holdRuns("pending", chosen);
+    const read = await readHealth();
+    if (read.superseded) return;
+    if (read.health) {
+      applyHealth(read.health);
+      return;
     }
+    // A failed read after another read has answered changes nothing: the form is filled.
+    if (state.health) return;
+    state.healthFailed = true;
+    renderBanner(null, null);
+    // Nothing is known about the catalog, so nothing is claimed about its size.
+    el.caveat.hidden = true;
+    fillTopK(DEFAULT_LIMITS.top_k_max);
+    el.modelField.hidden = true;
+    updateCounter();
+    // Still chosen (the visitor may have picked the site's models while waiting).
+    const still = savedPayer();
+    if (still) holdRuns("unknown", still);
+    else releaseRuns();
   }
 
   // ---------- results ----------
@@ -1218,7 +1449,8 @@
       el.highlighted.append(
         h(
           "a",
-          { class: `mention type-${t}`, href: `#card-${e.id}`, title: `${e.text}: ${kind}` },
+          // The tooltip names the type only: the mention itself is the link's text.
+          { class: `mention type-${t}`, href: `#card-${e.id}`, title: kind },
           cps.slice(e.start, e.end).join(""),
           h("span", { class: "visually-hidden", text: ` (${kind})` }),
         ),
@@ -1358,6 +1590,10 @@
     const byLine = by ? h("p", { class: "card-by", text: by }) : null;
     const lines = outcome === "declined" || outcome === "unsure" ? [byLine, why] : [why, byLine];
     for (const line of lines) if (line) detail.append(line);
+    // The number on the card's first line, in words: a phone has no hover for its tooltip.
+    if ((outcome === "matched" || outcome === "check") && typeof p.confidence === "number") {
+      detail.append(h("p", { class: "card-by card-conf-note", text: `${p.confidence.toFixed(2)} is the model's own confidence, not a measured accuracy.` }));
+    }
 
     if (all.length) {
       const tbody = h("tbody");
@@ -1480,19 +1716,34 @@
   }
 
   // The selectors that made the picks, in order of first appearance. After a step-down
-  // this differs from the selector the request asked for.
+  // this differs from the selector the request asked for. A pick that failed names a
+  // selector too, but nothing was chosen there, so it does not count.
+  const DECIDED = ["matched", "check", "unsure", "declined"];
+
   function pickersOf(entities) {
     const pickers = [];
     for (const e of entities) {
-      const who = e && e.pick && typeof e.pick.selector === "string" ? e.pick.selector : "";
+      if (!e || !DECIDED.includes(outcomeOf(e))) continue;
+      const who = typeof e.pick.selector === "string" ? e.pick.selector : "";
       if (who && !pickers.includes(who)) pickers.push(who);
     }
     return pickers;
   }
 
+  // Who answered, in one sentence for the line under the summary: the model that read
+  // the text and the models that chose terms, as the response names them. "" offline.
+  function answeredText(data, entities, pickers) {
+    if (data.mode === "offline" || typeof data.model !== "string" || !data.model) return "";
+    const own = data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site";
+    const read = `Read by ${modelName(data.model)}` + (own ? ` on your ${providerName(data.provider)} key` : "");
+    if (pickers.length) return `${read}; terms chosen by ${joinNames(pickers.map(selectorName))}.`;
+    const outcomes = entities.map(outcomeOf);
+    return outcomes.includes("search") && !outcomes.includes("failed") ? `${read}; no model chose the terms.` : `${read}.`;
+  }
+
   // "Run details" names what actually ran: the extraction model, and the model (or
   // models, after a step-down) that chose the terms.
-  function renderRanOn(data, pickers) {
+  function renderRanOn(data, pickers, outcomes) {
     clear(el.ranOn);
     if (data.mode === "offline") {
       el.ranOn.append("Extracted by the offline stand-in.");
@@ -1510,7 +1761,9 @@
         el.ranOn.append(h("strong", { text: selectorName(who) }));
       });
       el.ranOn.append(".");
-    } else if (data.mode !== "offline") {
+    } else if (data.mode !== "offline" && outcomes.includes("failed")) {
+      el.ranOn.append(" The model did not finish choosing the terms.");
+    } else if (data.mode !== "offline" && outcomes.includes("search")) {
       el.ranOn.append(" No model picked the terms: each entity shows its top search result.");
     }
     el.ranOn.hidden = !el.ranOn.firstChild;
@@ -1522,8 +1775,8 @@
 
   // The engineering read-out, folded away after the cards. The search's own words
   // (BM25, embeddings, the operator's reason for a failure) belong here and nowhere else.
-  function renderRunDetails(data, pickers) {
-    renderRanOn(data, pickers);
+  function renderRunDetails(data, pickers, outcomes) {
+    renderRanOn(data, pickers, outcomes);
     clear(el.runDetailsList);
     const row = (name, value) => el.runDetailsList.append(h("dt", { text: name }), h("dd", { text: value }));
     const names = { bm25: "keyword (BM25)", dense: "embeddings (dense)" };
@@ -1591,10 +1844,12 @@
     const mine = (Array.isArray(data.fallbacks) ? data.fallbacks : []).map(fallbackSentence);
     const lines = mine.length && mine.every(Boolean) ? mine : served.length ? served : mine.filter(Boolean);
     const retrieval = data.retrieval || {};
-    if (searched && retrieval.dense && retrieval.dense.status !== "ok") {
+    const off = (name) => Boolean(retrieval[name]) && retrieval[name].status !== "ok";
+    if (searched && off("dense") && off("bm25")) {
+      lines.push("The search was unavailable for this run, so the mentions could not be looked up.");
+    } else if (searched && off("dense")) {
       lines.push("Part of the search (matching by meaning) was unavailable for this run, so terms were found by keyword only. Synonyms and paraphrases may be missed.");
-    }
-    if (searched && retrieval.bm25 && retrieval.bm25.status !== "ok") {
+    } else if (searched && off("bm25")) {
       lines.push("Part of the search (matching by keyword) was unavailable for this run, so terms were found by meaning only.");
     }
     for (const line of new Set(lines)) el.noticesList.append(h("li", { text: line }));
@@ -1661,20 +1916,31 @@
   }
 
   // The closing panel: what the visitor just watched, and where the library is. Only
-  // what is true of this result is said: how many terms were searched (when known), by
-  // which kinds of search, and whether a model chose.
+  // what this result shows is said. The kinds of search are read from the candidates
+  // themselves (which search ranked them), and "the model chose" from picks that were
+  // made. The term count is the size of the catalog: a mention is looked up in the one
+  // ontology of its type, so no run searches all of it. With no candidate at all (the
+  // search failed, or found nothing) there is no lookup to point at, and no panel.
   function renderNext(data, entities, pickers) {
-    const searched = entities.some((e) => e.ontology);
-    el.next.hidden = !searched;
-    if (!searched) return;
+    const ranked = new Set();
+    for (const e of entities) {
+      for (const m of (Array.isArray(e.matches) ? e.matches : []).concat(Array.isArray(e.more) ? e.more : [])) {
+        for (const name of Object.keys((m && m.retrievers) || {})) ranked.add(name.split("-")[0]);
+      }
+    }
+    const found = entities.some((e) => Array.isArray(e.matches) && e.matches.length > 0);
+    el.next.hidden = !found;
+    if (!found) return;
+    const outcomes = entities.map(outcomeOf);
     const total = state.ontologies.reduce((sum, o) => sum + (Number(o.count) || 0), 0);
-    const terms = total > 0 ? `${total.toLocaleString("en")} ontology terms` : "the ontology terms";
-    const retrieval = data.retrieval || {};
-    const off = (name) => Boolean(retrieval[name]) && retrieval[name].status !== "ok";
-    const how = off("dense") ? "by keyword" : off("bm25") ? "by meaning" : "by keyword and by meaning";
-    const chose = pickers.length ? "and the model chose among real candidates" : "and each mention shows the top search result";
+    const kinds = [ranked.has("bm25") ? "by keyword" : "", ranked.has("dense") ? "by meaning" : ""].filter(Boolean);
+    const how = kinds.length ? ` ${kinds.join(" and ")}` : "";
+    let chose = "";
+    if (pickers.length) chose = ", and the model chose among real candidates";
+    else if (outcomes.includes("search") && !outcomes.includes("failed")) chose = ", and each mention shows the top search result";
     el.nextBody.textContent =
-      `The model never writes an ID. xwalk searched ${terms} ${how}, ${chose}. ` +
+      `The model never writes an ID. xwalk looked up each mention${how}${chose}. ` +
+      (total > 0 ? `The catalog holds ${total.toLocaleString("en")} terms. ` : "") +
       "xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.";
   }
 
@@ -1731,8 +1997,11 @@
       if (typeof timing.select === "number") steps.push(`${fmtShort(timing.select)} choosing terms`);
       done = `Done in ${fmtShort(timing.total)}` + (steps.length ? `: ${steps.join(", ")}.` : ".");
     }
-    // "Done in 8.8 s" would read as the visitor's own wait.
-    el.status.textContent = example ? "" : done;
+    // After a run the page names the models that answered, which need not be the ones
+    // the intro names or the ones that were asked for. "Done in 8.8 s" on the example
+    // would read as the visitor's own wait.
+    const answered = answeredText(data, entities, pickers);
+    el.status.textContent = example ? "" : [done, answered].filter(Boolean).join(" ");
 
     el.results.setAttribute("data-kind", example ? "example" : "run");
     el.resultsHeading.textContent = example ? "Example result" : "Results";
@@ -1740,7 +2009,7 @@
     el.exampleNote.hidden = !example;
 
     renderNotices(data, entities.some((e) => e.ontology));
-    renderRunDetails(data, pickers);
+    renderRunDetails(data, pickers, outcomes);
     el.runDetailsSummary.textContent = example ? "Details of the recorded run" : "Run details";
     el.runDetails.open = false;
     renderNext(data, entities, pickers);
@@ -1754,8 +2023,11 @@
 
   // A result belongs to the text it was made from. Once the box holds another text the
   // result stays, dimmed, under one line that says so.
+  // The recorded example is not called out while the box is empty (there is no "yours"
+  // to map) or while the visitor's own run is under way (the button is already pressed).
   function syncStale() {
-    const stale = Boolean(state.shown) && !el.results.hidden && el.text.value !== state.shown.text;
+    const other = Boolean(state.shown) && !el.results.hidden && el.text.value !== state.shown.text;
+    const stale = other && !(state.shown.example && (state.running || el.text.value === ""));
     el.results.classList.toggle("is-stale", stale);
     el.stale.textContent =
       state.shown && state.shown.example
@@ -1773,6 +2045,7 @@
     el.run.setAttribute("aria-busy", on ? "true" : "false");
     el.results.setAttribute("aria-busy", on ? "true" : "false");
     el.run.querySelector(".run-label").textContent = on ? "Mapping…" : "Map this text";
+    syncStale();
     showProgress(on);
     if (on) holdScreen();
     else releaseScreen();
@@ -1844,6 +2117,7 @@
   }
 
   function useSite() {
+    if (state.running) return;
     forgetKey();
     rememberPayer("site");
     el.provider.value = "site";
@@ -1862,7 +2136,7 @@
     const text = el.text.value;
     const n = codePointLength(text);
     if (!text.trim() || n > state.limits.max_chars) {
-      if (text.trim()) showTextError("long", tooLongText(n));
+      if (text.trim()) showTextError("long", tooLongText());
       else showTextError("empty", "Paste some text first, or tap Example.");
       // On a phone the keyboard would cover the message, so the box is not focused.
       if (touch) reveal(el.textError, "center");
@@ -1913,15 +2187,29 @@
     // An API from before own keys never sees the field.
     if (provider) payload.provider = provider.id;
 
-    const ctx = { provider, started: performance.now(), hidden: document.visibilityState === "hidden", edited: false };
+    const ctx = {
+      provider,
+      model: payload.model,
+      selector: el.selectorField.hidden ? effectiveSelector() : payload.selector || "",
+      started: performance.now(),
+      startedAt: Date.now(),
+      hidden: document.visibilityState === "hidden",
+      edited: false,
+      abort: null,
+    };
     state.runCtx = ctx;
     state.ran = true;
+    // The text is the visitor's submission from here on, also when it is the example
+    // this page put in the box: a later health answer may take the recorded example
+    // away, but not the text that is being mapped.
+    state.prefilled = false;
+    renderSteps(ctx.selector);
     setRunning(true);
     // Said once for screen readers; sighted visitors have the steps and the button.
     announce("Mapping your text. This usually takes 10 to 30 seconds.");
     try {
       // The key is read here, for this call, and held nowhere else.
-      const data = await api("POST", "/api/ner", payload, provider ? el.ownKey.value.trim() : undefined);
+      const data = await api("POST", "/api/ner", payload, provider ? el.ownKey.value.trim() : undefined, ctx);
       renderResults(text, data);
       setRunning(false);
       const said = el.noEntities.hidden ? el.summary.textContent : el.noEntitiesTitle.textContent;
@@ -1941,6 +2229,10 @@
       setRunning(false);
       state.runCtx = null;
     }
+    if (state.payerCheckDue) {
+      state.payerCheckDue = false;
+      reconcilePayer();
+    }
     refreshHealth();
   }
 
@@ -1948,6 +2240,8 @@
 
   function loadExample() {
     state.touched = true;
+    // As typing does: a result that arrives now does not take the focus or the scroll.
+    if (state.runCtx) state.runCtx.edited = true;
     el.text.value = exampleText();
     clearTextError();
     updateCounter();
@@ -1987,18 +2281,26 @@
       if (visible) {
         wakeLock = null;
         holdScreen();
+        // Timers do not run while a phone sleeps: a request past its time is cancelled now.
+        const ctx = state.runCtx;
+        if (ctx && ctx.abort && Date.now() - ctx.startedAt > REQUEST_TIMEOUT_MS) ctx.abort();
       }
       return;
     }
-    // A tab that slept through a timed wait learns that the wait is over.
-    if (visible && allowanceTimer !== null) refreshHealth();
+    // A tab that slept through a wait learns that the wait is over.
+    if (visible && (allowanceTimer !== null || state.limitNotice)) refreshHealth({ expire: true });
   });
-  el.model.addEventListener("change", renderAllowance);
-  el.selector.addEventListener("change", renderAllowance);
+  for (const select of [el.model, el.selector]) {
+    select.addEventListener("change", () => {
+      rememberModels();
+      renderAllowance();
+    });
+  }
   el.example.addEventListener("click", loadExample);
   el.noEntitiesExample.addEventListener("click", loadExample);
   el.clear.addEventListener("click", () => {
     state.touched = true;
+    if (state.runCtx) state.runCtx.edited = true;
     el.text.value = "";
     clearTextError();
     updateCounter();
@@ -2019,9 +2321,21 @@
   });
   // A browser that puts typed text back after the scripts ran (back and forward) fires
   // no input event; the counter and the "earlier text" line are brought up to date.
-  window.addEventListener("pageshow", () => {
+  // A page restored from the back-forward cache (`persisted`) is the document as it was
+  // left, key field included: who pays is checked against session storage before it can
+  // submit (reconcilePayer), and the free-runs line is read again.
+  window.addEventListener("pageshow", (ev) => {
     updateCounter();
     syncStale();
+    if (!ev.persisted) return;
+    if (state.running) {
+      // The request did not survive the cache; if it fails, the message says so.
+      if (state.runCtx) state.runCtx.hidden = true;
+      state.payerCheckDue = true;
+      return;
+    }
+    reconcilePayer();
+    refreshHealth({ expire: true });
   });
   el.promptReset.addEventListener("click", () => {
     el.prompt.value = state.defaultPrompt;
@@ -2032,9 +2346,18 @@
   // A key belongs to one provider: changing the choice forgets it, in the field and in
   // session storage, before anything else happens.
   el.provider.addEventListener("change", () => {
+    if (state.running) {
+      // Not reachable through the disabled control; kept so that nothing else can
+      // change who pays for a run that is under way.
+      el.provider.value = state.runCtx && state.runCtx.provider ? state.runCtx.provider.id : "site";
+      return;
+    }
     forgetKey();
     rememberPayer(el.provider.value);
     applyProvider();
+    // A message about the other payer (a used-up free limit, a busy model) is not left
+    // standing over the new choice.
+    hideError();
     releaseRuns(); // the visitor has chosen who pays
   });
   el.payerSite.addEventListener("click", () => {
@@ -2050,6 +2373,7 @@
     rememberKey();
   });
   el.forgetKey.addEventListener("click", () => {
+    if (state.running) return;
     forgetKey();
     clearKeyError();
     el.ownKey.focus();
@@ -2073,6 +2397,8 @@
   fillTopK(DEFAULT_LIMITS.top_k_max);
   el.topK.value = "5";
   updateCounter();
+  // Every handler is installed: Run, disabled in index.html, can be enabled.
+  syncRun();
   loadHealth();
   loadExampleResult();
 })();

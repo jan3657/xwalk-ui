@@ -46,11 +46,14 @@
 
     <div id="banner" class="banner" hidden></div>
 
+    <!-- No field of this form has a name, and Run is disabled until app.js has installed
+         its handler: if the script is slow or never loads, the browser has nothing to
+         submit and no text can end up in a URL. The CSP also sets form-action 'none'. -->
     <form id="ner-form" class="composer" novalidate>
       <div class="composer-text">
         <label for="text" class="visually-hidden">Biomedical text</label>
-        <textarea id="text" name="text" rows="5" spellcheck="false" enterkeyhint="enter" autocapitalize="sentences"
-          aria-describedby="text-help text-counter"
+        <textarea id="text" rows="5" spellcheck="false" enterkeyhint="enter" autocapitalize="sentences"
+          aria-describedby="text-error text-help text-counter"
           placeholder="Paste a sentence or a paragraph of biomedical text"></textarea>
         <p id="text-error" class="field-error" role="alert" hidden></p>
         <div class="text-tools">
@@ -62,12 +65,13 @@
 
       <div class="composer-foot">
         <div class="run-row">
-          <button type="submit" id="run" class="primary run" aria-busy="false" aria-describedby="allowance">
+          <button type="submit" id="run" class="primary run" aria-busy="false" aria-describedby="run-payer allowance" disabled>
             <span class="spinner" aria-hidden="true"></span><span class="run-label">Map this text</span>
             <kbd class="run-kbd" aria-hidden="true"><span id="shortcut-key">Ctrl</span> &crarr;</kbd>
           </button>
           <p class="hint run-hint">
-            <span id="run-hint">Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider and not saved by this site.</span>
+            <span id="run-hint">Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider.</span>
+            <span id="run-payer" class="visually-hidden">Runs on this site's models, free.</span>
             <span id="text-help" class="visually-hidden">Up to 5,000 characters and 25 mentions per run.</span>
           </p>
         </div>
@@ -87,7 +91,7 @@
 
         <div class="field" id="passcode-field" hidden>
           <label for="passcode">Passcode</label>
-          <input id="passcode" name="passcode" type="password" autocomplete="current-password">
+          <input id="passcode" type="password" autocomplete="current-password">
         </div>
 
         <details id="options" class="options">
@@ -114,25 +118,25 @@
             <div class="field" id="model-field" hidden>
               <label for="model">Model that reads the text</label>
               <span class="hint" id="model-hint">Finds the chemicals, diseases and foods in your text.</span>
-              <select id="model" name="model" aria-describedby="model-hint"></select>
+              <select id="model" aria-describedby="model-hint"></select>
             </div>
             <div class="field" id="selector-field" hidden>
               <label for="selector">How the final term is chosen</label>
               <span class="hint" id="selector-hint">The search returns several candidate terms per mention. A model reads them and picks one, or you can take the top search result as it is.</span>
-              <select id="selector" name="selector" aria-describedby="selector-hint selector-own"></select>
+              <select id="selector" aria-describedby="selector-hint selector-own"></select>
               <span class="hint" id="selector-own" hidden>With your own key the top search result is used unless you choose a model here.</span>
             </div>
             <div class="field narrow">
               <label for="top-k">Candidates listed per mention</label>
               <span class="hint" id="top-k-hint">How many search results to show under each mention.</span>
-              <select id="top-k" name="top_k" aria-describedby="top-k-hint"></select>
+              <select id="top-k" aria-describedby="top-k-hint"></select>
             </div>
 
             <details class="prompt-editor" id="prompt-editor">
               <summary>Instructions given to the model</summary>
               <div class="field">
                 <label for="prompt" class="visually-hidden">Instructions given to the model</label>
-                <textarea id="prompt" name="prompt" rows="6" aria-describedby="prompt-hint"></textarea>
+                <textarea id="prompt" rows="6" aria-describedby="prompt-hint"></textarea>
                 <p id="prompt-error" class="field-error" role="alert" hidden></p>
                 <span id="prompt-hint" class="hint">This is the text the model is given before yours. Change it to look for other kinds of mention or to set stricter rules. Your edit is used for your runs in this tab only. Up to 4,000 characters.</span>
                 <div class="button-row">
@@ -152,7 +156,7 @@
       <ol class="pipe-steps" aria-label="How a run works">
         <li data-step="find"><b>Find</b><span class="pipe-desc" id="pipe-find">The language model reads your text and marks every chemical, disease and food.</span></li>
         <li data-step="search"><b>Search</b><span class="pipe-desc" id="pipe-search">xwalk looks each one up in the full ontology with keyword search (BM25) and embedding search, and merges the two rankings into a shortlist.</span></li>
-        <li data-step="decide"><b>Decide</b><span class="pipe-desc" id="pipe-decide">The model picks the best term from the shortlist, or says none fits, and gives a confidence and a reason.</span></li>
+        <li data-step="decide"><b>Decide</b><span class="pipe-desc" id="pipe-decide">A term is chosen for each mention from its shortlist.</span></li>
       </ol>
       <div id="progress" class="pipe-run" hidden>
         <div class="progress-bar" aria-hidden="true"><span></span></div>
@@ -224,7 +228,7 @@
            the recorded example included; app.js writes the exact term count. -->
       <aside id="next" class="next" aria-labelledby="next-title" hidden>
         <h2 id="next-title">That lookup is xwalk</h2>
-        <p id="next-body">The model never writes an ID. xwalk searched more than 260,000 ontology terms by keyword and by meaning, and the model chose among real candidates. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.</p>
+        <p id="next-body">The model never writes an ID. xwalk looked up each mention by keyword and by meaning, and the model chose among real candidates. The catalog holds more than 260,000 terms. xwalk is an open-source Python library; you can run the same lookup on your own vocabulary.</p>
         <div class="button-row">
           <a id="next-github" class="button-link" href="https://github.com/jan3657/xwalk?utm_source=xwalk.si" target="_blank" rel="noopener">xwalk on GitHub</a>
           <button type="button" id="next-try" class="secondary">Try your own text</button>
@@ -235,10 +239,10 @@
     <footer class="footer" id="privacy">
       <h2 class="footer-title">How this site handles data</h2>
       <ul>
-        <li>Your text is sent to the model provider for extraction and term choice: Anthropic by default, OpenRouter if the run falls back or you choose it.</li>
-        <li>The extracted mentions are sent to OpenRouter to compute search embeddings.</li>
-        <li>This site stores no text, prompt or result. Each run is counted (time, model, token counts, country) without the text.</li>
-        <li>Requests are limited per network, using a salted hash of the IP address that is kept for one day.</li>
+        <li>Your text is sent to the model provider to find the mentions and choose the terms: Anthropic by default; OpenRouter, and the model host it routes to, if the run falls back or you choose it; the provider of your own key if you use one.</li>
+        <li>The mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory for a while so it does not compute them twice.</li>
+        <li>This site writes no text, prompt or result to its logs or its database. Each run is recorded as a row of counts: time, model, status, text length, mention and token counts, timings, country, and a visitor hash that changes every day.</li>
+        <li>Runs are limited per network, using a salted hash of the IP address. Entries older than a day are deleted by a clean-up that runs from time to time.</li>
         <li>Visits are counted without cookies.</li>
         <li>If you use your own API key, it stays in this browser tab's session storage and is sent only with your runs.</li>
       </ul>
