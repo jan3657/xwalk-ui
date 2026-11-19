@@ -1913,8 +1913,8 @@ the passcode kept, so only passcode holders can use an own key.
   arrive. Checked with a run slowed to 3.5 s on the local offline server in Chrome at
   390 px and 1280 px: the block shows and hides, no horizontal scroll. Not checked in
   LinkedIn's in-app browser or in Safari.
-- Link-preview tags and `public/og.png` (1200 by 627, drawn by hand, its three term
-  IDs typed in, not taken from a run).
+- Link-preview tags and `public/og.png` (1200 by 627, drawn by hand; its sentence and three
+  term IDs are from a run on production that day).
 - Production: `NER_SITE_OWN_PROVIDERS=anthropic,openrouter` (OpenAI direct stays off
   until one run with a real key has passed step 4), and `NER_SITE_PASSCODE` removed
   at the operator's request, without the measurements of rollout steps 5 to 8.
