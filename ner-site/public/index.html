@@ -6,12 +6,12 @@
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
   <title>xwalk: biomedical text to ontology IDs</title>
-  <meta name="description" content="Paste biomedical text. A language model finds the chemicals, diseases and foods, and xwalk maps each one to its term in ChEBI, MeSH or FoodOn.">
+  <meta name="description" content="Paste biomedical text. Claude finds the chemicals, diseases and foods in it, and xwalk links each one to a real term in ChEBI, MeSH or FoodOn.">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="xwalk">
   <meta property="og:url" content="https://www.xwalk.si/">
-  <meta property="og:title" content="xwalk: from text to ontology terms">
-  <meta property="og:description" content="Paste biomedical text. A language model finds the chemicals, diseases and foods, and xwalk maps each one to its term in ChEBI, MeSH or FoodOn.">
+  <meta property="og:title" content="xwalk: turn biomedical text into ontology IDs">
+  <meta property="og:description" content="Paste biomedical text. Claude finds the chemicals, diseases and foods in it, and xwalk links each one to a real term in ChEBI, MeSH or FoodOn.">
   <meta property="og:image" content="https://www.xwalk.si/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="627">
@@ -49,7 +49,7 @@
     <form id="ner-form" class="composer" novalidate>
       <div class="composer-text">
         <label for="text" class="visually-hidden">Biomedical text</label>
-        <textarea id="text" name="text" rows="7" spellcheck="false" enterkeyhint="enter" autocapitalize="sentences"
+        <textarea id="text" name="text" rows="5" spellcheck="false" enterkeyhint="enter" autocapitalize="sentences"
           aria-describedby="text-help text-counter"
           placeholder="Paste a sentence or a paragraph of biomedical text"></textarea>
         <p id="text-error" class="field-error" role="alert" hidden></p>
@@ -68,7 +68,7 @@
           </button>
           <p class="hint run-hint">
             <span id="run-hint">Free, no sign-up, usually 10 to 30 seconds. Use public or de-identified text: it is sent to the model provider and not saved by this site.</span>
-            <span id="text-help">Up to 5,000 characters and 25 mentions per run.</span>
+            <span id="text-help" class="visually-hidden">Up to 5,000 characters and 25 mentions per run.</span>
           </p>
         </div>
 
