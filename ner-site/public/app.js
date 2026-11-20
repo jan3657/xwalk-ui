@@ -172,7 +172,7 @@
     // never the visitor's own run; `pressed` once the visitor pressed "Map this text" on
     // it and was shown the recorded result in place of a run (showRecorded).
     shown: null,
-    // example.json once it has loaded: { text, recorded, data, ontologies }.
+    // example.json once it has loaded: { text, recorded, data, ontologies, request }.
     example: null,
     touched: false, // the visitor typed, or used Example or Clear
     prefilled: false, // the text box holds the example because this page put it there
@@ -258,20 +258,12 @@
     return /^https?:\/\//i.test(url) ? url : null;
   }
 
-  // How long ago a cached answer was made: " (4 minutes ago)", or "" when not told.
-  function agoText(seconds) {
-    if (typeof seconds !== "number" || !(seconds >= 0)) return "";
-    if (seconds < 60) return " (less than a minute ago)";
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return ` (${minutes} minute${minutes === 1 ? "" : "s"} ago)`;
-    const hours = Math.floor(minutes / 60);
-    return ` (${hours} hour${hours === 1 ? "" : "s"} ago)`;
-  }
-
-  // What the server's caches did for a response: its `cache` object, or null from a
-  // server that has none (or the recorded example, which predates them).
-  function cacheOf(data) {
-    return data && data.cache && typeof data.cache === "object" ? data.cache : null;
+  // Whether the server answered from its memory of a recent identical run: the
+  // response's `cache` object says so and nothing more (not how old the answer is, nor
+  // what the run that made it took). A server without caches, and the recorded example,
+  // have no such object.
+  function cachedAnswer(data) {
+    return Boolean(data && data.cache && typeof data.cache === "object" && data.cache.response === "hit");
   }
 
   function fmtSeconds(ms) {
@@ -1536,7 +1528,12 @@
     if (!data || typeof data !== "object" || !Array.isArray(data.entities) || !data.entities.length) return;
     if (typeof file.text !== "string" || !file.text || !recorded) return;
     const ontologies = (Array.isArray(file.ontologies) ? file.ontologies : []).filter((o) => o && typeof o.slug === "string" && typeof o.name === "string");
-    state.example = { text: file.text, recorded, data, ontologies };
+    // What was asked for when it was recorded: the prompt in effect, the number of
+    // candidates and the deployment's entity limit. Without them the recording is still
+    // shown on arrival, but never in place of a run (exampleAsked).
+    const asked = file.request && typeof file.request === "object" ? file.request : null;
+    const request = asked && typeof asked.prompt === "string" && asked.prompt && Number.isInteger(asked.top_k) && Number.isInteger(asked.max_entities) ? { prompt: asked.prompt, top_k: asked.top_k, max_entities: asked.max_entities } : null;
+    state.example = { text: file.text, recorded, data, ontologies, request };
     showExampleResult();
   }
 
@@ -1959,7 +1956,9 @@
       el.ranOn.append("Extracted by the offline stand-in.");
     } else if (typeof data.model === "string" && data.model) {
       el.ranOn.append("Extracted by ", h("strong", { text: modelName(data.model) }));
-      if (data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site") {
+      // An answer from the server's memory was made on the site's keys, in another
+      // run: it is never put down to the visitor's key, whatever the response says.
+      if (!cachedAnswer(data) && data.credential_source === "visitor" && typeof data.provider === "string" && data.provider && data.provider !== "site") {
         el.ranOn.append(` on your ${providerName(data.provider)} key`);
       }
       el.ranOn.append(".");
@@ -2019,25 +2018,8 @@
     };
     const timed = timingText(data.timing_ms || {});
     if (timed) row("Timing", timed);
-    // What the server reused from its memory of recent runs. A whole answer reused is
-    // also said in the status line; mentions and picks reused inside a run only here.
-    const cache = cacheOf(data);
-    const count = (v) => (typeof v === "number" && v > 0 ? v : 0);
-    if (cache && cache.response === "hit") {
-      row("Cache", `the whole answer was reused from a recent identical run${agoText(cache.age_s)}; no model call and no search for this request`);
-      const original = cache.original && typeof cache.original === "object" ? cache.original : {};
-      const was = [];
-      const before = timingText(original.timing_ms && typeof original.timing_ms === "object" ? original.timing_ms : {});
-      if (before) was.push(before);
-      const used = original.usage && typeof original.usage === "object" ? original.usage : {};
-      if (typeof used.llm_calls === "number") was.push(`${plural(used.llm_calls, "model call")} for extraction` + (count(used.selector_calls) ? `, ${used.selector_calls} for picking` : ""));
-      if (was.length) row("That run", was.join("; "));
-    } else if (cache) {
-      const reused = [];
-      if (count(cache.retrieval_hits)) reused.push(`search results reused for ${plural(cache.retrieval_hits, "mention")}`);
-      if (count(cache.pick_hits)) reused.push(`${plural(cache.pick_hits, "pick")} reused`);
-      row("Cache", reused.length ? `${reused.join(", ")} (from recent runs, at no model cost)` : "nothing reused from recent runs");
-    }
+    // A whole answer reused from the server's memory: also said in the status line.
+    if (cachedAnswer(data)) row("Cache", "the whole answer was reused from a recent identical run; no model call and no search for this request");
     el.runDetails.hidden = !el.ranOn.firstChild && !el.runDetailsList.firstChild;
   }
 
@@ -2258,9 +2240,8 @@
     }
     // An answer the server already had: said plainly, in place of a time that would
     // read as a very fast model.
-    const cache = cacheOf(data);
-    const cached = !example && Boolean(cache) && cache.response === "hit";
-    if (cached) done = `Answered from a recent identical run${agoText(cache.age_s)}. No model was called.`;
+    const cached = !example && cachedAnswer(data);
+    if (cached) done = "Answered from a recent identical run. No model was called.";
     // After a run the page names the models that answered, which need not be the ones
     // the intro names or the ones that were asked for. "Done in 8.8 s" on the example
     // would read as the visitor's own wait.
@@ -2993,13 +2974,21 @@
     const health = state.health;
     if (!example || !health || exampleFits() !== true) return false;
     if (el.text.value !== example.text || currentProvider()) return false;
+    // The recording answers for the settings it was made with, not for today's: the
+    // prompt this deployment would use now must be the one it was recorded with, and
+    // the entity limit the same (a deployment that now keeps one mention would not
+    // return eighteen).
+    const asked = example.request;
+    if (!asked || state.defaultPrompt !== asked.prompt) return false;
+    if (state.limits.max_entities !== asked.max_entities) return false;
     const prompt = el.prompt.value;
-    if (prompt.trim() && prompt !== state.defaultPrompt) return false;
+    if (prompt.trim() && prompt !== asked.prompt) return false;
     if ((el.model.value || health.default_model) !== health.default_model) return false;
     const selector = el.selectorField.hidden ? health.default_selector : el.selector.value || health.default_selector;
     if (selector !== health.default_selector) return false;
-    if ((Number(el.topK.value) || 5) !== 5) return false;
+    if ((Number(el.topK.value) || 5) !== asked.top_k) return false;
     const data = example.data;
+    if (data.entities.length > asked.max_entities) return false;
     if (data.requested_model && data.requested_model !== health.default_model) return false;
     if (data.requested_selector && data.requested_selector !== health.default_selector) return false;
     return true;
@@ -3029,14 +3018,6 @@
       return;
     }
     hideError();
-    // The untouched example is answered by its recorded result. Not when the visitor
-    // asked for a live run, and not when a live run of this very text is already what
-    // is on display: pressing the button again then means "run it again".
-    const ownRun = state.shown && !state.shown.example && state.shown.text === el.text.value;
-    if (!(opts && opts.live) && !ownRun && exampleAsked()) {
-      showRecorded();
-      return;
-    }
     const text = el.text.value;
     const n = codePointLength(text);
     if (!text.trim() || n > state.limits.max_chars) {
@@ -3058,6 +3039,15 @@
       return;
     }
     showPromptError("");
+    // The untouched example is answered by its recorded result, once the form has
+    // passed the checks a run would have to pass. Not when the visitor asked for a
+    // live run, and not when a live run of this very text is already what is on
+    // display: pressing the button again then means "run it again".
+    const ownRun = state.shown && !state.shown.example && state.shown.text === el.text.value;
+    if (!(opts && opts.live) && !ownRun && exampleAsked()) {
+      showRecorded();
+      return;
+    }
     const provider = currentProvider();
     clearKeyError();
     if (provider) {
@@ -3103,6 +3093,9 @@
     };
     state.runCtx = ctx;
     state.ran = true;
+    // A request is about to be sent: "nothing was sent" is no longer true of the
+    // recorded result on display, also if this run fails and it stays there.
+    if (state.shown) state.shown.pressed = false;
     // The text is the visitor's submission from here on, also when it is the example
     // this page put in the box: a later health answer may take the recorded example
     // away, but not the text that is being mapped.

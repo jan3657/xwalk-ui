@@ -62,9 +62,50 @@ def test_example_is_dated_and_names_its_ontologies(example: dict[str, Any]) -> N
 
 def test_example_holds_only_the_expected_fields(example: dict[str, Any]) -> None:
     # A public file: a recording pasted in with anything else (headers, a key) fails.
-    assert set(example) == {"text", "recorded", "ontologies", "response"}
+    assert set(example) == {"text", "recorded", "request", "ontologies", "response"}
     raw = (PUBLIC / "example.json").read_text(encoding="utf-8")
     assert not re.search(r"sk-[A-Za-z0-9_-]{8,}|authorization|bearer|passcode", raw, re.IGNORECASE)
+
+
+def test_example_records_the_request_it_answers(example: dict[str, Any]) -> None:
+    """The page shows the recording in place of a run only on a deployment whose
+    default prompt and entity limit are the ones in ``request``. They are what a
+    full-catalog deployment with the default limits uses: when the default prompt or
+    the default limit changes, this fails, and the example must be recorded again (or
+    the page would silently stop using it)."""
+    from ner_site.service import Settings
+
+    asked = example["request"]
+    assert set(asked) == {"prompt", "top_k", "max_entities"}
+    full = Settings(backend="neon", catalog="full")
+    assert asked["prompt"] == full.default_prompt
+    assert asked["max_entities"] == full.limits.max_entities
+    assert asked["top_k"] == 5
+    response = example["response"]
+    assert len(response["entities"]) <= asked["max_entities"]
+    assert all(len(e["matches"]) <= asked["top_k"] for e in response["entities"])
+
+
+def test_the_page_checks_the_form_and_the_recorded_settings_before_the_shortcut() -> None:
+    """Held here by reading app.js; tools/page_smoke.mjs ("example-settings",
+    "example-live") holds the behaviour in a browser."""
+    source = (PUBLIC / "app.js").read_text(encoding="utf-8")
+    run = source[source.index("  async function run(opts) {") :]
+    shortcut = run.index("exampleAsked()")
+    # The checks a run must pass come first, the shortcut after them.
+    assert run.index("state.limits.max_chars") < shortcut
+    assert run.index("state.limits.max_prompt_chars") < shortcut
+    # A live POST clears "nothing was sent" before it is sent.
+    assert run.index("state.shown.pressed = false") < run.index('api("POST", "/api/ner"')
+    asked = source[
+        source.index("  function exampleAsked() {") : source.index("  function showRecorded()")
+    ]
+    assert "state.defaultPrompt !== asked.prompt" in asked
+    assert "state.limits.max_entities !== asked.max_entities" in asked
+    # No age and no figures of another run are read from the response.
+    for gone in ("age_s", "cache.original", "retrieval_hits", "pick_hits"):
+        assert gone not in source, gone
+    assert "Answered from a recent identical run. No model was called." in source
 
 
 # ---------- the form without its script ----------
@@ -127,8 +168,9 @@ def test_the_footer_states_its_conditions() -> None:
     assert (
         "<li>When embedding search is used, the mentions found in your text are sent to OpenRouter "
         "to compute search embeddings. The server may keep recent mentions, search results and "
-        "answers in memory for a few hours so that it does not compute them twice; none of that "
-        "is written to its database.</li>"
+        "answers in memory so that it does not compute them twice: normally for a few hours, and "
+        "at most until the server instance is recycled. None of that is written to its database, "
+        "and an answer served from memory sends no text to a model provider.</li>"
     ) in text
     assert "<li>When run recording is enabled, this site attempts to save" in text
     assert "<li>Runs on this site's own models are limited per network" in text

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import re
 import threading
 import time
@@ -320,6 +321,9 @@ class IndexView:
     neon_schema: str = NEON_SCHEMA
     neon_dimensions: int = NEON_DIMENSIONS
     catalog: Catalog = "samples"
+    # Offline mode: no embedding is requested, so dense retrieval is not attempted
+    # (``indexes.OntologyIndex.dense_off``).
+    dense_off: bool = False
 
 
 @dataclass(frozen=True)
@@ -612,28 +616,35 @@ class Settings:
         return self.offline or self.api_key is not None or self.anthropic_api_key is not None
 
     @property
-    def cache_scope(self) -> tuple[Any, ...]:
+    def cache_scope(self) -> str:
         """What tells this deployment's answers from another's in the same process, for
         ``cache.caches_for``: two settings that differ in any of these never share a
-        cached value. The database is named by a digest, and no key or passcode is
-        here at all (only whether each key is set)."""
-        database = self.database_url or ""
-        return (
+        cached value. One SHA-256 digest of them all, so that nothing of the
+        configuration is held as it is: not the base URL (which may carry user
+        information or a query), not the database URL, not a path. The operator's
+        keys are part of what is digested, so another key (another account) is another
+        scope. The passcodes and the visitor salt are not: they do not change an
+        answer, and a short passcode could be guessed from a digest."""
+        parts = [
             self.mode,
             self.base_url,
+            list(self.models),
+            list(self.selectors),
             self.backend,
             self.catalog,
             self.neon_schema,
             self.neon_dimensions,
             str(self.dense_dir),
             str(self.cache_dir),
-            self.limits,
+            asdict(self.limits),
             self.claude_effort,
             self.fallback_model,
-            hashlib.sha256(database.encode("utf-8")).hexdigest() if database else "",
-            self.api_key is not None,
-            self.anthropic_api_key is not None,
-        )
+            self.database_url or "",
+            self.api_key or "",
+            self.anthropic_api_key or "",
+        ]
+        document = json.dumps(parts, ensure_ascii=False, separators=(",", ":"), default=str)
+        return hashlib.sha256(document.encode("utf-8", "surrogatepass")).hexdigest()
 
     @property
     def claude_offered(self) -> bool:
@@ -652,7 +663,16 @@ class Settings:
             neon_schema=self.neon_schema,
             neon_dimensions=self.neon_dimensions,
             catalog=self.catalog,
+            dense_off=self.offline,
         )
+
+    def unstorable(self, extra_secrets: Sequence[str] = ()) -> tuple[str, ...]:
+        """What must not occur in anything the in-memory caches keep: every scrubbed
+        secret, the passcodes whatever their length (a short one is not scrubbed from
+        a response, see :meth:`secrets`, so a result that holds it is simply not
+        stored), and `extra_secrets` (a visitor's key)."""
+        values = (*extra_secrets, self.passcode, self.stats_passcode, *self.secrets())
+        return tuple(dict.fromkeys(v for v in values if v))
 
     def secrets(self) -> tuple[str, ...]:
         """Values scrubbed from every response and log line as a last line of defence
@@ -1307,12 +1327,19 @@ async def run(
     allowance_window: str = "hour",
     claude_blocked: str | None = None,
     caches: Caches | None = None,
+    reused: dict[str, int] | None = None,
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
 
-    With ``caches`` (``ner_site.cache``) the mapping and the selection reuse what this
-    instance has already retrieved and picked, and the response says how often
-    (``cache``); the whole-response cache is the handler's (``ner_site.http``).
+    With ``caches`` (``ner_site.cache``) the mapping reuses what this instance has
+    already retrieved and, for a request the site pays for, the selection reuses what
+    it has already picked; a request on a visitor's own key neither reads nor writes a
+    pick. How often is counted into ``reused`` (``retrieval_hits``, ``pick_hits``) for
+    the log line, never into the response; ``reused["scrubbed"]`` counts what held a
+    secret before it was scrubbed (such a response is not kept). The response's
+    ``cache`` says only that this was a run (``miss``, or ``off`` when the response
+    cache was not used for it). The whole-response cache is the handler's
+    (``ner_site.http``).
 
     The selection step runs when the request's selector is not ``retrieval``: Jev with
     ``decider``, any other selector with ``select_llm`` (``ner_site.http`` builds them
@@ -1403,6 +1430,20 @@ async def run(
         raise failure
     extracted = time.monotonic()
 
+    unstorable = settings.unstorable(extra_secrets)
+
+    def sensitive(text: str) -> bool:
+        return any(secret in text for secret in unstorable)
+
+    # Whether anything this run was told held a secret, seen before it was scrubbed:
+    # the response is then served scrubbed and not kept (``reused["scrubbed"]``).
+    held: list[str] = []
+
+    def tidy(note: str) -> str:
+        if sensitive(note):
+            held.append("note")
+        return _clean(note, settings, extra_secrets)
+
     stats = MapStats()
     began = started if started_at is None else min(started_at, started)
     budget = max(MIN_MAP_BUDGET_S, REQUEST_DEADLINE_S - (extracted - began))
@@ -1413,9 +1454,10 @@ async def run(
         timeout=min(MAP_RETRIEVER_TIMEOUT_S, budget),
         deadline=budget,
         stats=stats,
-        clean=lambda note: _clean(note, settings, extra_secrets),
+        clean=tidy,
         routes=settings.routes,
         cache=None if caches is None else caches.retrieval,
+        sensitive=sensitive,
     )
     mapped = time.monotonic()
 
@@ -1456,17 +1498,22 @@ async def run(
             llm=select_llm,
             own_key=own,
             deadline=max(MIN_SELECT_BUDGET_S, REQUEST_DEADLINE_S - (mapped - began)),
-            cache=None if caches is None else caches.picks,
-            payer=req.provider or providers.SITE,
-            clean=lambda note: _clean(note, settings, extra_secrets),
+            # Picks are a model's answers on somebody's account: shared only between
+            # requests the site pays for.
+            cache=None if caches is None or own else caches.picks,
+            clean=tidy,
+            # Asked when a pick is about to be stored: the run is still on the models
+            # it asked for (nothing decided at admission, no step-down so far).
+            storable=lambda: (
+                not departures
+                and not any(c is not None and c.fallbacks for c in (chain, select_chain))
+            ),
+            degraded=stats.degraded,
+            sensitive=sensitive,
         )
         results = [
             r.model_copy(
-                update={
-                    "pick": r.pick.model_copy(
-                        update={"explanation": _clean(r.pick.explanation, settings, extra_secrets)}
-                    )
-                }
+                update={"pick": r.pick.model_copy(update={"explanation": tidy(r.pick.explanation)})}
             )
             if r.pick is not None
             else r
@@ -1503,6 +1550,14 @@ async def run(
     if picked is not None:
         timing["select"] = _ms(selected - mapped)
     timing["total"] = _ms(selected - started)
+    if reused is not None:
+        if any(sensitive(note) for note in notes):
+            held.append("warning")
+        reused.update(
+            retrieval_hits=stats.cache_hits,
+            pick_hits=0 if picked is None else picked.cache_hits,
+            scrubbed=len(held),
+        )
     answered_by = None if own else getattr(reader, "answered_by", None)
     return NerResponse(
         model=answered_by or req.model,
@@ -1532,41 +1587,71 @@ async def run(
         ),
         cache=None
         if caches is None
-        else CacheInfo(
-            response="miss" if caches.responses.enabled else "off",
-            retrieval_hits=stats.cache_hits,
-            pick_hits=0 if picked is None else picked.cache_hits,
-        ),
+        else CacheInfo(response="miss" if caches.responses.enabled and not own else "off"),
     )
 
 
-def cacheable(data: Mapping[str, Any], *, offline: bool = False) -> bool:
-    """Whether a 200 response (as JSON data) may be kept in the response cache: only
-    when a fresh identical run would be allowed to return the same thing. So never
-    with a step-down or a notice, a warning, a pick that failed, a retriever that was
-    not ``ok``, or a routed entity that carries a note (a search that failed, timed
-    out or was cut off).
+def cacheable(
+    response: NerResponse,
+    indexes: Mapping[str, OntologyIndex],
+    *,
+    settings: Settings,
+    extra_secrets: Sequence[str] = (),
+) -> bool:
+    """Whether a run's response may be kept in the response cache: only when a fresh
+    identical run would be allowed to return the same thing. Judged on the response as
+    the run made it, before redaction (which rewrites strings and dictionary keys and
+    could hide a field from this check).
 
-    One exception, for the offline stand-in only: it never has dense retrieval (it
-    requests no embeddings, by design), says so in every response with one fixed
-    warning, and would say the same again. That status and that warning do not keep an
-    offline response out; anything else does there too."""
-    if data.get("ok") is not True or data.get("fallbacks") or data.get("notices"):
+    Never: a request on a visitor's own key; a step-down or a notice; a warning; a
+    pick that failed; a retriever that was not ``ok``; a routed entity that carries a
+    note (a search that failed, timed out or was cut off); an unrouted entity with any
+    note but the one for type ``other``; a response in which a secret, the passcode
+    (of any length) or the visitor's key occurs.
+
+    One exception, for the offline stand-in only, and only in its explicit form:
+    every index says that dense retrieval was switched off by the mode
+    (``OntologyIndex.dense_off``, set where offline settings open the indexes) and is
+    otherwise whole. Dense retrieval is then ``unavailable`` in the response and its
+    one fixed warning is there, by design, and a fresh run would say the same. A dense
+    index that is unavailable for any other reason keeps a response out, offline too."""
+    if response.credential_source != "site" or response.provider != providers.SITE:
         return False
-    allowed = {_unavailable_note("dense")} if offline else set()
-    if any(warning not in allowed for warning in data.get("warnings") or ()):
+    if response.fallbacks or response.notices:
         return False
-    for kind, status in (data.get("retrieval") or {}).items():
-        if status.get("status") != "ok" and not (offline and kind == "dense"):
+    dense_off = bool(indexes) and all(i.dense_off and i.whole for i in indexes.values())
+    allowed = {_unavailable_note("dense")} if dense_off else set()
+    if any(warning not in allowed for warning in response.warnings):
+        return False
+    for kind, status in response.retrieval.items():
+        if status.status != "ok" and not (dense_off and kind == "dense"):
             return False
-    for entity in data.get("entities") or ():
-        pick = entity.get("pick")
-        if pick is not None and pick.get("status") == "failed":
+    for entity in response.entities:
+        if entity.pick is not None and entity.pick.status == "failed":
             return False
-        notes = entity.get("notes") or []
-        if entity.get("ontology") is not None and notes:
+        if entity.ontology is not None and entity.notes:
             return False
-        if entity.get("ontology") is None and notes != [OTHER_NOTE]:
+        if entity.ontology is None and entity.notes != [OTHER_NOTE]:
+            return False
+    unstorable = settings.unstorable(extra_secrets)
+    if unstorable:
+        # Every string of the response, keys included, unescaped.
+        strings: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, str):
+                strings.append(value)
+            elif isinstance(value, dict):
+                for name, inner in value.items():
+                    walk(name)
+                    walk(inner)
+            elif isinstance(value, list):
+                for inner in value:
+                    walk(inner)
+
+        walk(response.model_dump(mode="json"))
+        text = "\n".join(strings)
+        if any(secret in text for secret in unstorable):
             return False
     return True
 

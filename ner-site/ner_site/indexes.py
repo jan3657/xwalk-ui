@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -86,13 +87,21 @@ class PrefetchEncoder:
     is served from memory. One request of 25 queries took 3 to 10 s through OpenRouter on
     4 November 2026, where 25 single requests, 4 at a time, took 52 to 67 s. Name,
     dimension and settings are the wrapped encoder's, so index identities are unchanged.
-    Thread-safe; keeps at most ``MAX_CACHED`` query vectors."""
+    Thread-safe; keeps at most ``MAX_CACHED`` query vectors, none for longer than
+    ``TTL_S`` seconds (the default time limit of ``ner_site.cache``): a vector that old
+    is not used, and every write removes the ones that have expired, so a mention does
+    not stay in memory because nobody searched for it again. ``clock`` is a parameter
+    so that tests can move the time."""
 
     MAX_CACHED = 4096
+    TTL_S = 6 * 3600.0
 
-    def __init__(self, inner: Encoder) -> None:
+    def __init__(self, inner: Encoder, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._inner = inner
-        self._cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._clock = clock
+        # text -> (stored at, vector), oldest first (a text embedded again moves to the
+        # end), so both the expired and the surplus entries are at the front.
+        self._cache: OrderedDict[str, tuple[float, list[float]]] = OrderedDict()
         self._lock = threading.Lock()
 
     @property
@@ -110,14 +119,34 @@ class PrefetchEncoder:
     def __getattr__(self, attr: str) -> Any:  # settings, usage, ...: the wrapped encoder's
         return getattr(self._inner, attr)
 
+    def _sweep(self, now: float) -> None:
+        """Remove the expired vectors (the lock is held)."""
+        while self._cache:
+            text, (stored_at, _) = next(iter(self._cache.items()))
+            if now - stored_at < self.TTL_S:
+                break
+            del self._cache[text]
+
+    def _found(self, text: str, now: float) -> list[float] | None:
+        """The vector of `text` while it has not expired (the lock is held)."""
+        found = self._cache.get(text)
+        return None if found is None or now - found[0] >= self.TTL_S else found[1]
+
     def cached(self, text: str) -> bool:
+        now = self._clock()
         with self._lock:
-            return text in self._cache
+            return self._found(text, now) is not None
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
 
     def _remember(self, texts: Sequence[str], vectors: Sequence[list[float]]) -> None:
+        now = self._clock()
         with self._lock:
+            self._sweep(now)
             for text, vector in zip(texts, vectors, strict=True):
-                self._cache[text] = list(vector)
+                self._cache[text] = (now, list(vector))
                 self._cache.move_to_end(text)
             while len(self._cache) > self.MAX_CACHED:
                 self._cache.popitem(last=False)
@@ -125,8 +154,9 @@ class PrefetchEncoder:
     def prefetch(self, texts: Sequence[str]) -> int:
         """Embed every query in `texts` not yet in memory, in one call; the number of
         calls made (0 or 1)."""
+        now = self._clock()
         with self._lock:
-            missing = list(dict.fromkeys(t for t in texts if t and t not in self._cache))
+            missing = list(dict.fromkeys(t for t in texts if t and self._found(t, now) is None))
         if not missing:
             return 0
         self._remember(missing, self._inner.encode(missing, is_query=True))
@@ -134,8 +164,9 @@ class PrefetchEncoder:
 
     def encode(self, texts: Sequence[str], *, is_query: bool = False) -> list[list[float]]:
         if is_query:
+            now = self._clock()
             with self._lock:
-                found = [self._cache.get(t) for t in texts]
+                found = [self._found(t, now) for t in texts]
             if all(v is not None for v in found):
                 return [list(v) for v in found if v is not None]
         vectors = self._inner.encode(texts, is_query=is_query)
@@ -152,6 +183,23 @@ class OntologyIndex:
     status: dict[str, RetrieverStatus]  # {"bm25": ..., "dense": ...}
     # The dense retriever's query encoder (shared by every ontology), for batching.
     encoder: PrefetchEncoder | None = None
+    # Dense retrieval was switched off by the mode (offline: no key is spent, no
+    # embedding is requested) and was therefore never attempted, whatever `status`
+    # gives as the reason. Set by `get_indexes` from ``IndexSettings.dense_off``; it
+    # is the one way an index without dense retrieval still counts as whole.
+    dense_off: bool = False
+
+    @property
+    def whole(self) -> bool:
+        """Whether every retriever configured for this ontology is there to answer:
+        BM25 and dense both ``ok``, or BM25 ``ok`` with dense switched off by the mode.
+        Only then may what was retrieved here be kept for another request."""
+        bm25, dense = self.status.get("bm25"), self.status.get("dense")
+        if bm25 is None or bm25.status != "ok":
+            return False
+        if self.dense_off:
+            return not any(r.name == DENSE_NAME for r in self.retrievers)
+        return dense is not None and dense.status == "ok"
 
 
 class IndexSettings(Protocol):
@@ -167,7 +215,8 @@ class IndexSettings(Protocol):
     def api_key(self) -> str | None: ...
 
     # The Neon backend (read with defaults, so a settings object without them is bundled):
-    # backend, database_url, neon_schema, neon_dimensions, catalog.
+    # backend, database_url, neon_schema, neon_dimensions, catalog. And dense_off (read
+    # with False): the mode requests no embeddings, see `OntologyIndex.dense_off`.
 
 
 def _ok() -> RetrieverStatus:
@@ -459,22 +508,34 @@ def get_indexes(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
     if backend == "neon":
         return _get_neon(settings)
     dense_dir = settings.dense_dir
+    dense_off = bool(getattr(settings, "dense_off", False))
     key: tuple[str | int | None, ...] = (
         "bundled",
         str(settings.cache_dir),
         None if dense_dir is None else str(dense_dir),
         settings.api_key,
+        dense_off,
     )
     with _MEMO_LOCK:
         found = _MEMO.get(key)
         if found is None:
-            found = open_indexes(
-                cache_dir=Path(settings.cache_dir),
-                dense_dir=None if dense_dir is None else Path(dense_dir),
-                api_key=settings.api_key,
+            found = _marked(
+                open_indexes(
+                    cache_dir=Path(settings.cache_dir),
+                    dense_dir=None if dense_dir is None else Path(dense_dir),
+                    api_key=settings.api_key,
+                ),
+                dense_off,
             )
             _MEMO[key] = found
         return found
+
+
+def _marked(indexes: Mapping[str, OntologyIndex], dense_off: bool) -> Mapping[str, OntologyIndex]:
+    """`indexes` with ``dense_off`` set on each, when the mode switched dense off."""
+    if not dense_off:
+        return indexes
+    return {slug: replace(index, dense_off=True) for slug, index in indexes.items()}
 
 
 def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
@@ -482,6 +543,7 @@ def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
     schema: str = getattr(settings, "neon_schema", NEON_SCHEMA)
     dimensions: int = getattr(settings, "neon_dimensions", NEON_DIMENSIONS)
     catalog: Catalog = getattr(settings, "catalog", "samples")
+    dense_off = bool(getattr(settings, "dense_off", False))
     key: tuple[str | int | None, ...] = (
         "neon",
         database_url,
@@ -489,6 +551,7 @@ def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
         dimensions,
         catalog,
         settings.api_key,
+        dense_off,
     )
     with _MEMO_LOCK:
         found = _MEMO.get(key)
@@ -505,6 +568,7 @@ def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
                 dimensions=dimensions,
                 catalog=catalog,
             )
+        found = _marked(found, dense_off)
         if not _transient(found):
             _MEMO[key] = found
         return found
