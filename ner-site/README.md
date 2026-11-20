@@ -1211,11 +1211,12 @@ process (tests, a local server whose environment is edited between requests) the
 of two configurations are apart: they are named by `Settings.cache_scope`, one SHA-256
 digest of the mode, the base URL, the model and selector lists, the backend and catalog
 settings, the directories, the limits, the Claude effort, the fallback model, the
-database URL, both operator keys and both passcodes. Another operator key is another
-account and another scope. Another passcode is another scope too, because what may be
-stored depends on it (nothing in which the passcode occurs is): the new passcode starts
-with empty caches, and the caches of the old one are emptied at that moment
-(`Settings.cache_family` is the scope without the passcodes; `cache.caches_for` clears
+database URL, both operator keys, both passcodes and the visitor salt. Another operator
+key is another account and another scope. Another passcode or visitor salt is another
+scope too, because what may be stored depends on it (nothing in which one of them
+occurs is): the new value starts with empty caches, and the caches of the old one are
+emptied at that moment (`Settings.cache_family` is the scope without the passcodes and
+the salt; `cache.caches_for` clears
 a family's other scopes when a new one is first used), so an answer that the new rule
 forbids does not stay in memory for its time limit.
 
@@ -1229,10 +1230,17 @@ of these holds:
   provider's server-side refusal fallback on any one pick, also when the reader was an
   OpenRouter model and the other picks were Claude's own;
 - a warning, the reader's included (a mention it dropped, a list it cut);
-- an answer of the reader or of the selector that the provider reported as cut off at
-  its token limit (finish reason `length`; Claude's `max_tokens`). Such an answer can
-  still parse, so the visitor is shown what they were shown before (there is no warning
-  for it and none was added); it is simply nobody else's answer;
+- a reply of the reader or of the selector that its provider did not confirm as
+  normally completed. This is an allowlist (`extract.FINISHED_REASONS`): `stop` in the
+  OpenAI-compatible shape, which is what OpenRouter reports, also for a
+  structured-output reply; `end_turn` from the Claude adapter, also for a
+  schema-enforced reply. Everything else keeps the run out: `length` / `max_tokens`,
+  `content_filter`, `error`, `model_context_window_exceeded`, `pause_turn`,
+  `stop_sequence` (the site sends none), a word this code does not know, and no reason
+  at all. Such a reply can still parse, so the visitor is shown what they were shown
+  before (there is no warning for it and none was added); it is simply nobody else's
+  answer. A provider that omits the reason on good replies therefore never has its
+  answers stored;
 - a pick that failed;
 - degraded retrieval: a retriever that was not `ok`, a mention whose search failed,
   timed out or was cut off, a mention whose candidates were not a clean answer;
@@ -1244,11 +1252,14 @@ changed.
 
 One exception, for the offline stand-in only (`NER_SITE_OFFLINE=1`), and only in its
 explicit form. Offline mode does not open or check dense retrieval at all: the index
-directory is not looked at, no encoder is made, and every ontology reports the one
-status `unavailable`, "disabled in offline mode (NER_SITE_OFFLINE=1): no query
-embeddings; BM25 only" (`indexes.dense_disabled`), which is also what `/api/health`
-and every offline response say, whatever the directory or the database holds and
-whether or not a key is set. A fresh run would get the same BM25 candidates and the
+directory is not looked at, no encoder is made, and every ontology whose records could
+be opened reports the one status `unavailable`, "disabled in offline mode
+(NER_SITE_OFFLINE=1): no query embeddings; BM25 only" (`indexes.dense_disabled`),
+which is then also what `/api/health` and every offline response say, whatever the
+dense directory or the vector table holds and whether or not a key is set. The one
+other case: on the Neon backend an ontology whose record store is missing, incomplete
+or unreachable has no retriever at all, and reports that failure as the reason for
+BM25 and for dense alike, offline too; such a response is not stored. A fresh run would get the same BM25 candidates and the
 same one fixed warning again, so an offline response whose only blemish is exactly
 that status and that warning is stored. Any other reason for missing dense retrieval
 keeps a response out, offline as live. It is what lets the cache be tried with
@@ -1262,17 +1273,19 @@ environment already, and it is not covered by the statement that follows.) Every
 is a SHA-256 digest of its parts, and so is the name of a deployment's caches: no key
 holds text, a URL or a path. The values do hold text: a response has the mentions it
 found and the selector's explanations. Not stored is a response in which any of these
-occurs: a configured secret (the operator's keys, the database URL and its password,
-the visitor salt), either passcode whatever its length, the passcode the request sent,
-whatever the request carried in an `Authorization` header (a deployment without own
-keys ignores that header, and it is still the visitor's), and the client address in
-any of the address headers, every entry of `X-Forwarded-For` included. The address is
+occurs: a configured sensitive value whatever its length (the operator's keys, the
+database URL and its password, the visitor salt, either passcode; this veto is apart
+from display redaction, which still leaves a value under eight characters alone), the
+passcode the request sent, whatever the request carried in an `Authorization` header
+(a deployment without own keys ignores that header, and it is still the visitor's),
+and the client address in any of the address headers, every entry of every
+`X-Forwarded-For` line included. The address is
 never put into a response by this code; the check is for a visitor whose own text
 holds it. `NER_SITE_BASE_URL` may no longer carry user information or a query string
 (a settings error, 503 `not_configured`): either can hold a credential, and the base
-URL is not treated as a secret. (A passcode under eight characters is not scrubbed
-from responses; with one like `ok` almost every answer holds it, and then almost
-nothing is cached. Use eight characters or more.) Nothing of a cache is written to the
+URL is not treated as a secret. (A value under eight characters is not scrubbed from
+responses; with a passcode, a salt or a database password like `ok` almost every
+answer holds it, and then almost nothing is cached. Use eight characters or more.) Nothing of a cache is written to the
 database, a file or a log; the log line and the row of a run get counts only. A cached
 value is never changed by a later request: a response is kept as JSON text and parsed
 anew for every hit.
@@ -1298,6 +1311,19 @@ there is no separate limiter for hits or for delivery; that was weighed after th
 review and left as it is (the review's item 11). What bounds the cost of a flood of
 identical requests is the size of a response, the body limit and Vercel's own
 concurrency; the recorder limits its concurrent writes.
+
+**Known limits, left as they are by decision.**
+
+- A refusal of the operator's OpenRouter key that an ordinary request meets (a 401 on
+  a site-paid call) does not hold stored answers back: only the key check of
+  `/api/health` records an OpenRouter refusal, so until a health check has seen it an
+  identical request is still answered from memory while a fresh one fails.
+- A catalog republished in place under a warm instance is not noticed: the instance
+  keeps the fingerprint it opened while its searches read the new rows, so a stored
+  answer can be older than what a fresh run returns. Redeploy after loading a catalog.
+- When the batch embedding of a request fails and the searches then embed their own
+  queries successfully, the run reports one embedding request where two or more were
+  sent, carries no warning, and can be stored.
 
 **No guarantee.** The cache lives in one warm function instance. Another instance has
 its own, a cold start begins empty, and Vercel recycles instances when it likes. Two
@@ -2732,6 +2758,41 @@ Not verified, and not done:
 - No rate limit for hits (item 11), as decided. `example.json`'s `request` is still
   written from the code's defaults, not recorded. No Python 3.10 interpreter was at
   hand. Chrome only.
+
+### The final review of the response cache, 20 November 2026 (same branch, not deployed)
+
+A third review of `5f72c9f..caaca4d` reproduced five things. Two are fixed here, three
+are documented as known limits in "The caches" above (an OpenRouter refusal met by an
+ordinary call; a catalog republished in place under a warm instance; a recovered
+embedding failure), by decision.
+
+- A confirmed finish (its finding 2): storage now needs the provider's normal
+  completion reason from every reply of the reader and of the selector, as an
+  allowlist (`stop`, `end_turn`) in place of the two cut-off reasons. What the adapters
+  hand on was read in the code: the OpenAI-compatible client passes the provider's
+  `finish_reason` through, the Claude adapter passes `stop_reason` through and maps
+  `max_tokens` to `length`; schema-enforced Claude replies end with `end_turn`. Tests:
+  a reading that ends with `length`, `max_tokens`, `content_filter`, `error`,
+  `model_context_window_exceeded`, `pause_turn`, `stop_sequence`, an unknown word or
+  no reason is served unchanged and not stored; a pick likewise for four of them; the
+  real Claude adapter with a scripted SDK reply ending in
+  `model_context_window_exceeded` is not stored and the same reply ending in
+  `end_turn` is; `stop` and `end_turn` on both stages give a hit.
+- Sensitive values (its finding 4): the storage veto uses every configured sensitive
+  value whatever its length, apart from display redaction, whose eight-character
+  threshold is unchanged; the HTTP shim hands on every `X-Forwarded-For` line; the
+  visitor salt is part of the cache scope. Tests: a six-character database password, a
+  six-character salt and a two-character passcode in a mention are served and not
+  stored; an address on a second `X-Forwarded-For` line, through the shim, keeps the
+  response out; a changed salt is another scope whose old entries are emptied.
+- Four deliberate breakages, each run against `tests/test_site_cache.py` and undone:
+  the two-reason denylist again (12 tests fail), the eight-character threshold on the
+  veto (1), the salt left out of the scope (1), the shim's first line only (1).
+- `.venv/bin/python -m pytest -q`: 2135 passed, 35 skipped (2118 before).
+  `.venv/bin/ruff check .`: clean. `node --check` on the four scripts:
+  ok. The page did not change, so the smoke harness was not run again.
+- The offline sentence in "The caches" now names the case the review found: a missing
+  Neon record store is reported as the dense reason too.
 
 ### For the operator after deploying
 

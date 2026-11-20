@@ -1244,7 +1244,7 @@ def _run(settings: Settings, text: str, indexes: Any, caches: Any, **kw: Any) ->
     )
 
 
-CLEAN_RUN = {"scrubbed": 0, "cut_off": 0, "served_elsewhere": 0, "degraded": 0}
+CLEAN_RUN = {"scrubbed": 0, "unfinished": 0, "served_elsewhere": 0, "degraded": 0}
 
 
 def test_a_run_reuses_what_an_earlier_text_shared_with_it(
@@ -2716,9 +2716,22 @@ def test_only_a_definitive_and_unexpired_refusal_keeps_a_hit_back(
 # --- (c) an answer the provider cut off ------------------------------------------------
 
 
-@pytest.mark.parametrize("reason", ["length", "max_tokens"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "length",
+        "max_tokens",
+        "content_filter",
+        "error",
+        "model_context_window_exceeded",
+        "pause_turn",
+        "stop_sequence",
+        "a word nobody has seen yet",
+        None,
+    ],
+)
 def test_a_reading_the_provider_cut_off_is_served_and_not_stored(
-    reason: str, tmp_path: Path, opened: list[int], capsys: pytest.CaptureFixture[str]
+    reason: str | None, tmp_path: Path, opened: list[int], capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The answer parses, so the visitor sees what they saw before (no warning exists
     for it); the list may have stopped early, so it is nobody else's answer."""
@@ -2756,17 +2769,17 @@ def test_the_finish_reason_is_carried_through_both_stages() -> None:
 
     cut = FakeLLM(["{}", "{}"], model="m", finish_reason="length")
     watch = FinishWatch(cut)
-    assert not watch.cut_off and watch.model == "m" and watch.fingerprint == cut.fingerprint
+    assert not watch.unfinished and watch.model == "m" and watch.fingerprint == cut.fingerprint
     asyncio.run(watch.complete(LLMRequest(system="s", user="u")))
-    assert watch.cut_off
+    assert watch.unfinished
     whole = FinishWatch(FakeLLM(["{}"]))
     asyncio.run(whole.complete(LLMRequest(system="s", user="u")))
-    assert not whole.cut_off
+    assert not whole.unfinished
     # The pick stage, on its own: the pick is used and the cache is given nothing.
     cache = Caches(EXPERIMENTAL).picks
     llm = FakeLLM(handler=_choose(), finish_reason="length")
     (result,), stats = _select(LUNA, cache, llm=llm)
-    assert result.pick.status == "match" and stats.cut_off == {"e1"} and len(cache) == 0
+    assert result.pick.status == "match" and stats.unfinished == {"e1"} and len(cache) == 0
     # And the run counts it for the one rule.
     reused: dict[str, int] = {}
     settings = Settings(api_key=SITE_KEY, cache=ON)
@@ -2780,7 +2793,7 @@ def test_the_finish_reason_is_carried_through_both_stages() -> None:
             reused=reused,
         )
     )
-    assert reused["cut_off"] == 1 and response.warnings == []
+    assert reused["unfinished"] == 1 and response.warnings == []
 
 
 # --- (d) one rule: only a wholly clean run is stored ------------------------------------
@@ -2789,7 +2802,7 @@ def test_the_finish_reason_is_carried_through_both_stages() -> None:
 @pytest.mark.parametrize(
     "counted",
     [
-        pytest.param({"cut_off": 1}, id="an answer cut off at the token limit"),
+        pytest.param({"unfinished": 1}, id="a reply its provider did not confirm as finished"),
         pytest.param({"served_elsewhere": 1}, id="a pick another model served"),
         pytest.param({"degraded": 1}, id="candidates that were not a clean answer"),
         pytest.param({"scrubbed": 1}, id="a secret the run scrubbed"),
@@ -2824,7 +2837,7 @@ def test_the_handler_asks_the_one_rule_and_nothing_else(
         assert len(_caches(s).responses) == stored
     response, indexes, kw = seen[0]
     assert isinstance(response, NerResponse) and indexes is http_mod.get_indexes(s)
-    assert kw["settings"] is s and kw["run"]["cut_off"] == 0 and RAW_IP in kw["extra_secrets"]
+    assert kw["settings"] is s and kw["run"]["unfinished"] == 0 and RAW_IP in kw["extra_secrets"]
 
 
 def test_a_reader_warning_keeps_the_whole_run_out(tmp_path: Path, opened: list[int]) -> None:
@@ -3165,3 +3178,191 @@ def test_live_a_missing_dense_index_is_still_checked_and_keeps_answers_out(
     for _ in range(2):
         assert _json(_post(s, {"text": HALO_TEXT}, llm=_reader()))["cache"] == {"response": "miss"}
     assert len(_caches(s).responses) == 0
+
+
+# --- the final review: a confirmed finish, and every sensitive value --------------------
+
+
+@pytest.mark.parametrize("reason", ["stop", "end_turn"])
+def test_a_reply_the_provider_confirmed_as_finished_is_stored(
+    reason: str, tmp_path: Path, opened: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Storage needs the provider's normal completion reason from every reply of the
+    reader and of the selector: ``stop`` (OpenAI-style) or ``end_turn`` (Claude)."""
+    from ner_site.extract import FINISHED_REASONS
+
+    assert frozenset({"stop", "end_turn"}) == FINISHED_REASONS
+    picker = FakeLLM(handler=lambda request: PICK, finish_reason=reason)
+    monkeypatch.setattr(http_mod, "make_select_llm", lambda settings, model: picker)
+    s = _live(tmp_path)
+    body = {"text": HALO_TEXT, "selector": LUNA}
+    llm = FakeLLM(handler=lambda request: HALO, finish_reason=reason)
+    assert _json(_post(s, body, llm=llm))["cache"] == {"response": "miss"}
+    assert _json(_post(s, body))["cache"] == {"response": "hit"}
+    assert len(llm.requests) == 1 and len(picker.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "reason", ["content_filter", "error", "model_context_window_exceeded", None]
+)
+def test_a_pick_whose_reply_was_not_confirmed_as_finished_is_not_stored(
+    reason: str | None, tmp_path: Path, opened: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    picker = FakeLLM(handler=lambda request: PICK, finish_reason=reason)
+    monkeypatch.setattr(http_mod, "make_select_llm", lambda settings, model: picker)
+    s = _live3(tmp_path)
+    out = _runs_again(s, {"text": HALO_TEXT, "selector": LUNA}, llm=_reader())
+    # The visitor is shown the pick as before; nothing of the run is kept.
+    assert out["entities"][0]["pick"]["status"] == "match" and out["warnings"] == []
+    caches = _caches(s)
+    assert len(picker.requests) == 2 and (len(caches.responses), len(caches.picks)) == (0, 0)
+
+
+def test_the_claude_adapters_finish_reasons_are_what_the_allowlist_is_shown(
+    tmp_path: Path, opened: list[int], visits: Any
+) -> None:
+    """The reviewer's case through the real Claude adapter: valid entity JSON that
+    ended with ``model_context_window_exceeded`` is served and not stored; the same
+    reply ending with ``end_turn`` is."""
+    from ner_site.claude import ClaudeClient
+
+    from tests.test_site_claude import FakeSDK, message, text
+
+    s = _open_site(tmp_path)
+
+    def claude_with(stop_reason: str) -> Any:
+        sdks: list[Any] = []
+
+        def factory(settings: Settings, model: str, purpose: str) -> Any:
+            sdks.append(FakeSDK(*[message(text(HALO), stop_reason=stop_reason)] * 4))
+            return ClaudeClient(model, api_key=ANTHROPIC_KEY, client=sdks[-1], max_tokens=64)
+
+        return factory
+
+    for _ in range(2):
+        out = _json(
+            _post(s, {"text": HALO_TEXT}, claude=claude_with("model_context_window_exceeded"))
+        )
+        assert out["cache"] == {"response": "miss"} and out["entities"][0]["text"] == "haloperidol"
+        assert out["warnings"] == []
+    assert len(_caches(s).responses) == 0
+    assert _json(_post(s, {"text": HALO_TEXT}, claude=claude_with("end_turn")))["cache"] == {
+        "response": "miss"
+    }
+    assert _json(_post(s, {"text": HALO_TEXT}))["cache"] == {"response": "hit"}
+
+
+def test_a_short_database_password_or_visitor_salt_in_a_response_keeps_it_out(
+    tmp_path: Path, opened: list[int], visits: Any
+) -> None:
+    """Display redaction leaves a value under eight characters alone (replacing it
+    would corrupt ordinary JSON). The storage veto has no such threshold."""
+    short_db = "postgresql://owner:pw6abc@ep-x-pooler.c-1.eu.aws.neon.tech/neondb"
+    for secret, env in (
+        ("pw6abc", {"DATABASE_URL": short_db}),
+        ("salt66", {"NER_SITE_VISITOR_SALT": "salt66"}),
+        ("sp", {"NER_SITE_PASSCODE": "sp"}),
+    ):
+        text = f"Dose {secret} of haloperidol."
+        answer = _answer((secret, "other", 5, 5 + len(secret)))
+        s = _open_site(tmp_path, **env)
+        assert secret in s.unstorable() and secret not in s.secrets()
+        headers = {**HEADERS, "x-passcode": "sp"} if "NER_SITE_PASSCODE" in env else None
+        for _ in range(2):
+            result = _post(
+                s, {"text": text}, llm=_reader(answer), headers=headers, claude=_Claude(answer)
+            )
+            out = _json(result)
+            # Served as it is (too short to scrub), and not kept.
+            assert result[0] == 200 and out["cache"] == {"response": "miss"}, secret
+            assert out["entities"][0]["text"] == secret
+        assert len(_caches(s).responses) == 0, secret
+        # The same answer on a deployment without that value is an ordinary one.
+        plain = _open_site(tmp_path, NER_SITE_MAX_ENTITIES="24")
+        _post(plain, {"text": text}, claude=_Claude(answer))
+        assert len(_caches(plain).responses) == 1
+        caching.reset()
+    # Every configured value, whatever its length; redaction keeps its threshold.
+    every = Settings(
+        api_key="k1",
+        anthropic_api_key="k2",
+        passcode="p",
+        stats_passcode="s" * 24,
+        visitor_salt="v",
+        database_url="postgresql://u:a%40b@h/d",
+    )
+    assert set(every.unstorable(("own",))) == {
+        "own",
+        "k1",
+        "k2",
+        "p",
+        "s" * 24,
+        "v",
+        "postgresql://u:a%40b@h/d",
+        "a%40b",
+        "a@b",
+    }
+    assert set(every.secrets()) == {"s" * 24, "postgresql://u:a%40b@h/d"}
+    assert service.MIN_SCRUBBED_CHARS == 8
+
+
+def test_a_changed_visitor_salt_starts_with_empty_caches(tmp_path: Path, opened: list[int]) -> None:
+    """An answer is stored; then the visitor salt becomes a word that occurs in it.
+    The new salt is another scope of the same family: no hit, and the old entry is
+    emptied at once."""
+    old = _live(tmp_path, NER_SITE_VISITOR_SALT="first-salt")
+    asked = {"text": HALO_TEXT}
+    assert _post(old, asked, llm=_reader())[0] == 200
+    before = _caches(old)
+    assert len(before.responses) == 1
+    new = _live(tmp_path, NER_SITE_VISITOR_SALT="haloperidol")
+    assert new.cache_scope != old.cache_scope and new.cache_family == old.cache_family
+    llm = _reader()
+    out = _json(_post(new, asked, llm=llm))
+    assert out["cache"] == {"response": "miss"} and len(llm.requests) == 1
+    assert len(before.responses) == 0 and len(_caches(new).responses) == 0
+
+
+def test_an_address_on_a_second_forwarded_for_line_is_seen_by_the_storage_check(
+    tmp_path: Path, opened: list[int]
+) -> None:
+    """Through the HTTP shim, which used to pass on the first line only."""
+    from email.message import Message
+    from io import BytesIO
+    from types import SimpleNamespace
+
+    second = "198.51.100.23"
+    text = f"Host {second} was given haloperidol."
+    answer = _answer((second, "other", 5, 5 + len(second)))
+    s = _live(tmp_path)
+
+    def send(*forwarded: str) -> dict[str, Any]:
+        body = json.dumps({"text": text}).encode()
+        headers = Message()
+        headers["content-type"] = "application/json"
+        headers["x-requested-with"] = "xwalk-ner"
+        headers["content-length"] = str(len(body))
+        for line in forwarded:
+            headers["X-Forwarded-For"] = line
+        request = SimpleNamespace(
+            headers=headers, command="POST", path="/api/ner", rfile=BytesIO(body)
+        )
+        original = http_mod.default_llm_factory
+        http_mod.default_llm_factory = lambda settings, model: _reader(answer)  # type: ignore[assignment]
+        try:
+            result = http_mod._shim_response(request, s)  # noqa: SLF001
+        finally:
+            http_mod.default_llm_factory = original  # type: ignore[assignment]
+        assert result[0] == 200, result[2]
+        return _json(result)
+
+    for _ in range(2):
+        assert send("203.0.113.5", f"10.0.0.1, {second}")["cache"] == {"response": "miss"}
+    assert len(_caches(s).responses) == 0
+    # The visitor is still the first entry of the first line.
+    assert http_mod._private(  # noqa: SLF001
+        {"x-forwarded-for": f"203.0.113.5, 10.0.0.1, {second}"}, {}
+    ) == ("203.0.113.5", "10.0.0.1", second)
+    # Without that address among the lines the same text is stored.
+    assert send("203.0.113.5", "10.0.0.1")["cache"] == {"response": "miss"}
+    assert send("203.0.113.5", "10.0.0.1")["cache"] == {"response": "hit"}

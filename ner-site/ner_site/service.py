@@ -666,9 +666,9 @@ class Settings:
 
     @property
     def cache_family(self) -> str:
-        """Everything of :attr:`cache_scope` but the passcodes: two settings of one
-        family differ only in a passcode. ``cache.caches_for`` empties the caches of a
-        family's earlier scope when a new one is first used."""
+        """Everything of :attr:`cache_scope` but the passcodes and the visitor salt:
+        two settings of one family differ only in one of those. ``cache.caches_for``
+        empties the caches of a family's earlier scope when a new one is first used."""
         return self._scope_digest(["family", *self._scope_parts()])
 
     @property
@@ -678,13 +678,19 @@ class Settings:
         cached value. One SHA-256 digest of them all, so that nothing of the
         configuration is held as it is: not the database URL, not a path. The
         operator's keys are part of what is digested, so another key (another account)
-        is another scope. So are the two passcodes: what may be stored depends on them
-        (nothing in which the passcode occurs is), so a changed passcode starts with
-        empty caches instead of inheriting what the old rule let in. The digest is a
-        name inside this process only: it is not logged and not sent anywhere. The
-        visitor salt is not part of it: it changes no answer."""
+        is another scope. So are the two passcodes and the visitor salt: what may be
+        stored depends on them (nothing in which one of them occurs is), so a changed
+        passcode or salt starts with empty caches instead of inheriting what the old
+        rule let in. The digest is a name inside this process only: it is not logged
+        and not sent anywhere."""
         return self._scope_digest(
-            ["scope", *self._scope_parts(), self.passcode or "", self.stats_passcode or ""]
+            [
+                "scope",
+                *self._scope_parts(),
+                self.passcode or "",
+                self.stats_passcode or "",
+                self.visitor_salt or "",
+            ]
         )
 
     @property
@@ -707,20 +713,8 @@ class Settings:
             dense_off=self.offline,
         )
 
-    def unstorable(self, extra_secrets: Sequence[str] = ()) -> tuple[str, ...]:
-        """What must not occur in anything the in-memory caches keep: every scrubbed
-        secret, the passcodes whatever their length (a short one is not scrubbed from
-        a response, see :meth:`secrets`, so a result that holds it is simply not
-        stored), and `extra_secrets` (what belongs to the request: a visitor's key,
-        the passcode it sent, the address it came from)."""
-        values = (*extra_secrets, self.passcode, self.stats_passcode, *self.secrets())
-        return tuple(dict.fromkeys(v for v in values if v))
-
-    def secrets(self) -> tuple[str, ...]:
-        """Values scrubbed from every response and log line as a last line of defence
-        (nothing echoes them in the first place). Values shorter than
-        ``MIN_SCRUBBED_CHARS`` are left alone: replacing a passcode like ``ok`` would
-        corrupt ordinary JSON, and so short a value cannot be hidden anyway."""
+    def _sensitive(self) -> tuple[str, ...]:
+        """Every configured sensitive value, whatever its length."""
         values: list[str | None] = [
             self.api_key,
             self.anthropic_api_key,
@@ -730,10 +724,30 @@ class Settings:
             self.stats_passcode,
         ]
         if self.database_url:
-            password = urlsplit(self.database_url).password
+            try:
+                password = urlsplit(self.database_url).password
+            except ValueError:
+                password = None
             if password:
                 values += [password, unquote(password)]
-        return tuple(dict.fromkeys(s for s in values if s and len(s) >= MIN_SCRUBBED_CHARS))
+        return tuple(dict.fromkeys(s for s in values if s))
+
+    def unstorable(self, extra_secrets: Sequence[str] = ()) -> tuple[str, ...]:
+        """What must not occur in anything the in-memory caches keep: every configured
+        sensitive value whatever its length (the operator's keys, both passcodes, the
+        visitor salt, the database URL and its password) and `extra_secrets` (what
+        belongs to the request: a visitor's key, the passcode it sent, the address it
+        came from). Apart from display redaction (:meth:`secrets`), which leaves a
+        value under ``MIN_SCRUBBED_CHARS`` alone: such a value cannot be scrubbed from
+        a response, so a result that holds it is simply not stored."""
+        return tuple(dict.fromkeys(v for v in (*extra_secrets, *self._sensitive()) if v))
+
+    def secrets(self) -> tuple[str, ...]:
+        """Values scrubbed from every response and log line as a last line of defence
+        (nothing echoes them in the first place). Values shorter than
+        ``MIN_SCRUBBED_CHARS`` are left alone: replacing a passcode like ``ok`` would
+        corrupt ordinary JSON, and so short a value cannot be hidden anyway."""
+        return tuple(s for s in self._sensitive() if len(s) >= MIN_SCRUBBED_CHARS)
 
 
 def scrub(message: str, settings: Settings, extra_secrets: Sequence[str] = ()) -> str:
@@ -1437,8 +1451,8 @@ async def run(
     into ``reused`` (``retrieval_hits``, ``pick_hits``) for the log line, never into
     the response. ``reused`` also gets what :func:`cacheable` needs to know of the run
     and the response does not say: ``scrubbed`` (what held a secret before it was
-    scrubbed), ``cut_off`` (answers of the reader or the selector that the provider
-    reported as cut off at the token limit), ``served_elsewhere`` (picks another
+    scrubbed), ``unfinished`` (replies of the reader or the selector that the provider
+    did not confirm as normally completed), ``served_elsewhere`` (picks another
     model served in a server-side refusal fallback) and ``degraded`` (entities whose
     candidates were not a clean answer). A run with any of them is not kept. The response's
     ``cache`` says only that this was a run (``miss``, or ``off`` when the response
@@ -1476,7 +1490,7 @@ async def run(
     enter_stage(chain, EXTRACT)
     # A view remembers which model its answer came from; the chain may move on later.
     reader = llm if chain is None else chain.view()
-    # Remembers an answer the provider cut off at the token limit; for `reused` only.
+    # Remembers a reply the provider did not confirm as finished; for `reused` only.
     watched = FinishWatch(reader)
     started = time.monotonic()
     try:
@@ -1663,7 +1677,7 @@ async def run(
             retrieval_hits=stats.cache_hits,
             pick_hits=0 if picked is None else picked.cache_hits,
             scrubbed=len(held),
-            cut_off=int(watched.cut_off) + (0 if picked is None else len(picked.cut_off)),
+            unfinished=int(watched.unfinished) + (0 if picked is None else len(picked.unfinished)),
             served_elsewhere=0 if picked is None else len(picked.served_elsewhere),
             degraded=len(stats.degraded),
         )
@@ -1721,8 +1735,9 @@ def cacheable(
     - a step-down or a fallback anywhere in the run, a server-side refusal fallback
       on any pick included (``fallbacks``, ``notices``, ``run["served_elsewhere"]``);
     - a warning, the reader's included (an entity it dropped, a list it cut);
-    - an answer of the reader or the selector that the provider reported as cut off
-      at its token limit (``run["cut_off"]``): it may parse and still be incomplete;
+    - a reply of the reader or the selector that its provider did not confirm as
+      normally completed (``run["unfinished"]``; ``extract.FINISHED_REASONS`` is the
+      allowlist): it may parse and still be incomplete;
     - a pick that failed;
     - degraded retrieval: a retriever that was not ``ok``, a routed entity that
       carries a note (a search that failed, timed out or was cut off), an entity whose
@@ -1746,7 +1761,7 @@ def cacheable(
     if response.fallbacks or response.notices:
         return False
     if run is not None and any(
-        run.get(name) for name in ("scrubbed", "cut_off", "served_elsewhere", "degraded")
+        run.get(name) for name in ("scrubbed", "unfinished", "served_elsewhere", "degraded")
     ):
         return False
     disabled = dense_disabled()

@@ -296,32 +296,39 @@ def parse_entities(
     return entities, warnings
 
 
-# What a provider reports for an answer it ended at its token limit: ``length`` in the
-# OpenAI-compatible shape (the Claude adapter maps its own word to it), ``max_tokens``
-# as Anthropic says it.
-CUT_OFF_REASONS = frozenset({"length", "max_tokens"})
+# What a provider reports for a reply it completed normally, as the adapters hand it
+# on: ``stop`` in the OpenAI-compatible shape (OpenRouter, also for a structured-output
+# reply; the offline stand-in says the same), ``end_turn`` from the Claude adapter (its
+# schema-enforced replies end with it too; the site sends no stop sequences and no
+# tools, so ``stop_sequence`` and ``tool_use`` are not normal here). Everything else is
+# not a confirmed finish: ``length`` / ``max_tokens``, ``content_filter``, ``error``,
+# ``model_context_window_exceeded``, ``pause_turn``, a word this code does not know,
+# and no reason at all.
+FINISHED_REASONS = frozenset({"stop", "end_turn"})
 
 
 class FinishWatch:
     """An ``LLMClient`` that passes everything on to `client` and remembers whether
-    any answer it got was reported as cut off (``cut_off``).
+    any reply it got was not confirmed by its provider as normally completed
+    (``unfinished``): an allowlist (``FINISHED_REASONS``), so a reason nobody has
+    thought of counts as not confirmed.
 
-    An answer that was ended at the token limit can still parse: a list of entities
-    that stops early, or a pick whose reasoning was cut. The stage uses it as before
-    and the visitor sees what they saw before; the one thing this is for is that such
-    a run is not kept for another request (``service.cacheable``)."""
+    A reply that was ended early can still parse: a list of entities that stops, or a
+    pick whose reasoning was cut or filtered. The stage uses it as before and the
+    visitor sees what they saw before; the one thing this is for is that such a run
+    is not kept for another request (``service.cacheable``)."""
 
     def __init__(self, client: LLMClient) -> None:
         self._client = client
-        self.cut_off = False
+        self.unfinished = False
 
     def __getattr__(self, name: str) -> object:  # model, fingerprint, capabilities, budget
         return getattr(self._client, name)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response = await self._client.complete(request)
-        if getattr(response, "finish_reason", None) in CUT_OFF_REASONS:
-            self.cut_off = True
+        if getattr(response, "finish_reason", None) not in FINISHED_REASONS:
+            self.unfinished = True
         return response
 
 

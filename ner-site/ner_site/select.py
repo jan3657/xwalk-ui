@@ -149,10 +149,11 @@ class SelectStats:
     asked: dict[str, str] = field(default_factory=dict)
     # Picks answered from the pick cache: no call was made for them.
     cache_hits: int = 0
-    # Entities whose pick came from an answer the provider reported as cut off at its
-    # token limit (``extract.FinishWatch``). The pick is used as it was read; neither
-    # it nor the response of its run is kept for another request.
-    cut_off: set[str] = field(default_factory=set)
+    # Entities whose pick came from a reply its provider did not confirm as normally
+    # completed (``extract.FinishWatch``: cut off, filtered, an error, no reason). The
+    # pick is used as it was read; neither it nor the response of its run is kept for
+    # another request.
+    unfinished: set[str] = field(default_factory=set)
 
     def add(self, usage: XwalkUsage) -> None:
         self.calls += usage.calls
@@ -342,8 +343,8 @@ async def _with_llm(
         stats.add(failure_usage(exc))
         raise
     stats.add(outcome.usage)
-    if watch.cut_off:
-        stats.cut_off.add(entity.id)
+    if watch.unfinished:
+        stats.unfinished.add(entity.id)
     answered = getattr(view, "answered_by", None)
     if answered:
         selector = answered
@@ -415,7 +416,7 @@ async def select_entities(
     (no step-down, no fallback); `degraded` holds the ids of the entities whose
     candidates came from degraded retrieval; `sensitive` says whether a text holds a
     secret. A pick that fails any of the three, or whose answer the provider reported
-    as cut off (``stats.cut_off``), is used and not stored."""
+    as cut off (``stats.unfinished``), is used and not stored."""
     if selector == RETRIEVAL_ONLY:
         return list(results)
     if selector == JEV and decider is None:
@@ -494,7 +495,7 @@ async def select_entities(
                     # server-side refusal fallback: the run is no longer the one asked for.
                     and not stats.served_elsewhere
                     and entity.id not in degraded
-                    and entity.id not in stats.cut_off
+                    and entity.id not in stats.unfinished
                     and answered_on == selector
                     and (storable is None or storable())
                 ):

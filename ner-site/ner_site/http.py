@@ -1521,6 +1521,12 @@ def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Respo
     headers: dict[str, str | Sequence[str]] = {
         k.lower(): request.headers[k] for k in request.headers if k.lower() != "authorization"
     }
+    # Every line of a repeated X-Forwarded-For, in order (`handle` joins them with a
+    # comma, as a proxy would have): the visitor is still its first entry, and the
+    # storage check (`_private`) sees every address the request carried.
+    forwarded = request.headers.get_all("X-Forwarded-For", [])
+    if len(forwarded) > 1:
+        headers["x-forwarded-for"] = forwarded
     if method == "POST" and urlsplit(request.path).path == NER_PATH:
         headers["authorization"] = request.headers.get_all("Authorization", [])
 
