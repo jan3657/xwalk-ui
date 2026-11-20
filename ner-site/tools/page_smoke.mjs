@@ -44,12 +44,16 @@
 //
 // The cache states cover what the server's caches and the recorded example save
 // (ner_site/cache.py). cache-hit: an answer that came whole from the cache says so in
-// place of the timing sentence, and "Run details" shows what was reused, also for a run
-// that reused only some searches or picks. cache-live does the same against the server's
-// own API (the second identical request). example-pressed, example-live and
-// example-early: "Map this text" on the untouched example sends nothing and shows the
-// recorded result with "Run it live"; an edited text, a changed option, an own key, a
-// second press after a live run, and a press before health has answered all run for real.
+// place of the timing sentence and in "Run details", with no age and no figures of the
+// run that made it, and is never put down to the visitor's key; a run says nothing of a
+// cache. cache-live does the same against the server's own API (the second identical
+// request), whose `cache` object holds "response" and nothing else. example-pressed,
+// example-live and example-early: "Map this text" on the untouched example sends nothing
+// and shows the recorded result with "Run it live"; an edited text, a changed option, an
+// own key, a second press after a live run, and a press before health has answered all
+// run for real. example-settings: so does a deployment whose prompt or entity limit is
+// not the one the example was recorded with, and a form that would not pass a run's
+// checks gets its error, not the recording.
 //
 // Playwright is resolved from the local node_modules, NODE_PATH, or `npm root -g`, as in
 // screenshot.mjs. PLAYWRIGHT_CHANNEL=chrome uses the installed Chrome.
@@ -96,6 +100,11 @@ function productionHealth() {
   health.backend = "neon";
   health.neon = { schema: "xwalk_full", catalog: "full" };
   if (!health.selectors.includes("retrieval")) health.selectors.unshift("retrieval");
+  // The defaults the example was recorded with (example.json's `request`).
+  if (EXAMPLE_FILE.request) {
+    health.default_prompt = EXAMPLE_FILE.request.prompt;
+    health.limits = { ...health.limits, max_entities: EXAMPLE_FILE.request.max_entities };
+  }
   health.ontologies = [
     { slug: "chebi", name: "ChEBI", type: "chemical", count: 219011 },
     { slug: "ctd-disease", name: "CTD diseases / MeSH", type: "disease", count: 13323 },
@@ -745,7 +754,7 @@ const STATES = {
     s.check(/\S/.test(await s.text("#results-summary")), "the results summary is empty");
     // The server remembers the example from the width or the scheme before this one
     // (cache-live holds the two sentences apart).
-    await s.expectText("#status", /^(Done in |Answered from a recent identical run \()/, "the one-sentence status");
+    await s.expectText("#status", /^(Done in |Answered from a recent identical run\. )/, "the one-sentence status");
     await s.expectHidden("#error", "the error box");
     await s.expectHidden("#progress", "the progress bar after the run");
   },
@@ -766,7 +775,7 @@ const STATES = {
     await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\. Use public or de-identified text: it is sent to the model provider\.$/, "the hint under Run");
     const footer = await s.text("#privacy");
     s.check(!/not saved|stores no|kept for one day|writes no text|Each run is recorded/i.test(footer), "the footer still promises more than the site does");
-    s.check(footer.includes("When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings. The server may keep recent mentions, search results and answers in memory for a few hours so that it does not compute them twice; none of that is written to its database."), "the footer's line about what the server keeps in memory is not the agreed one");
+    s.check(footer.includes("When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings. The server may keep recent mentions, search results and answers in memory so that it does not compute them twice: normally for a few hours, and at most until the server instance is recycled. None of that is written to its database, and an answer served from memory sends no text to a model provider."), "the footer's line about what the server keeps in memory is not the agreed one");
     s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
     s.check(/When run recording is enabled, this site attempts to save/.test(footer), "the footer says runs are recorded without its condition");
     s.check(/Runs on this site's own models are limited per network/.test(footer), "the footer's line about limits has no condition");
@@ -2848,53 +2857,55 @@ const STATES = {
     await s.expectResults();
   },
 
-  // An answer the server already had, and a run that reused part of its work.
+  // An answer the server already had.
   async "cache-hit"(s) {
-    const original = { timing_ms: { extract: 3289, map: 2339, select: 3197, total: 8825 }, usage: { llm_calls: 1, prompt_tokens: 1134, completion_tokens: 187, embedding_requests: 1, selector_calls: 7 } };
     const noCalls = { llm_calls: 0, prompt_tokens: null, completion_tokens: null, embedding_requests: 0, selector_calls: 0, selector_prompt_tokens: null, selector_completion_tokens: null, selector_cost_usd: null };
-    const hit = (age) => shaped({ usage: noCalls, timing_ms: { total: 1 }, cache: { response: "hit", retrieval_hits: 0, pick_hits: 0, age_s: age, original } });
+    const hit = (more) => shaped({ usage: noCalls, timing_ms: { total: 1 }, cache: { response: "hit" }, ...more });
     s.health = productionHealth();
-    s.ner = { body: hit(245) };
+    s.ner = { body: hit() };
     await s.open();
     await s.page.fill("#text", SHAPED_TEXT);
     await s.run();
     await s.expectResults();
-    await s.expectText("#status", /^Answered from a recent identical run \(4 minutes ago\)\. No model was called\. That run was read by Claude Opus 5\.5; terms chosen by Claude Opus 5\.5\.$/, "the status of a cached answer");
+    await s.expectText("#status", /^Answered from a recent identical run\. No model was called\. That run was read by Claude Opus 5\.5; terms chosen by Claude Opus 5\.5\.$/, "the status of a cached answer");
     let seen = await s.shown();
     s.check(seen.kind === "run" && seen.heading === "Results" && seen.cards === SHAPED_SPECS.length, `a cached answer is shown as ${seen.kind}, ${JSON.stringify(seen.heading)}, ${seen.cards} cards`);
     s.check(!/Done in/.test(await s.text("#results")), "a cached answer still shows a timing sentence");
     await s.page.click("#run-details > summary");
     const rows = () => s.page.evaluate(() => Object.fromEntries([...document.querySelectorAll("#run-details-list dt")].map((dt) => [dt.textContent, dt.nextElementSibling.textContent])));
     let details = await rows();
-    s.check(details.Cache === "the whole answer was reused from a recent identical run (4 minutes ago); no model call and no search for this request", `Run details say of the cache: ${JSON.stringify(details.Cache)}`);
-    s.check(details["That run"] === "extract 3.29 s, search 2.34 s, pick 3.20 s, total 8.82 s; 1 model call for extraction, 7 for picking" || details["That run"] === "extract 3.29 s, search 2.34 s, pick 3.20 s, total 8.83 s; 1 model call for extraction, 7 for picking", `Run details say of the original run: ${JSON.stringify(details["That run"])}`);
+    s.check(details.Cache === "the whole answer was reused from a recent identical run; no model call and no search for this request", `Run details say of the cache: ${JSON.stringify(details.Cache)}`);
+    s.check(details["That run"] === undefined, `Run details still describe the run that made the answer: ${JSON.stringify(details["That run"])}`);
     s.check(details["Model calls"] === "0 for extraction" && details.Timing === "total 1 ms" && details.Tokens === undefined, `a cached answer's own figures are ${JSON.stringify([details["Model calls"], details.Timing, details.Tokens])}`);
     if (s.shot) await s.shot("hit");
 
-    // How old the answer is, in the words a visitor reads.
-    for (const [age, words] of [[20, "less than a minute ago"], [60, "1 minute ago"], [3599, "59 minutes ago"], [7300, "2 hours ago"]]) {
-      s.ner = { body: hit(age) };
+    // A server that still sent an age, the figures of the original run or counts of
+    // reused work (an older one): none of it is shown.
+    s.ner = { body: hit({ cache: { response: "hit", age_s: 245, retrieval_hits: 3, pick_hits: 1, original: { timing_ms: { extract: 3289, total: 8825 }, usage: { llm_calls: 1, selector_calls: 7 } } } }) };
+    await s.run();
+    await s.settled();
+    await s.expectText("#status", /^Answered from a recent identical run\. No model was called\. /, "the status of a cached answer that came with an age");
+    const everything = await s.text("#results");
+    s.check(!/ago\b|That run\s*extract|8\.8\d? s|reused for/.test(everything), "the page shows the age of a cached answer or the figures of the run that made it");
+
+    // No answer from the server's memory is put down to the visitor's key, whatever
+    // the response claims (the server serves none for an own-key request).
+    s.ner = { body: hit({ credential_source: "visitor", provider: "anthropic" }) };
+    await s.run();
+    await s.settled();
+    const claimed = `${await s.text("#status")} ${await s.text("#results-models")}`;
+    s.check(!/on your .* key/i.test(claimed), `a cached answer is put down to the visitor's key: ${JSON.stringify(claimed)}`);
+
+    // A run says nothing about a cache: not in the status, not in "Run details", also
+    // when an older server counts what it reused.
+    for (const cache of [{ response: "miss" }, { response: "off" }, { response: "miss", retrieval_hits: 3, pick_hits: 1 }]) {
+      s.ner = { body: shaped({ cache }) };
       await s.run();
       await s.settled();
-      const status = await s.text("#status");
-      s.check(status.startsWith(`Answered from a recent identical run (${words}). No model was called.`), `an answer ${age} s old is said as ${JSON.stringify(status.slice(0, 80))}`);
+      await s.expectText("#status", /^Done in 8\.8 s: /, `the status of a run (${JSON.stringify(cache)})`);
+      details = await rows();
+      s.check(details.Cache === undefined && !/reused|recent identical/i.test(await s.text("#results")), `a run with ${JSON.stringify(cache)} speaks of a cache: ${JSON.stringify(details.Cache)}`);
     }
-
-    // A run that reused some searches and one pick: an ordinary result, and only "Run
-    // details" says what was reused.
-    s.ner = { body: shaped({ cache: { response: "miss", retrieval_hits: 3, pick_hits: 1 } }) };
-    await s.run();
-    await s.settled();
-    await s.expectText("#status", /^Done in 8\.8 s: /, "the status of a run that reused part of its work");
-    await s.page.evaluate(() => (document.getElementById("run-details").open = false));
-    s.check(!/reused|recent identical/i.test(await s.text("#results")), "a partial reuse is said outside Run details");
-    await s.page.click("#run-details > summary");
-    details = await rows();
-    s.check(details.Cache === "search results reused for 3 mentions, 1 pick reused (from recent runs, at no model cost)" && details["That run"] === undefined, `Run details say of a partial reuse: ${JSON.stringify(details.Cache)}`);
-    s.ner = { body: shaped({ cache: { response: "miss", retrieval_hits: 0, pick_hits: 0 } }) };
-    await s.run();
-    await s.settled();
-    s.check((await rows()).Cache === "nothing reused from recent runs", `Run details say of a run that reused nothing: ${JSON.stringify((await rows()).Cache)}`);
     // A server without caches says nothing about one.
     s.ner = { body: shaped() };
     await s.run();
@@ -2924,6 +2935,7 @@ const STATES = {
       for (let i = 0; i < 100 && answers.length < n; i += 1) await s.page.waitForTimeout(50);
       return answers[n - 1];
     };
+    const only = (a, value) => Boolean(a && a.cache) && JSON.stringify(a.cache) === JSON.stringify({ response: value });
     await s.page.fill("#text", text);
     await s.run();
     await s.expectResults();
@@ -2932,23 +2944,23 @@ const STATES = {
       console.log(`        (cache-live @ ${s.width}px: this server reports no cache; nothing checked)`);
       return;
     }
-    s.check(first.cache.response === "miss", `the first run of a new text was a ${first.cache.response}`);
+    s.check(only(first, "miss"), `the first run of a new text answered ${JSON.stringify(first.cache)}`);
     await s.expectText("#status", /^Done in /, "the status of the first run");
     await s.run();
     await s.expectResults();
     const second = await answer(2);
-    s.check(second && second.cache && second.cache.response === "hit" && second.usage.llm_calls === 0, `the second identical run answered ${JSON.stringify(second && second.cache)}`);
-    await s.expectText("#status", /^Answered from a recent identical run \(less than a minute ago\)\. No model was called\./, "the status of the second identical run");
+    s.check(only(second, "hit") && second.usage.llm_calls === 0, `the second identical run answered ${JSON.stringify(second && second.cache)}`);
+    await s.expectText("#status", /^Answered from a recent identical run\. No model was called\./, "the status of the second identical run");
     s.check(s.posts.length === 2, `${s.posts.length} requests were sent for two presses`);
-    // One more character: a run again, which reuses what was looked up for the mentions.
+    // One more character: a run again, and its answer says nothing of what it reused.
     await s.page.fill("#text", text + " ");
     await s.run();
     await s.expectResults();
     const third = await answer(3);
-    s.check(third && third.cache && third.cache.response === "miss" && third.cache.retrieval_hits >= 1, `a text sharing its mentions answered ${JSON.stringify(third && third.cache)}`);
-    await s.expectText("#status", /^Done in /, "the status of a run that reused part of its work");
+    s.check(only(third, "miss"), `a text sharing its mentions answered ${JSON.stringify(third && third.cache)}`);
+    await s.expectText("#status", /^Done in /, "the status of a run that shares mentions with an earlier one");
     await s.page.click("#run-details > summary");
-    await s.expectText("#run-details", /Cache\s*search results reused for \d+ mentions?/, "the cache row of Run details");
+    s.check(!/Cache|reused/.test(await s.text("#run-details")), "Run details of a run speak of a cache");
   },
 
   // "Map this text" on the untouched example: nothing is sent.
@@ -3032,6 +3044,8 @@ const STATES = {
     await s.expectError("The demo hit an error on its side.", { action: "Try again" });
     let seen = await s.shown();
     s.check(s.posts.length === 1 && seen.kind === "example" && seen.heading === "Example result", `after a failed live run: ${s.posts.length} request(s), ${seen.kind}, ${JSON.stringify(seen.heading)}`);
+    // A request was sent, so the recorded result no longer says that nothing was.
+    await s.expectHidden("#recorded-note", "the line about the recorded result after a live run that failed");
     const gate = s.gate();
     s.ner = { gate: gate.promise, body: shaped() };
     await s.page.click("#error-action");
@@ -3101,6 +3115,58 @@ const STATES = {
     await s.run();
     await s.expectResults();
     s.check(s.posts.length === 2 && s.posts[1].body.prompt === "Find only the foods.", "an edited prompt did not run the example for real");
+  },
+
+  // The recording answers for the settings it was made with. A deployment whose entity
+  // limit or default prompt is another one runs the example for real, and a form that
+  // would not pass a run's checks gets its error, not the recording.
+  async "example-settings"(s) {
+    const asked = EXAMPLE_FILE.request;
+    s.check(Boolean(asked) && typeof asked.prompt === "string" && asked.top_k === 5 && Number.isInteger(asked.max_entities), `example.json records its request as ${JSON.stringify(asked && Object.keys(asked))}`);
+    // The entity limit lowered to one: the eighteen recorded mentions are not its answer.
+    s.health = productionHealth();
+    s.health.limits = { ...s.health.limits, max_entities: 1 };
+    s.health.default_prompt = asked.prompt.replace(/at most \d+ entities/, "at most 1 entities");
+    s.ner = { body: shaped() };
+    await s.open();
+    await s.expectExample("on arrival");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1 && s.posts[0].body.text === EXAMPLE_FILE.text, `with another entity limit the press sent ${s.posts.length} request(s)`);
+    await s.expectHidden("#recorded-note", "the line about the recorded result on a deployment with another entity limit");
+
+    // The same limit, another default prompt.
+    s.posts.length = 0;
+    s.health = productionHealth();
+    s.health.default_prompt = asked.prompt + " Prefer drugs.";
+    await s.open();
+    await s.expectExample("on arrival, another default prompt");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1, `with another default prompt the press sent ${s.posts.length} request(s)`);
+
+    // The limit alone changed (a prompt that does not state it): still a run.
+    s.posts.length = 0;
+    s.health = productionHealth();
+    s.health.limits = { ...s.health.limits, max_entities: asked.max_entities - 1 };
+    await s.open();
+    await s.expectExample("on arrival, another limit under the same prompt");
+    await s.run();
+    await s.expectResults();
+    s.check(s.posts.length === 1, `with another limit under the same prompt the press sent ${s.posts.length} request(s)`);
+
+    // A form a run would refuse is refused before the recording is offered: the
+    // deployment takes fewer characters than the example has.
+    s.posts.length = 0;
+    s.health = productionHealth();
+    s.health.limits = { ...s.health.limits, max_chars: 100 };
+    await s.open();
+    await s.expectExample("on arrival, a text limit below the example");
+    await s.run();
+    await s.page.waitForTimeout(300);
+    await s.expectVisible("#text-error", "the error of a text that is too long");
+    await s.expectHidden("#recorded-note", "the line about the recorded result for a form that would not run");
+    s.check(s.posts.length === 0, `a text over the limit sent ${s.posts.length} request(s)`);
   },
 };
 
