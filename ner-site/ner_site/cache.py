@@ -42,7 +42,8 @@ the values do (a response holds the mentions it found). The deployment a set of 
 belongs to is named by a digest too (``Settings.cache_scope``). No key and no value is
 given a visitor's API key, the passcode, an address or a visitor id: the callers build
 keys from the request's own fields, and store nothing in which a configured secret, the
-passcode (of any length) or the visitor's key occurs.
+passcode (of any length) or the visitor's key occurs; nor a response in which the
+address the request came from occurs.
 
 What is stored. Only what a fresh identical run would have been allowed to return:
 the callers decide, each for its own stage (``service.cacheable`` for a response, and
@@ -90,7 +91,7 @@ class CacheSettings:
     """How many entries each cache may hold (0: that cache is off) and how long an
     entry lives. The defaults here are "off": a ``Settings`` built in code caches
     nothing unless it is given sizes, and ``Settings.from_env`` gives a deployment
-    :data:`ON` unless the environment says otherwise."""
+    :data:`ON` (whole responses only) unless the environment says otherwise."""
 
     responses: int = 0
     retrieval: int = 0

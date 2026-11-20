@@ -380,8 +380,9 @@ class Settings:
     # Set: runs are recorded and GET /api/stats answers to it. Unset: neither exists.
     stats_passcode: str | None = field(default=None, repr=False)
     # The in-memory caches (``ner_site.cache``). Off for a ``Settings`` built in code;
-    # ``from_env`` turns them on with the default sizes unless the environment says
-    # otherwise (``NER_SITE_CACHE=off``, or a size of 0).
+    # ``from_env`` turns the response cache on with its default size, and leaves the
+    # two experimental ones off, unless the environment says otherwise
+    # (``NER_SITE_CACHE=off``, or a size).
     cache: CacheSettings = CacheSettings()
 
     # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
