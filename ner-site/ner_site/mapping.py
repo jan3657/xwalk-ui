@@ -10,7 +10,9 @@ whose dense retriever is up, failed and timed-out searches included; a search sk
 because the deadline had passed is not dispatched). Each dense search is one embeddings
 request unless the encoder retried, so it is a lower bound on HTTP requests; the encoder
 is shared across requests on a warm instance, so its own cumulative `usage` cannot be
-attributed to one request.
+attributed to one request. The query vectors are not shared: each call embeds its own
+queries in a scope of its own (``indexes.vector_scope``) and forgets them when its
+searches are over, so the count never depends on what an earlier request embedded.
 
 Time: every retriever call is bounded by `timeout`, and with `deadline` the whole call
 is bounded too. A dense (remote) search still running at the deadline is cut off, and one
@@ -20,19 +22,19 @@ not yet started is skipped; the entity keeps its BM25 matches and gets the note
 get their BM25 matches. A cut-off search's thread is abandoned, not joined: it finishes
 in the background and its result goes nowhere (see ``ner_site.http``).
 
-The retrieval cache (``ner_site.cache``): with `cache`, an entity whose ontology, query
-and retrievers were answered cleanly before gets those fused candidates again without a
-search, an embedding or a database round trip (``stats.cache_hits`` counts them). Only a
-clean answer is stored: every retriever configured for the ontology was there
-(``OntologyIndex.whole``; an ontology that lost its dense index stores nothing, its
-BM25-only candidates are a degraded answer), every one answered, and none failed, timed
-out or was cut off. Nor is anything stored in which `sensitive` finds a secret. The
-candidates are copied on the way in and on the way out (``cache.copy_candidates``), so
-nothing a request does to a record's fields reaches the next one. ``stats.degraded``
-names the entities whose candidates are not such a clean answer; the selection keeps
-no pick made on them. A hit asked no retriever anything, so it is in neither
-``dense_entities`` nor ``embedding_requests``. Two entities with the same mention in
-one request both search the first time: in-flight work is not shared.
+The retrieval cache (``ner_site.cache``; experimental, off by default): with `cache`, an
+entity whose ontology, query and retrievers were answered cleanly before gets those
+fused candidates again without a search, an embedding or a database round trip
+(``stats.cache_hits`` counts them). Only a clean answer is stored: every retriever
+configured for the ontology was there (``OntologyIndex.whole``; an ontology that lost
+its dense index stores nothing, its BM25-only candidates are a degraded answer), every
+one answered, and none failed, timed out or was cut off. Nor is anything stored in which
+`sensitive` finds a secret. The candidates are copied on the way in and on the way out
+(``cache.copy_candidates``), so nothing a request does to a record's fields reaches the
+next one. ``stats.degraded`` names the entities whose candidates are not such a clean
+answer; the selection keeps no pick made on them. A hit asked no retriever anything, so
+it is in neither ``dense_entities`` nor ``embedding_requests``. Two entities with the
+same mention in one request both search the first time: in-flight work is not shared.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from xwalk.retrieval.postgres import PgVectorRetriever
 from xwalk.retrieve import retrieve
 
 from ner_site.cache import TTLCache, candidates_text, copy_candidates, retrieval_key
-from ner_site.indexes import OntologyIndex, PrefetchEncoder
+from ner_site.indexes import OntologyIndex, PrefetchEncoder, vector_scope
 from ner_site.ontologies import TEMPLATES, route, term_url
 from ner_site.schema import Entity, EntityResult, Match
 
@@ -320,8 +322,15 @@ async def map_entities(
         return listed(entity, slug, candidates, entity_notes)
 
     searched = [e for e in entities if remembered.get(e.id, (None, None))[1] is None]
-    await _prefetch(searched, indexes, routes, timeout, deadline_at, stats)
-    results = list(await asyncio.gather(*(one(e) for e in entities)))
+    # The vectors this call embeds are its own (see the module docstring).
+    with vector_scope() as scope:
+        try:
+            await _prefetch(searched, indexes, routes, timeout, deadline_at, stats)
+            results = list(await asyncio.gather(*(one(e) for e in entities)))
+        finally:
+            encoders = {id(i.encoder): i.encoder for i in indexes.values() if i.encoder is not None}
+            for encoder in encoders.values():
+                encoder.forget(scope)
     order = {e.id: i for i, e in enumerate(entities)}
     stats.dense_entities = [e.id for e in entities if e.id in dense_seen]
     for note, ids in degraded.items():

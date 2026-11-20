@@ -13,12 +13,15 @@ operator can act on. A BM25 build that fails is reported the same way.
 
 from __future__ import annotations
 
+import itertools
 import shutil
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -60,6 +63,11 @@ NEON_SCHEMA = "xwalk"
 NEON_DIMENSIONS = 1024
 NO_DATABASE = "DATABASE_URL is not set (NER_SITE_BACKEND=neon)"
 UNREACHABLE = "neon database could not be queried"
+# The one status of dense retrieval in offline mode: it is not opened and not checked
+# there (no key is spent, no embedding is requested), whatever the index directory or
+# the database holds. Only this status lets a response without dense retrieval be kept
+# (``OntologyIndex.whole``, ``service.cacheable``).
+DENSE_OFF_REASON = "disabled in offline mode (NER_SITE_OFFLINE=1): no query embeddings; BM25 only"
 # Per-request database calls: short, one retry. A failure degrades the entity (a note),
 # like an embeddings failure; it never fails the request.
 NEON_TIMEOUT_S = 15.0
@@ -73,6 +81,27 @@ Catalog = Literal["samples", "full"]
 # Retry-After (which it would otherwise honour for up to 300 s) fails at once. Neither
 # setting changes what a vector means, so an index built with the defaults still matches.
 QUERY_ENCODER_SETTINGS: dict[str, Any] = {"timeout": 15.0, "max_retries": 0}
+
+# Whose query vectors a search may use. ``mapping.map_entities`` gives every request a
+# scope of its own (:func:`vector_scope`), so the vectors a request embedded in one
+# batch serve its own searches and no other request's: a request never does less work,
+# and never reports fewer embedding requests, because an earlier text shared a mention
+# with it. 0 is "no request" (a caller that uses an encoder directly).
+_SCOPE: ContextVar[int] = ContextVar("ner_site_vector_scope", default=0)
+_SCOPES = itertools.count(1)
+
+
+@contextmanager
+def vector_scope() -> Iterator[int]:
+    """A scope of query vectors for the calling task and for what it starts from here
+    on (tasks and ``asyncio.to_thread`` copy the context)."""
+    scope = next(_SCOPES)
+    token = _SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        _SCOPE.reset(token)
+
 
 _BUILD_LOCK = threading.Lock()
 _MEMO_LOCK = threading.Lock()
@@ -91,7 +120,12 @@ class PrefetchEncoder:
     ``TTL_S`` seconds (the default time limit of ``ner_site.cache``): a vector that old
     is not used, and every write removes the ones that have expired, so a mention does
     not stay in memory because nobody searched for it again. ``clock`` is a parameter
-    so that tests can move the time."""
+    so that tests can move the time.
+
+    A vector belongs to the scope it was embedded in (:func:`vector_scope`) and is
+    found only there; ``forget`` removes a scope's vectors, which the mapping does when
+    a request's searches are over. What may stay longer is what a search thread that
+    was abandoned at its timeout wrote afterwards, until the time limit."""
 
     MAX_CACHED = 4096
     TTL_S = 6 * 3600.0
@@ -99,9 +133,9 @@ class PrefetchEncoder:
     def __init__(self, inner: Encoder, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._inner = inner
         self._clock = clock
-        # text -> (stored at, vector), oldest first (a text embedded again moves to the
-        # end), so both the expired and the surplus entries are at the front.
-        self._cache: OrderedDict[str, tuple[float, list[float]]] = OrderedDict()
+        # (scope, text) -> (stored at, vector), oldest first (a text embedded again
+        # moves to the end), so both the expired and the surplus entries are at the front.
+        self._cache: OrderedDict[tuple[int, str], tuple[float, list[float]]] = OrderedDict()
         self._lock = threading.Lock()
 
     @property
@@ -122,14 +156,15 @@ class PrefetchEncoder:
     def _sweep(self, now: float) -> None:
         """Remove the expired vectors (the lock is held)."""
         while self._cache:
-            text, (stored_at, _) = next(iter(self._cache.items()))
+            key, (stored_at, _) = next(iter(self._cache.items()))
             if now - stored_at < self.TTL_S:
                 break
-            del self._cache[text]
+            del self._cache[key]
 
     def _found(self, text: str, now: float) -> list[float] | None:
-        """The vector of `text` while it has not expired (the lock is held)."""
-        found = self._cache.get(text)
+        """The vector of `text` in the calling scope while it has not expired (the
+        lock is held)."""
+        found = self._cache.get((_SCOPE.get(), text))
         return None if found is None or now - found[0] >= self.TTL_S else found[1]
 
     def cached(self, text: str) -> bool:
@@ -141,13 +176,22 @@ class PrefetchEncoder:
         with self._lock:
             return len(self._cache)
 
-    def _remember(self, texts: Sequence[str], vectors: Sequence[list[float]]) -> None:
-        now = self._clock()
+    def forget(self, scope: int) -> int:
+        """Remove the vectors of `scope`; how many there were."""
         with self._lock:
+            mine = [key for key in self._cache if key[0] == scope]
+            for key in mine:
+                del self._cache[key]
+            return len(mine)
+
+    def _remember(self, texts: Sequence[str], vectors: Sequence[list[float]]) -> None:
+        scope = _SCOPE.get()
+        with self._lock:
+            now = self._clock()  # inside the lock: stored times are in write order
             self._sweep(now)
             for text, vector in zip(texts, vectors, strict=True):
-                self._cache[text] = (now, list(vector))
-                self._cache.move_to_end(text)
+                self._cache[(scope, text)] = (now, list(vector))
+                self._cache.move_to_end((scope, text))
             while len(self._cache) > self.MAX_CACHED:
                 self._cache.popitem(last=False)
 
@@ -184,9 +228,10 @@ class OntologyIndex:
     # The dense retriever's query encoder (shared by every ontology), for batching.
     encoder: PrefetchEncoder | None = None
     # Dense retrieval was switched off by the mode (offline: no key is spent, no
-    # embedding is requested) and was therefore never attempted, whatever `status`
-    # gives as the reason. Set by `get_indexes` from ``IndexSettings.dense_off``; it
-    # is the one way an index without dense retrieval still counts as whole.
+    # embedding is requested): it was not opened and not checked, and its status is
+    # `dense_disabled()`. Set where the indexes are opened, from
+    # ``IndexSettings.dense_off``; it is the one way an index without dense retrieval
+    # still counts as whole.
     dense_off: bool = False
 
     @property
@@ -198,7 +243,9 @@ class OntologyIndex:
         if bm25 is None or bm25.status != "ok":
             return False
         if self.dense_off:
-            return not any(r.name == DENSE_NAME for r in self.retrievers)
+            return dense == dense_disabled() and not any(
+                r.name == DENSE_NAME for r in self.retrievers
+            )
         return dense is not None and dense.status == "ok"
 
 
@@ -225,6 +272,11 @@ def _ok() -> RetrieverStatus:
 
 def _unavailable(reason: str) -> RetrieverStatus:
     return RetrieverStatus(status="unavailable", reason=reason)
+
+
+def dense_disabled() -> RetrieverStatus:
+    """The status of dense retrieval that the mode switched off (``DENSE_OFF_REASON``)."""
+    return _unavailable(DENSE_OFF_REASON)
 
 
 def open_bm25(records: Sequence[Record], index_dir: Path) -> BM25Retriever:
@@ -305,9 +357,14 @@ def open_indexes(
     dense_dir: Path | None,
     api_key: str | None,
     encoder_factory: Callable[[], Encoder] | None = None,
+    dense_off: bool = False,
 ) -> Mapping[str, OntologyIndex]:
     """One `OntologyIndex` per routed ontology, in `ROUTES` order. Never raises for
     an unavailable retriever; see each index's `status`.
+
+    With `dense_off` (offline mode) dense retrieval is neither opened nor checked: the
+    index directory is not looked at, no encoder is made, and every ontology's dense
+    status is `dense_disabled()`.
 
     The four dense retrievers share one query encoder (one connection pool), created on
     first need: from `encoder_factory` when given (tests, offline use; no key needed),
@@ -340,6 +397,10 @@ def open_indexes(
             status["bm25"] = _unavailable(
                 f"BM25 index could not be built ({type(exc).__name__}: {exc})"
             )
+        if dense_off:
+            status["dense"] = dense_disabled()
+            opened[slug] = OntologyIndex(slug, store, retrievers, status, None, True)
+            continue
         retriever, status["dense"] = open_dense(
             slug,
             records,
@@ -395,9 +456,13 @@ def open_neon_indexes(
     dimensions: int = NEON_DIMENSIONS,
     catalog: Catalog = "samples",
     encoder_factory: Callable[[], Encoder] | None = None,
+    dense_off: bool = False,
 ) -> Mapping[str, OntologyIndex]:
     """One `OntologyIndex` per routed ontology from Postgres; never raises for an
     unavailable index (see `status`). One query reads every stored identity.
+
+    With `dense_off` (offline mode) the vector index is neither opened nor checked and
+    every ontology that has its records says `dense_disabled()` for dense retrieval.
 
     The samples are checked against the bundled records (digest included). The full
     catalogs are not shipped with the site, so their configuration is checked (engine,
@@ -461,7 +526,9 @@ def open_neon_indexes(
             status["bm25"] = _ok()
         except Exception as exc:  # noqa: BLE001
             status["bm25"] = _unavailable(_neon_reason(slug, exc))
-        if not have_encoder:
+        if dense_off:
+            status["dense"] = dense_disabled()
+        elif not have_encoder:
             status["dense"] = _unavailable(
                 "OPENROUTER_API_KEY is not set; query embeddings need it (BM25 only)"
             )
@@ -486,7 +553,7 @@ def open_neon_indexes(
             except Exception as exc:  # noqa: BLE001
                 status["dense"] = _unavailable(_neon_reason(slug, exc))
         encoder = shared[0] if status.get("dense") == _ok() and shared else None
-        opened[slug] = OntologyIndex(slug, store, retrievers, status, encoder)
+        opened[slug] = OntologyIndex(slug, store, retrievers, status, encoder, dense_off)
     return opened
 
 
@@ -519,23 +586,14 @@ def get_indexes(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
     with _MEMO_LOCK:
         found = _MEMO.get(key)
         if found is None:
-            found = _marked(
-                open_indexes(
-                    cache_dir=Path(settings.cache_dir),
-                    dense_dir=None if dense_dir is None else Path(dense_dir),
-                    api_key=settings.api_key,
-                ),
-                dense_off,
+            found = open_indexes(
+                cache_dir=Path(settings.cache_dir),
+                dense_dir=None if dense_dir is None else Path(dense_dir),
+                api_key=settings.api_key,
+                dense_off=dense_off,
             )
             _MEMO[key] = found
         return found
-
-
-def _marked(indexes: Mapping[str, OntologyIndex], dense_off: bool) -> Mapping[str, OntologyIndex]:
-    """`indexes` with ``dense_off`` set on each, when the mode switched dense off."""
-    if not dense_off:
-        return indexes
-    return {slug: replace(index, dense_off=True) for slug, index in indexes.items()}
 
 
 def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
@@ -567,8 +625,8 @@ def _get_neon(settings: IndexSettings) -> Mapping[str, OntologyIndex]:
                 schema=schema,
                 dimensions=dimensions,
                 catalog=catalog,
+                dense_off=dense_off,
             )
-        found = _marked(found, dense_off)
         if not _transient(found):
             _MEMO[key] = found
         return found
@@ -601,12 +659,14 @@ def summarise_status(indexes: Mapping[str, OntologyIndex]) -> dict[str, Retrieve
 __all__ = [
     "BM25_NAME",
     "DENSE_NAME",
+    "DENSE_OFF_REASON",
     "EXACT_FIELDS",
     "LOAD_TOOL",
     "NAME_FIELDS",
     "NEON_SCHEMA",
     "IndexSettings",
     "OntologyIndex",
+    "dense_disabled",
     "get_indexes",
     "make_executor",
     "open_neon_indexes",
@@ -615,4 +675,5 @@ __all__ = [
     "open_indexes",
     "reset",
     "summarise_status",
+    "vector_scope",
 ]

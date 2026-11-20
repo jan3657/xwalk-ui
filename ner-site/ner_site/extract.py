@@ -42,7 +42,7 @@ import re
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from xwalk.llm.base import LLMClient, LLMRequest, ParseError
+from xwalk.llm.base import LLMClient, LLMRequest, LLMResponse, ParseError
 from xwalk.llm.parsing import parse_json_object
 from xwalk.records import Usage
 
@@ -294,6 +294,35 @@ def parse_entities(
         for i, (s, e, mention, t) in enumerate(kept, start=1)
     ]
     return entities, warnings
+
+
+# What a provider reports for an answer it ended at its token limit: ``length`` in the
+# OpenAI-compatible shape (the Claude adapter maps its own word to it), ``max_tokens``
+# as Anthropic says it.
+CUT_OFF_REASONS = frozenset({"length", "max_tokens"})
+
+
+class FinishWatch:
+    """An ``LLMClient`` that passes everything on to `client` and remembers whether
+    any answer it got was reported as cut off (``cut_off``).
+
+    An answer that was ended at the token limit can still parse: a list of entities
+    that stops early, or a pick whose reasoning was cut. The stage uses it as before
+    and the visitor sees what they saw before; the one thing this is for is that such
+    a run is not kept for another request (``service.cacheable``)."""
+
+    def __init__(self, client: LLMClient) -> None:
+        self._client = client
+        self.cut_off = False
+
+    def __getattr__(self, name: str) -> object:  # model, fingerprint, capabilities, budget
+        return getattr(self._client, name)
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        response = await self._client.complete(request)
+        if getattr(response, "finish_reason", None) in CUT_OFF_REASONS:
+            self.cut_off = True
+        return response
 
 
 async def extract(

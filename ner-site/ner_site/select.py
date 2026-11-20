@@ -16,21 +16,23 @@ key is resolved by exact lookup, so a malformed or invented answer is a failed p
 an id. Every failure (provider error, timeout, the request deadline) becomes a ``failed``
 pick with its reason, never an exception.
 
-The pick cache (``ner_site.cache``): with `cache`, a question that was answered before
-is not asked again. It is for requests the site pays for only: the service passes no
-cache for a request on a visitor's own key, which therefore neither reads nor writes a
-pick (one provider account never answers for another). The question is everything the
-selector was shown: the model (or ``jev``), the mention with its type and ontology, the
-exact text on either side of it (``CONTEXT_CHARS`` each), and the candidates in order
-with the content of their records (``cache.content_of``), so a term whose label or
-definition changed is asked about again. The mention alone is never the key: "green
-tea" after "drank" is the drink, elsewhere the leaf. On a fallback chain a pick is
-looked up under the model the chain would ask now.
+The pick cache (``ner_site.cache``; experimental, off by default): with `cache`, a
+question that was answered before is not asked again. It is for requests the site pays
+for only: the service passes no cache for a request on a visitor's own key, which
+therefore neither reads nor writes a pick (one provider account never answers for
+another). The question is everything the selector was shown: the model (or ``jev``), the
+mention with its type and ontology, the exact text on either side of it
+(``CONTEXT_CHARS`` each), and the candidates in order with the content of their records
+(``cache.content_of``), so a term whose label or definition changed is asked about
+again. The mention alone is never the key: "green tea" after "drank" is the drink,
+elsewhere the leaf. On a fallback chain a pick is looked up under the model the chain
+would ask now.
 
 Stored, per pick: one that is not ``failed``, was answered by the selector that was
 asked for (not by a later step of a chain, and not by another model a provider served
-in its place), in a run that had not stepped down or fallen back when the pick was made
-(`storable`), on candidates that were retrieved cleanly (`degraded` names the entities
+in its place, for this pick or an earlier one of the run), in a run that had not stepped
+down or fallen back when the pick was made (`storable`), from an answer the provider did
+not report as cut off, on candidates that were retrieved cleanly (`degraded` names the entities
 whose were not), and in which `sensitive` finds no secret. A hit costs no call and no
 tokens (``SelectStats.cache_hits`` counts them).
 """
@@ -58,9 +60,11 @@ from xwalk.stages.keying import Resolution
 from xwalk.stages.property_gate import PropertyGate
 from xwalk.stages.screen import Screener
 from xwalk.stages.select import Selector, SelectorPolicy
+from xwalk.stores.memory import MemoryStore
 from xwalk.templates import TemplateSet
 
 from ner_site.cache import TTLCache, pick_key
+from ner_site.extract import FinishWatch
 from ner_site.indexes import OntologyIndex
 from ner_site.mapping import MAX_LISTED
 from ner_site.ontologies import DOC_TEMPLATE, term_url
@@ -145,6 +149,10 @@ class SelectStats:
     asked: dict[str, str] = field(default_factory=dict)
     # Picks answered from the pick cache: no call was made for them.
     cache_hits: int = 0
+    # Entities whose pick came from an answer the provider reported as cut off at its
+    # token limit (``extract.FinishWatch``). The pick is used as it was read; neither
+    # it nor the response of its run is kept for another request.
+    cut_off: set[str] = field(default_factory=set)
 
     def add(self, usage: XwalkUsage) -> None:
         self.calls += usage.calls
@@ -258,19 +266,22 @@ def _pick(
 
 async def _with_jev(
     entity: EntityResult,
-    index: OntologyIndex,
     candidates: Sequence[Candidate],
     text: str,
     decider: DecisionClient,
     stats: SelectStats,
 ) -> Pick:
+    """Jev's pick among `candidates`. The matcher reads the records from a store made
+    of these very candidates, not from the index: what Jev judges is then what the
+    page lists and what the pick's cache key describes, also when the index's store
+    has changed or cannot be read since the search."""
     entity_type = entity.type
     questions = _questions(entity_type)
     policy = POLICIES[entity_type]
     matcher = DecisionMatcher(
         templates=SELECT_TEMPLATES,
         retrievers=[_Retrieved(candidates)],
-        store=index.store,
+        store=MemoryStore.from_source([c.record for c in candidates]),
         screener=Screener(
             decider,
             questions,
@@ -317,8 +328,9 @@ async def _with_llm(
     # remembers which model answered this one, and the pick names that model.
     get_view = None if own_key else getattr(llm, "view", None)
     view = get_view() if callable(get_view) else None
+    watch = FinishWatch(llm if view is None else view)
     chooser = Selector(
-        llm if view is None else view,
+        watch,
         _prompts(entity.type),
         SELECT_TEMPLATES,
         policy=SelectorPolicy(max_candidates=MAX_CANDIDATES),
@@ -330,6 +342,8 @@ async def _with_llm(
         stats.add(failure_usage(exc))
         raise
     stats.add(outcome.usage)
+    if watch.cut_off:
+        stats.cut_off.add(entity.id)
     answered = getattr(view, "answered_by", None)
     if answered:
         selector = answered
@@ -393,13 +407,15 @@ async def select_entities(
     has candidates (None otherwise, and for ``retrieval``). `candidates` maps entity ids
     to their fused candidates; `deadline` (seconds from now) bounds the whole step.
 
-    `cache` is the pick cache (module docstring); it is never used with `own_key`.
+    `cache` is the pick cache (module docstring; experimental, off by default); it is
+    never used with `own_key`.
     `clean` is applied to a pick's explanation before the pick is stored, so that what
     the cache holds is what a response may carry. `storable` is asked when a pick is
     about to be stored and says whether the run is still on the models it asked for
     (no step-down, no fallback); `degraded` holds the ids of the entities whose
     candidates came from degraded retrieval; `sensitive` says whether a text holds a
-    secret. A pick that fails any of the three is used and not stored."""
+    secret. A pick that fails any of the three, or whose answer the provider reported
+    as cut off (``stats.cut_off``), is used and not stored."""
     if selector == RETRIEVAL_ONLY:
         return list(results)
     if selector == JEV and decider is None:
@@ -449,7 +465,7 @@ async def select_entities(
             try:
                 if selector == JEV:
                     assert decider is not None
-                    work = _with_jev(entity, index, found, text, decider, stats)
+                    work = _with_jev(entity, found, text, decider, stats)
                 else:
                     assert llm is not None
                     work = _with_llm(entity, found, text, llm, selector, stats, own_key)
@@ -474,8 +490,11 @@ async def select_entities(
                 if (
                     remember is not None
                     and pick.status != "failed"
-                    and entity.id not in stats.served_elsewhere
+                    # No pick of this run so far was served by another model in a
+                    # server-side refusal fallback: the run is no longer the one asked for.
+                    and not stats.served_elsewhere
                     and entity.id not in degraded
+                    and entity.id not in stats.cut_off
                     and answered_on == selector
                     and (storable is None or storable())
                 ):

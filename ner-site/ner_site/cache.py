@@ -1,14 +1,21 @@
-"""Three in-memory caches, so that a warm instance does not pay a model, the embeddings
+"""In-memory caches, so that a warm instance does not pay a model, the embeddings
 endpoint or the database again for work it has just done.
 
-- ``responses``: a whole request -> the response it got (``ner_site.http``).
+- ``responses``: a whole request -> the response it got (``ner_site.http``). The one
+  cache a deployment has by default.
 - ``retrieval``: an ontology and a mention -> the fused candidates (``ner_site.mapping``).
 - ``picks``: a selector, a mention in its surroundings and the candidates it was shown
   -> the pick (``ner_site.select``).
 
+``retrieval`` and ``picks`` are experimental and off unless a deployment gives them a
+size: with either on, a run that is not a whole-response hit does less work when an
+earlier text shared a mention with it, and its public call counts, tokens and timings
+show that. With both off such a run does all its work.
+
 Each is a :class:`TTLCache`: at most ``max_entries`` entries (the least recently used
 one leaves first), optionally at most ``max_bytes`` of stored values, and none older
-than ``ttl_s`` seconds, behind one lock. Two requests that miss the same key at once
+than ``ttl_s`` seconds, behind one lock (the time of a write is read inside the lock, so
+the stored times are in the order of the writes). Two requests that miss the same key at once
 both do the work and both store it; the second store replaces the first with an equal
 value. In-flight work is not shared.
 
@@ -63,9 +70,13 @@ from typing import Any, Generic, TypeVar
 V = TypeVar("V")
 
 DEFAULT_RESPONSES = 128
-DEFAULT_RETRIEVAL = 2048
-DEFAULT_PICKS = 8192
+# Experimental, off by default (module docstring): a deployment that wants them gives
+# them a size.
+DEFAULT_RETRIEVAL = 0
+DEFAULT_PICKS = 0
 DEFAULT_TTL_S = 6 * 3600
+# The longest time limit a deployment may set: the page says "normally for a few hours".
+MAX_TTL_S = 24 * 3600
 # A stored response is JSON text; the recorded example is 103 kB. One above this is
 # not stored at all, so 128 responses are at most 32 MB.
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -92,6 +103,9 @@ class CacheSettings:
 
 
 ON = CacheSettings(DEFAULT_RESPONSES, DEFAULT_RETRIEVAL, DEFAULT_PICKS, DEFAULT_TTL_S)
+# All three, with the sizes the experimental two had while they were on by default: for
+# a deployment that tries them, and for their tests.
+EXPERIMENTAL = CacheSettings(DEFAULT_RESPONSES, 2048, 8192, DEFAULT_TTL_S)
 OFF = CacheSettings()
 
 
@@ -164,9 +178,8 @@ class TTLCache(Generic[V]):
         """Remove every expired entry; how many there were."""
         if not self.enabled:
             return 0
-        now = self._clock()
         with self._lock:
-            return self._sweep(now)
+            return self._sweep(self._clock())
 
     def get(self, key: Hashable) -> tuple[V, float] | None:
         """The value stored under `key` and its age in seconds, or None when there is
@@ -174,8 +187,8 @@ class TTLCache(Generic[V]):
         the most recently used."""
         if not self.enabled:
             return None
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             found = self._entries.get(key)
             if found is None:
                 return None
@@ -192,15 +205,17 @@ class TTLCache(Generic[V]):
         a value over the size limit, which also removes what was under `key`). Expired
         entries leave first, then the least recently used ones while there are too many
         or they are too large together. The caller hands over a value nothing else
-        will change."""
+        will change. The time is read with the lock held: two writers then cannot store
+        their times in the opposite order of their entries, which would leave an
+        expired entry behind a younger one where the sweep does not look."""
         if not self.enabled:
             return False
         size = 0 if self._size_of is None else int(self._size_of(value))
         limit = self._max_entry_bytes
         if self._max_bytes is not None:
             limit = self._max_bytes if limit is None else min(limit, self._max_bytes)
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._sweep(now)
             if key in self._entries:
                 self._drop(key)
@@ -295,19 +310,14 @@ def content_of(candidates: Sequence[Any]) -> list[Any]:
 
 
 class Caches:
-    """The three caches of one deployment.
-
-    ``index_identity`` names the index view the stored responses were made on
-    (:func:`index_identity`; None until a request has run). The handler sets it from
-    the indexes of every run and looks responses up under it, so a view that was
-    opened anew (other fingerprints, another set of retrievers) has other keys, and a
-    hit still opens no index."""
+    """The three caches of one deployment. Nothing here says which index view a
+    stored response belongs to: that is part of each response's key
+    (:func:`response_key`), which a request builds once from the indexes it opened."""
 
     def __init__(
         self, settings: CacheSettings, *, clock: Callable[[], float] = time.monotonic
     ) -> None:
         self.settings = settings
-        self.index_identity: str | None = None
         # JSON text of a response, exactly as it was sent.
         self.responses: TTLCache[str] = TTLCache(
             settings.responses,
@@ -339,8 +349,10 @@ class Caches:
 
 def index_identity(indexes: Mapping[str, Any]) -> str:
     """The identity of an opened index view: per ontology, each retriever's name, index
-    fingerprint and depth, and each retriever kind's status. A catalog that was loaded
-    anew, or a retriever that came or went, is another identity."""
+    fingerprint and depth, each retriever kind's status and whether the mode switched
+    dense retrieval off. A catalog that was loaded anew, or a retriever that came or
+    went, is another identity. A request computes it once, from the indexes it opened,
+    and keeps it in its own key."""
     return digest(
         "indexes",
         [
@@ -358,6 +370,7 @@ def index_identity(indexes: Mapping[str, Any]) -> str:
                     [str(kind), str(getattr(status, "status", ""))]
                     for kind, status in (getattr(index, "status", None) or {}).items()
                 ),
+                bool(getattr(index, "dense_off", False)),
             ]
             for slug, index in indexes.items()
         ],
@@ -365,13 +378,15 @@ def index_identity(indexes: Mapping[str, Any]) -> str:
 
 
 def response_key(
-    *, text: str, prompt: str, model: str, selector: str, top_k: int, indexes: str | None
+    *, text: str, prompt: str, model: str, selector: str, top_k: int, indexes: str
 ) -> str:
     """Everything of a validated, site-paid request that decides its answer: the text,
     the prompt actually used, the reader model, the selector, ``top_k`` and the index
-    view it was answered on (:func:`index_identity`). A request on a visitor's own key
-    has no response key: it is neither looked up nor stored."""
-    return digest("response", text, prompt, model, selector, top_k, indexes or "")
+    view the request opened (:func:`index_identity`). Built once per request and used
+    for its lookup and for storing its answer, so an answer made on one view is never
+    stored under another. A request on a visitor's own key has no response key: it is
+    neither looked up nor stored."""
+    return digest("response", text, prompt, model, selector, top_k, indexes)
 
 
 def retrieval_key(slug: str, query: str, retrievers: Sequence[Any]) -> str:
@@ -419,29 +434,53 @@ def pick_key(
 
 _LOCK = threading.Lock()
 _CACHES: dict[Hashable, Caches] = {}
+# The family each set of caches belongs to (see :func:`caches_for`).
+_FAMILIES: dict[Hashable, Hashable] = {}
 
 
 def _now() -> float:
     return time.monotonic()
 
 
-def caches_for(deployment: Hashable, settings: CacheSettings) -> Caches | None:
+def sweep_all() -> int:
+    """Remove the expired entries of every cache of the process; how many."""
+    with _LOCK:
+        everything = list(_CACHES.values())
+    return sum(one.sweep() for one in everything)
+
+
+def caches_for(
+    deployment: Hashable, settings: CacheSettings, *, family: Hashable | None = None
+) -> Caches | None:
     """The caches of `deployment` (whatever tells one configuration of the site from
     another in this process; ``Settings.cache_scope``, a digest), made on first use;
-    None when every cache is off. Tests move the time by replacing ``_now``."""
+    None when every cache is off. Tests move the time by replacing ``_now``.
+
+    `family` names what stays the same when only a secret of the deployment changes
+    (``Settings.cache_family``: everything but the passcodes). When the caches of a
+    new `deployment` are made, those of every other deployment of the same family are
+    emptied and forgotten: after a passcode is changed in a warm process, what was
+    stored under the old one does not stay in memory, and the new passcode starts
+    with nothing.
+
+    Every call sweeps what has expired in all caches of the process, also when the
+    caches are off for `settings`: an entry nobody asks for again, and the caches of a
+    configuration no request uses any more, do not stay for the life of the instance."""
     if not settings.enabled:
+        sweep_all()
         return None
     key = (deployment, settings)
     with _LOCK:
         found = _CACHES.get(key)
         if found is None:
+            if family is not None:
+                for other in [k for k, f in _FAMILIES.items() if f == family and k != key]:
+                    _CACHES.pop(other).clear()
+                    del _FAMILIES[other]
             found = _CACHES[key] = Caches(settings, clock=lambda: _now())
-        everything = list(_CACHES.values())
-    # Every request that reaches its caches clears what has expired, in all of them: an
-    # entry nobody asks for again, and the caches of a configuration no request uses
-    # any more, do not stay for the life of the instance.
-    for one in everything:
-        one.sweep()
+            if family is not None:
+                _FAMILIES[key] = family
+    sweep_all()
     return found
 
 
@@ -449,6 +488,7 @@ def reset() -> None:
     """Forget everything (tests)."""
     with _LOCK:
         _CACHES.clear()
+        _FAMILIES.clear()
 
 
 __all__ = [
@@ -456,8 +496,10 @@ __all__ = [
     "DEFAULT_RESPONSES",
     "DEFAULT_RETRIEVAL",
     "DEFAULT_TTL_S",
+    "EXPERIMENTAL",
     "MAX_RESPONSE_BYTES",
     "MAX_RETRIEVAL_BYTES",
+    "MAX_TTL_S",
     "OFF",
     "ON",
     "CacheSettings",
@@ -474,4 +516,5 @@ __all__ = [
     "reset",
     "response_key",
     "retrieval_key",
+    "sweep_all",
 ]

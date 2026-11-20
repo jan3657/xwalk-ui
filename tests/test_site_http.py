@@ -208,8 +208,8 @@ def test_health_offline_reports_the_offline_model(cache_dir: Path, tmp_path: Pat
 def test_health_offline_with_committed_indexes_and_no_key_is_dense_unavailable(
     cache_dir: Path, tmp_path: Path
 ) -> None:
-    """A dense index exists (a fake one here), but no key: never `ok`, and the reason
-    names the key."""
+    """A dense index exists (a fake one here): offline it is not opened and not
+    checked, with or without a key, and the one status says that the mode did it."""
     index = tmp_path / "dense" / "chebi-sample" / "dense"
     index.mkdir(parents=True)
     (index / "xwalk_meta.json").write_text("{}")
@@ -217,7 +217,19 @@ def test_health_offline_with_committed_indexes_and_no_key_is_dense_unavailable(
         cache_dir, tmp_path, NER_SITE_OFFLINE="1", NER_SITE_DENSE_DIR=str(tmp_path / "dense")
     )
     dense = _json(http_mod.handle("GET", "/api/health", {}, b"", settings=s))["retrieval"]["dense"]
-    assert dense["status"] == "unavailable" and "OPENROUTER_API_KEY is not set" in dense["reason"]
+    assert dense == {
+        "status": "unavailable",
+        "reason": "disabled in offline mode (NER_SITE_OFFLINE=1): no query embeddings; BM25 only",
+    }
+    keyed = _settings(
+        cache_dir,
+        tmp_path,
+        NER_SITE_OFFLINE="1",
+        NER_SITE_DENSE_DIR=str(tmp_path / "nothing-here"),
+        OPENROUTER_API_KEY=SENTINEL_KEY,
+    )
+    again = _json(http_mod.handle("GET", "/api/health", {}, b"", settings=keyed))
+    assert again["retrieval"]["dense"] == dense
 
 
 def test_health_reports_the_passcode_requirement_without_needing_it(
@@ -445,7 +457,7 @@ def test_a_real_client_401_through_mock_transport_is_502_without_the_key(
         cache_dir,
         tmp_path,
         OPENROUTER_API_KEY=SENTINEL_KEY,
-        NER_SITE_BASE_URL="https://user:hunter2@gw.example/v1",
+        NER_SITE_BASE_URL="https://gw.example/v1",
     )
     result = _post(
         s,

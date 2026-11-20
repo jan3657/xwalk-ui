@@ -577,7 +577,12 @@ def test_query_embeddings_go_out_in_one_batched_request(tmp_path: Path, dense_di
     assert len(queries) == 1 and sorted(queries[0][1]) == sorted(t for t, _ in texts)
     assert stats.embedding_requests == 1
     assert all(any("dense-qwen3" in m.retrievers for m in r.matches) for r in results)
-    # A second request for a query already embedded sends nothing.
+    # The vectors were this call's own: another call for a query that was embedded
+    # before embeds it again, and reports that it did. What a run does and reports
+    # never depends on what an earlier run embedded.
+    assert len(idx["chebi-sample"].encoder) == 0  # type: ignore[arg-type]
     again = MapStats()
     _map(entities[:1], idx, top_k=3, stats=again)
-    assert len([call for call in toy.calls if call[0]]) == 1 and again.embedding_requests == 0
+    queries = [call for call in toy.calls if call[0]]
+    assert len(queries) == 2 and queries[1][1] == ["acetic acid"]
+    assert again.embedding_requests == 1
