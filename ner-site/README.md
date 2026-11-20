@@ -77,10 +77,16 @@ One page, in this order from the top:
 
 **The example on arrival.** `public/example.json` is one real answer of production's
 `POST /api/ner` for the example sentence (`EXAMPLE_FULL` in `app.js`), in the shape
-`{"text", "recorded", "ontologies", "response"}`: `response` is the API's body
+`{"text", "recorded", "request", "ontologies", "response"}`: `response` is the API's body
 unchanged, `recorded` the date of the run, `ontologies` the three `ontologies` entries
 of `/api/health` at that time (the page needs their names and counts before health has
-answered). The page fetches the file with a plain `fetch` (not the function that
+answered), and `request` the settings the answer stands for: the prompt in effect, the
+number of candidates (`top_k`) and the deployment's entity limit (`max_entities`).
+`request` was added on 20 November 2026, after the recording, and was not read off production: it is the
+default prompt and the default limit (25) of a full-catalog deployment as this code
+renders them, which is what production runs unless `NER_SITE_MAX_ENTITIES` is set
+there. `tests/test_site_page.py` fails when the code's default prompt or limit moves
+away from it; record the example again then, with its `request`. The page fetches the file with a plain `fetch` (not the function that
 carries the passcode and a visitor's key), puts the sentence in the text box unless
 the visitor already typed, and renders the answer under the form with the heading
 "Example result" and the line "Recorded from a real run on 19 Nov 2026." It shows no
@@ -100,13 +106,19 @@ run), keeps the "Example result" heading and the recorded date, and adds the lin
 "This is the recorded result for the example, so nothing was sent." with a "Run it
 live" button, which runs the example for real. It needs health to have said that this
 is a full-catalog, live deployment whose default model and selector are the ones the
-example was recorded with; before that, a press is a run as it was. An edited text, a
+example was recorded with, and whose default prompt and entity limit are the ones in
+the file's `request` (a deployment that now keeps one mention is not answered with the
+eighteen that were recorded); before that, a press is a run as it was. The form is
+checked first, as for a run. A recording without `request` is shown on arrival and
+never in place of a run. An edited text, a
 changed option (prompt, model, selector, number of candidates) or an own key makes the
 button run for real, as does a second press once a live run of the example is on
-display, and "Try again" after a live run that failed. "The caches" below has the
-server's side of the same saving.
+display, and "Try again" after a live run that failed. Once a live request has been
+sent, the recorded result no longer says that nothing was sent, also when that run
+fails and the recording stays on display. "The caches" below has the server's side of
+the same saving.
 
-The file is kept whole, 38 kB (about 7 kB compressed), with all 30 candidates per
+The file is kept whole, 98 kB, with all 30 candidates per
 mention: the cards say "30 candidates" and the model's reasons refer to them.
 Record it again whenever the example sentence, the default model or the catalog
 changes: run the sentence once on production, save the response body as `response`,
@@ -800,8 +812,8 @@ until the visitor chooses that.
 | `NER_SITE_DENSE_DIR` | `<project root>/indexes` | Where the committed dense indexes live. |
 | `NER_SITE_CACHE_DIR` | `/tmp/xwalk-ner-site` | Where BM25 indexes are built at cold start. Nothing to do with the caches below. |
 | `NER_SITE_CACHE` | on | `off` (or `0`, `false`, `no`) turns all three in-memory caches off ("The caches" below): every request runs in full, as before there were caches, and the response has no `cache` object. Anything but on/off spellings is refused (503 `not_configured`). |
-| `NER_SITE_CACHE_RESPONSES` / `NER_SITE_CACHE_RETRIEVAL` / `NER_SITE_CACHE_PICKS` | 128 / 2048 / 8192 | How many entries each cache may hold on one warm instance: whole responses, the candidates of one mention, single picks. `0` turns that cache off. Whole numbers up to 2000 / 20000 / 100000; anything else is refused. |
-| `NER_SITE_CACHE_TTL_S` | 21600 (6 hours) | How long an entry may be reused, in seconds, for all three caches. `0` turns them all off. Whole numbers up to 604800 (7 days). |
+| `NER_SITE_CACHE_RESPONSES` / `NER_SITE_CACHE_RETRIEVAL` / `NER_SITE_CACHE_PICKS` | 128 / 2048 / 8192 | How many entries each cache may hold on one warm instance: whole responses, the candidates of one mention, single picks. `0` turns that cache off. Whole numbers up to 2000 / 20000 / 100000; anything else is refused. Two ceilings in bytes are fixed in code on top of the counts: no response over 256 KB is stored, and the stored candidates are held to 48 MB of text. |
+| `NER_SITE_CACHE_TTL_S` | 21600 (6 hours) | How long an entry may be reused and kept, in seconds, for all three caches (expired entries are removed by the next write and the next request). `0` turns them all off. Whole numbers up to 604800 (7 days); the footer says "normally for a few hours", so a much longer value makes that sentence untrue. |
 | `NER_SITE_BACKEND` | `bundled` | `neon` reads the records, BM25 and vectors from Neon Postgres instead of building BM25 in `/tmp` and opening the committed dense indexes (see "Neon backend" below). |
 | `DATABASE_URL` | unset | The Neon connection string (mark it sensitive; scrubbed from every response and log line). The indexes use it only with `NER_SITE_BACKEND=neon`; without it every ontology then reports "DATABASE_URL is not set (NER_SITE_BACKEND=neon)". Since 18 November 2026 it is also read, on either backend, on a site that is not offline and where either `ANTHROPIC_API_KEY` is set or own keys are on (`NER_SITE_OWN_PROVIDERS` lists a provider), because the visitor allowance and the own-key flood limit are counted there. Where it is read for one of these, a value that is not a Postgres URL is refused (503 `not_configured`); anywhere else (the bundled backend without the Anthropic key and with own keys off, or offline) it is ignored unread, as before. With `NER_SITE_STATS_PASSCODE` set it is read on every deployment, for the record of runs. Where that is the only reason it is read, a value that cannot be used (not a Postgres URL, no host, malformed) is not an error: there are then no statistics (`GET /api/stats` answers 503 `stats_unavailable`) and everything else answers as with analytics off. |
 | `NER_SITE_NEON_SCHEMA` | `xwalk` | The schema `tools/load_neon.py` wrote. The allowance table `site_visits` and the record of runs `site_runs` are created in it; the schema itself must already exist (`tools/setup_usage.py` creates it when it does not). |
@@ -1130,86 +1142,150 @@ NER_SITE_TEST_DATABASE_URL=postgresql://user@localhost:5432/postgres \
 
 ### The caches: work an instance has just done
 
-As built on 19 November 2026 (`ner_site/cache.py`; tests in `tests/test_site_cache.py`).
-A run on Opus costs the operator about $0.30 and a visitor 10 to 30 seconds, and the
-same sentence, or the same mention, comes in again and again (the page's own example
-most of all). A warm instance now keeps what it has just worked out, in memory, in three
-places:
+As built on 19 November 2026 and changed on 20 November 2026 after an independent
+review (branch `fix/cache-review`) (`ner_site/cache.py`; tests in `tests/test_site_cache.py`). A run on Opus costs
+the operator about $0.30 and a visitor 10 to 30 seconds, and the same sentence, or the
+same mention, comes in again and again (the page's own example most of all). A warm
+instance keeps what it has just worked out, in memory, in three places:
 
-| Cache | Looked up by | Holds | Saves | Default size |
-|---|---|---|---|---|
-| Responses | the text, the prompt actually used (the default one when none is sent), the reading model, the selector, `top_k`, and who pays (`site`, or the own-key provider's id) | the whole 200 response, as it was sent after redaction | every model call, every search and the admission round trip | 128 |
-| Retrieval | the ontology, the mention as it is searched for, and the retrievers that were there to answer: each one's name, index identity and depth (how many candidates it is asked for) | the fused candidate list of that mention | one embedding and the database searches for that mention, in any text | 2048 |
-| Picks | who pays, the model that is asked (or `jev`), the mention with its type and ontology, the exact text shown to the selector on either side of it (150 characters each), and the exact candidate ids in the order shown | the pick: status, term, confidence, explanation | one selector call, when the same mention comes back in the same surroundings | 8192 |
+| Cache | Shared by | Looked up by | Holds | Saves | Default size |
+|---|---|---|---|---|---|
+| Responses | requests the site pays for | the text, the prompt actually used (the default one when none is sent), the reading model, the selector, `top_k`, and the index view the answer was made on (see below) | the whole 200 response, as it was sent | every model call, every search and the admission round trip | 128 entries, none over 256 KB |
+| Retrieval | every request | the ontology, the mention as it is searched for, and the retrievers that were there to answer: each one's name, index identity and depth (how many candidates it is asked for) | the fused candidate list of that mention | one embedding and the database searches for that mention, in any text | 2048 entries, 48 MB of candidate text in all |
+| Picks | requests the site pays for | the model that is asked (or `jev`), the mention with its type and ontology, the exact text shown to the selector on either side of it (150 characters each), and the candidates in the order shown with the content of their records (id and every field: label, synonyms, definition, organism) | the pick: status, term, confidence, explanation | one selector call, when the same mention comes back in the same surroundings | 8192 entries |
+
+**Own keys.** A request on a visitor's own key neither reads nor writes the response
+cache or the pick cache. It is always sent to that key's provider, which answers or
+refuses it: a key that was revoked, has no balance or may not use the model gets the
+provider's refusal, also when the site holds the answer to the very same request, and
+nothing a visitor's account paid for is handed to the site's visitors or to another
+visitor on the same provider. Its response says `"cache": {"response": "off"}`. Only the
+retrieval cache is shared with own-key requests: candidates of the public ontologies,
+which no model produced.
 
 A pick is never looked up by the mention alone. The selector's answer depends on what
 stands around it: in the example, "drank green tea" resolves to the steeped drink and
-not to the dry leaf. On a fallback chain a pick is looked up under the model the chain
-would ask now and stored under the model of the step that answered, so a pick that
-Sonnet made after a step-down is only ever reused where Sonnet would have been asked.
+not to the dry leaf. Nor by candidate ids alone: the selector reads labels, synonyms
+and definitions, so a term whose label changed under the same id is another question.
+On a fallback chain a pick is looked up under the model the chain would ask now.
+
+**The index view.** `Caches.index_identity` is a digest of what the instance last
+opened: per ontology, each retriever's name, fingerprint and depth, and the status of
+BM25 and dense. Every run sets it from the indexes it ran on, and responses are looked
+up and stored under it, so a hit still opens no index, and a view that was opened anew
+(a catalog loaded again, a retriever that came or went) has other keys. What it does
+not see: a catalog reloaded in the database while the instance stays warm on a view it
+has already opened. The opened indexes are remembered for the life of the instance (as
+before the caches), so such an instance keeps answering from the old view, cached or
+not, until it is recycled; cached values add at most the time limit to that.
+
+**A changed setting or key.** On Vercel a changed environment variable takes effect
+only with a redeploy, which starts new instances with empty caches, so there is no
+generation counter to turn. Within one process (tests, a local server whose environment
+is edited between requests) the caches of two configurations are still apart: they are
+named by `Settings.cache_scope`, one SHA-256 digest of the mode, the base URL, the model
+and selector lists, the backend and catalog settings, the directories, the limits, the
+Claude effort, the fallback model, the database URL and both operator keys. Another
+operator key is another account and another scope.
 
 **What is never stored.** A cached value must be something a fresh identical run would
-have been allowed to return. So:
+have been allowed to return, and each stage decides for itself, on what the run really
+produced, before anything is redacted:
 
-- no response that carries a step-down or a notice (`fallbacks`, `notices`), a warning,
-  a pick that failed, a retriever that was not `ok`, a routed mention with a note (its
-  search failed, timed out or was cut off by the deadline), and no error response at
-  all (only a 200 is ever a candidate);
-- no retrieval in which a retriever failed, timed out or was cut off;
-- no pick that failed, was cut off, or was answered by another model than the one
-  asked (a provider's own refusal fallback).
+- Retrieval: nothing when a retriever configured for that ontology was unavailable for
+  the lookup (an ontology whose dense index is missing stores no BM25-only candidates),
+  and nothing when a retriever failed, timed out or was cut off by the deadline.
+- Picks: none that failed or was cut off; none answered by another model than the one
+  asked (a later step of the chain, or a provider's own refusal fallback); none made
+  once the run had stepped down or fallen back (at admission, while reading, or while
+  choosing); none made on candidates that came from degraded retrieval.
+- Responses: none that carries a step-down or a notice (`fallbacks`, `notices`), a
+  warning, a pick that failed, a retriever that was not `ok`, a routed mention with a
+  note; none larger than 256 KB; no error response at all (only a 200 is ever a
+  candidate); none of an own-key request.
 
-One exception, for the offline stand-in only (`NER_SITE_OFFLINE=1`): it has no dense
-search by design and says so in every response with one fixed warning, and a fresh run
-would say exactly the same. That status and that warning do not keep an offline response
-out of the cache; anything else does there too. It is what lets the caches be tried
-with `tools/serve_local.py --offline`. On a live deployment a response whose dense
-search was unavailable is not stored.
+One exception, for the offline stand-in only (`NER_SITE_OFFLINE=1`), and only in its
+explicit form. Offline settings open the indexes with dense retrieval switched off by
+the mode (`OntologyIndex.dense_off`: no embedding is requested, so dense is not
+attempted, whatever the index directory holds), and a fresh run would get the same
+BM25 candidates and the same one fixed warning again. An index marked so, with BM25
+`ok`, counts as whole, and an offline response whose only blemish is that status and
+that warning is stored. An index that lacks dense retrieval without that mark is
+degraded, offline as live. It is what lets the caches be tried with
+`tools/serve_local.py --offline`.
 
-**Secrets and text.** Every key is a SHA-256 digest of its parts, so no key holds text.
-The values do hold text: a response has the mentions it found, a pick the model's
-explanation. No key and no value is ever given a visitor's API key, the passcode, a
-client address or a visitor id: keys are built from the request's own fields, a
-response is stored exactly as it was sent (after the redaction every response goes
-through), and a pick's explanation is scrubbed before it is stored. Nothing of a cache
-is written to the database, a file or a log; the log line and the row of a run get
-counts only. A cached value is never changed by a later request: a response is kept as
-JSON text and parsed anew for every hit, a pick is copied in and out, and candidates
-are immutable records.
+**Secrets and text.** This paragraph is about the three caches of `ner_site/cache.py`
+and nothing else. (The older memo of the settings a warm instance has read,
+`http.env_settings`, is keyed on the raw values of the environment variables, the keys
+and the passcode among them. It holds nothing that is not in the process environment
+already, and it is not covered by the statement that follows.) Every key is a SHA-256
+digest of its parts, and so is the name of a deployment's caches: no key holds text, a
+URL or a path. The values do hold text: a response has the mentions it found, a pick
+the model's explanation. No key and no value is given a visitor's API key, a client
+address or a visitor id, and nothing in which a configured secret occurs is stored:
+not a response from which the run or the handler had to scrub one, and not a
+response, a pick or the candidates of a mention in which the passcode occurs, whatever
+its length. (A passcode under eight characters is not scrubbed from responses; with
+one like `ok` almost every answer holds it, and then almost nothing is cached. Use
+eight characters or more.) Nothing of a cache is written to the database, a file or a
+log; the log line and the row of a run get counts only. A cached value is never
+changed by a later request: a response is kept as JSON text and parsed anew for every
+hit, a pick is copied in and out, and candidates are copied in and out with their
+records' fields (a frozen record still holds a changeable mapping and lists).
+
+**How long, and how much.** An entry is not handed out once it is six hours old
+(`NER_SITE_CACHE_TTL_S`), counted from when it was stored, and it is also removed:
+every write to a cache removes that cache's expired entries, and every request that
+reaches the caches removes the expired entries of all of them, those of a
+configuration no request uses any more included. An entry therefore outlives its time
+limit only on an instance that receives no request at all, and at most until Vercel
+recycles that instance. The query-vector cache that was there before (`indexes.py`,
+up to 4,096 mentions with their vectors) has the same six hours since that
+change, fixed in code and not governed by the cache variables: an expired vector is not
+used, and the next vector stored removes the expired ones. In memory a full set is at
+most 32 MB of responses (128 of at most 256 KB; a typical one is about 100 KB), at
+most 48 MB of candidate text (`MAX_RETRIEVAL_BYTES`: the least recently used
+candidates leave when the total passes it, and the figure is the text of the records,
+not a measured resident size) and a few MB of picks; the entry counts can be lowered
+with the variables above. A hit still costs the instance a little: it parses and
+serialises the stored response, writes a log line and, with analytics on, a row.
+There is no separate rate limit for hits.
 
 **No guarantee.** The caches live in one warm function instance. Another instance has
-its own, a cold start begins empty, and Vercel recycles instances when it likes. Within
-an instance an entry leaves after six hours or when its cache is full (the least
-recently used first). Two identical requests that arrive at the same moment both run:
-work that is under way is not shared. So the caches save money and time when they
-happen to hit, and nothing may depend on them. In memory a full set costs roughly 13 MB
-of responses (about 100 KB each), up to about 80 MB of candidates on the Neon backend
-(about 40 KB per mention; on the bundled samples the records are shared and it is far
-less) and a few MB of picks; the bounds can be lowered with the variables above.
+its own, a cold start begins empty, and Vercel recycles instances when it likes. Two
+identical requests that arrive at the same moment both run: work that is under way is
+not shared. So the caches save money and time when they happen to hit, and nothing may
+depend on them.
 
 **Accounting.**
 
-- A request answered whole from the cache costs nothing, so it is looked up before
-  admission and does not use up one of the visitor's runs. It follows that a visitor
-  whose allowance is used, or who would now start on Sonnet, still gets a cached Opus
-  answer for a text that was run before, and that a hit is served while the limiter's
-  database cannot be reached. On an own key it is answered without the key being used.
+- A site-paid request answered whole from the cache costs nothing, so it is looked up
+  before admission and does not use up one of the visitor's runs. It follows that a
+  visitor whose allowance is used, or who would now start on Sonnet, still gets a
+  stored Opus answer for a text that was run before, and that a hit is served while the
+  limiter's database cannot be reached.
+- Not while the operator's Claude is known to be unusable. When a request of this
+  instance has met a refused Claude key or an exhausted balance (the block of
+  `ner_site.fallback`, five minutes), a request that names a Claude model or selector
+  is not answered from the cache: it proceeds as a fresh one would, is admitted and
+  routed to the fallback model, and its log line has `"cache_skipped":
+  "claude_blocked"`. Answers that needed no Claude are served as usual.
 - Everything that refuses a request before admission still refuses it first: the
   lookup comes after the body size, `X-Requested-With`, the passcode, the JSON, the
   credential (its shape, and own keys being off) and the validation of the request.
 - A request that reuses only some retrievals or picks is an ordinary run: admitted,
   counted and recorded as before, with fewer calls.
-- The response says what happened in `cache`:
-  `{"response": "miss", "retrieval_hits": 3, "pick_hits": 2}` for a run, and for a
-  whole answer from the cache `{"response": "hit", "retrieval_hits": 0, "pick_hits": 0,
-  "age_s": 240, "original": {"timing_ms": {...}, "usage": {...}}}`. On a hit the
-  top-level `usage` (no calls, tokens null) and `timing_ms` (`{"total": <ms of the
-  lookup>}`) are that request's own; the figures of the run that made the answer are
-  under `cache.original`. `response` is `off` when only the response cache is off. No
-  existing field changed.
-- The log line gets `cache`: for a run the same counts and `stored` (whether the answer
-  was clean enough to keep); for a hit `{"response": "hit", "age_s": n}`, with
-  `llm_calls: 0` and no `tier`.
+- The response says one thing in `cache`, whether the whole answer came from memory:
+  `{"response": "hit"}` or `{"response": "miss"}` (`"off"` when the response cache was
+  not used for the request: it is switched off, or the request ran on an own key). It
+  does not say how old a stored answer is, what the run that made it took or used, or
+  how many searches and picks a run reused; `CacheInfo` refuses any other field. On a
+  hit the top-level `usage` (no calls, tokens null) and `timing_ms` (`{"total": <ms of
+  the lookup>}`) are that request's own.
+- The log line gets the rest, in `cache`: for a run `{"response": "miss",
+  "retrieval_hits": n, "pick_hits": n, "stored": bool}` (`stored`: whether the answer
+  was kept); for a hit `{"response": "hit", "age_s": n}`, with `llm_calls: 0` and no
+  `tier`.
 - The record of runs (`site_runs`, when analytics is on): a hit writes a row, so that
   it is counted as a request and its visitor as that day's visitor, and the row says
   that it cost nothing. `model` is null (no model was reached, as for a refused
@@ -1228,20 +1304,27 @@ with a size of `0`. A `Settings` object built in code (tests, tools) has the cac
 unless it is given sizes; `Settings.from_env`, and so every deployment and
 `tools/serve_local.py`, has them on.
 
-**What a visitor can tell.** A hit is fast and says how old the answer is. Someone who
+**What a visitor can tell.** A hit says that it is one, and it is fast. Someone who
 sends a text therefore learns whether that exact text, with the same options, was run
-on that instance in the last hours. The site asks for public or de-identified text; an
-operator for whom that is still too much turns the response cache off
-(`NER_SITE_CACHE_RESPONSES=0`), which keeps the other two.
+on the site's keys on that instance in the last hours; not when, by whom, or how long
+it took. A run that reuses the candidates of a mention says nothing about it, but it
+is somewhat faster, so a determined observer can still guess from timing that a mention
+was searched for recently. The site asks for public or de-identified text; an operator
+for whom that is still too much turns the response cache off
+(`NER_SITE_CACHE_RESPONSES=0`), or all of them.
 
 **On the page.** A result that came whole from the cache says so in its status line
-("Answered from a recent identical run (4 minutes ago). No model was called.") in place
-of the timing sentence; "Run details" has a "Cache" row in every result (what was
-reused, or that nothing was). And the page does not ask the server at all for the one
-request it already has the answer to: "Map this text" on the untouched example, with
-the default options and the site paying, brings the recorded result (`public/example.json`)
-into view under its "Example result" heading and date, with the line "This is the
-recorded result for the example, so nothing was sent." and a "Run it live" button.
+("Answered from a recent identical run. No model was called.") in place of the timing
+sentence, and "Run details" has a "Cache" row for it; a run has no such row. A cached
+answer is never put down to the visitor's key. And the page does not ask the server at
+all for the one request it already has the answer to: "Map this text" on the untouched
+example, with the default options and the site paying, brings the recorded result
+(`public/example.json`) into view under its "Example result" heading and date, with the
+line "This is the recorded result for the example, so nothing was sent." and a "Run it
+live" button. The form is checked first as for a run (a text over the limit gets its
+error, not the recording), and the recording is used only on a deployment whose default
+prompt and entity limit are the ones in the file's `request`. Once a live request has
+been sent the line is gone for good, also if that run fails.
 Editing the text, changing an option or choosing an own key makes the button run for
 real, as does "Run it live", and so does pressing it again once a live run of the
 example is what is on display.
@@ -1551,9 +1634,13 @@ re-pinning `requirements.txt` to an xwalk commit that contains
   it ran on (`site` or `visitor`), and never the visitor id, the client address or
   any part of a visitor's key. The page's footer ("How this site handles data") says
   where the text goes, that the mentions go to OpenRouter when embedding search is used
-  and that the server may keep recent mentions, search results and answers in memory
-  for a few hours, none of it written to its database (the query-vector cache of a
-  warm instance, up to 4,096 entries, and the three caches of "The caches" above), that
+  and that the server may keep recent mentions, search results and answers in memory,
+  normally for a few hours and at most until the server instance is recycled, none of
+  it written to its database, and that an answer served from memory sends no text to a
+  model provider (the query-vector cache of a warm instance, up to 4,096 entries, and
+  the three caches of "The caches" above; all four remove what is older than six hours
+  when they are next written to, and a response hit calls no model and requests no
+  embedding), that
   the site is built not to keep
   text, prompt or results (its logs and its database are designed to hold run metadata only, with time,
   model, token counts, country and the per-day visitor hash given as examples), that it
@@ -2369,6 +2456,111 @@ often a warm Vercel instance hits is not known. No Python 3.10 interpreter was a
 sizes. `screenshot.mjs` pressing "Run it live" on a full-catalog site was not
 exercised. Chrome only: no Safari, Firefox, phone or screen reader.
 
+### The caches after their review, 20 November 2026 (branch `fix/cache-review`, not deployed)
+
+An independent review of the caches found one critical fault (answers and picks shared
+between visitors' own provider accounts), six important ones and four minor ones; the
+caches were switched off in production (`NER_SITE_CACHE=off`) until this. All eleven
+are changed as "The caches" above now describes, and this entry replaces what the entry
+before it says about the payer in the keys, the `cache` object, the "That run" row, the
+age in the status line and the reuse of BM25-only candidates and stepped-down picks.
+Python 3.13, the repository venv; the page in the installed Chrome against
+`tools/serve_local.py --offline`.
+
+- `.venv/bin/python -m pytest -q`: 2082 passed, 35 skipped (2049 before).
+  `.venv/bin/ruff check .`: clean. `tests/test_site_cache.py` now has 114 tests,
+  offline, with an injected clock. New or replaced, by finding:
+  1. an own-key request with the same answer already stored for the site runs on its
+     own key every time, for two visitors' keys in turn, and leaves the response and
+     pick caches as they were; own-key runs on empty caches leave nothing a later
+     request is answered from; a key the provider refuses is refused with the answer in
+     the cache; the same three things for picks alone;
+  2. `CacheInfo` has one field and refuses `age_s`, `original`, `retrieval_hits` and
+     `pick_hits`; a hit's JSON holds no age; the counts and the age are in the log line;
+  3. with Claude blocked (`key_refused`, `balance_exhausted`) a stored Opus answer is
+     not served, the request runs on the fallback model, a stored non-Claude answer is
+     still served, and the hit returns when the block is gone; the same for a Claude
+     selector;
+  4. the same candidate ids with another label, definition or synonym list are asked
+     about again and the new label is what comes back; a response made on one index
+     view is a miss once another view has been opened; the scope is a 64-character
+     digest in which no key, passcode, URL or path occurs, and another operator key is
+     another scope;
+  5. a write removes the expired entries of its cache; `caches_for` removes those of
+     every cache of the process; the query-vector cache drops and re-embeds a vector
+     after six hours; an expired response is gone from the cache, not passed over;
+  6. BM25-only candidates of an ontology whose dense index is missing are not stored
+     and are marked degraded; a pick made after a step-down, below the selector asked
+     for, in a run that had stepped down, on degraded candidates, or holding a secret
+     is not stored (in `select` and through the handler); cleanliness is judged on the
+     typed response (a secret that equals a field name hides `warnings` from the
+     redacted JSON and not from the check);
+  7. a response, a pick and a mention's candidates in which the passcode occurs are
+     not stored, for a passcode of 1, 2, 4, 11 and 21 characters; a site-paid run whose
+     selector echoes the operator's key and the passcode goes out scrubbed and is not
+     kept;
+  8. changing a field, adding one and appending to a list inside a hit's candidate
+     reaches neither the next hit nor the stored value nor the store's record;
+  9. `dense_off` is set by offline settings and by nothing else; offline over indexes
+     without it nothing is stored, in `cacheable`, in `service.run` and through the
+     handler;
+  10. (page) see `tools/page_smoke.mjs` below, and two tests in `tests/test_site_page.py`
+      (the recorded `request` equals the code's full-catalog default prompt and limit;
+      the checks precede the shortcut in `app.js`);
+  11. a response over the limit is not stored and a smaller one is; a cache with a
+      byte ceiling evicts by size, refuses a value that could never fit and counts a
+      replaced value once; the candidate cache honours `MAX_RETRIEVAL_BYTES`.
+- The new tests fail when the code is broken on purpose (each change made, the file's
+  tests run, the change undone): own keys sharing the response cache (2 fail), own keys
+  using the pick cache (1), the pick key on ids alone (1), degraded candidates stored
+  (5), no sweep on write (1), the Claude block ignored (2), candidates not copied on
+  the way out (1).
+- `curl` against a fresh offline server: a first request answers
+  `"cache": {"response": "miss"}`, the identical second one `"cache": {"response":
+  "hit"}` (that object holds nothing else) with no selector call and `timing_ms:
+  {"total": 0}`; another text sharing a mention `{"response": "miss"}`, with
+  `retrieval_hits: 1` in the log line only. Own keys cannot be exercised offline
+  (offline mode has none): a request naming a provider with a key is refused, 400
+  `bad_credential`, with the answer in the cache. That an own-key request runs is held
+  by the tests.
+- `tools/page_smoke.mjs`: 60 states (one new) at 390 and 1280 px, light and dark: all
+  120 passed in each scheme. Changed: `cache-hit` (the sentence without an age; no
+  "That run" row; a response that still carries an age, the original figures or reuse
+  counts shows none of them; a cached answer claimed for a visitor's key is not put
+  down to it; a run has no cache row), `cache-live` (the `cache` object of the server's
+  own answers holds `response` only), `example-live` (after a live run that failed the
+  line "nothing was sent" is gone), `production` (the footer sentence). New:
+  `example-settings` (another entity limit, another default prompt, and the limit alone
+  changed each make the press a run; a text over the deployment's limit gets its error
+  and no recording).
+- `tools/screenshot.mjs` at 390 px, at 1280 px `--dark`, and with
+  `--text "" --expect error`: exit 0. `node --check` on `public/app.js`,
+  `tools/page_smoke.mjs`, `tools/screenshot.mjs`, `public/analytics.js`.
+- The footer sentence against the code: mentions are kept by the query-vector cache
+  and inside stored responses, search results by the retrieval cache, answers by the
+  response and pick caches; all four remove entries older than six hours at their next
+  write (the three caches also at the next request); none writes to the database (the
+  row of a run holds counts); a response hit returns before any model client or index
+  is built and requests no embedding.
+
+Not verified, and not done:
+
+- Nothing was run against production, Neon, Anthropic or OpenRouter. Own keys were
+  exercised with scripted clients only.
+- `example.json`'s `request` was written from the code's defaults, not recorded. If
+  production sets `NER_SITE_MAX_ENTITIES` or its prompt differs, the page never uses
+  the recording in place of a run there (every press runs), which is the safe side.
+- "Normally for a few hours" in the footer holds for the default time limit. On an
+  instance that receives no request nothing is swept until it is recycled; the footer
+  says so ("at most until the server instance is recycled").
+- A catalog reloaded in the database under a warm instance is not noticed (the opened
+  indexes are remembered, as before the caches); see "The index view" above.
+- The settings memo of `http.env_settings` still uses the raw environment values as
+  its key; the statement about secrets is about the three caches only.
+- The timing of a run still tells whether a mention's candidates were in memory.
+- No rate limit for hits was added. The byte figures are sizes of text, not a measured
+  resident set. No Python 3.10 interpreter was at hand. Chrome only.
+
 ### For the operator after deploying
 
 1. `GET /api/health`: `mode: live`, `llm: {"status": "ok"}`, `dense: ok`. Without
@@ -2402,8 +2594,11 @@ exercised. Chrome only: no Safari, Firefox, phone or screen reader.
    `OPENROUTER_API_KEY`; `NER_SITE_BASE_URL` changes only the chat endpoint.
 7. The caches ("The caches" above): "Map this text" on the untouched example sends
    no `POST /api/ner` (the network panel stays empty) and shows the recorded result
-   with "Run it live". A text of your own run twice in a row: the second answer has
-   `"cache": {"response": "hit", ...}`, the page says "Answered from a recent identical
-   run", and the function log has `"cache": {"response": "hit", "age_s": n}` with
-   `llm_calls: 0`, when the same warm instance answered both; another instance
-   answers with a miss, which is not a fault. `NER_SITE_CACHE=off` turns it all off.
+   with "Run it live". A text of your own run twice in a row on the site's models: the
+   second answer has `"cache": {"response": "hit"}` and nothing else in that object,
+   the page says "Answered from a recent identical run. No model was called.", and the
+   function log has `"cache": {"response": "hit", "age_s": n}` with `llm_calls: 0`,
+   when the same warm instance answered both; another instance answers with a miss,
+   which is not a fault. The same text twice on an own key: both run, both answers have
+   `"cache": {"response": "off"}`, and the provider's console shows both. `NER_SITE_CACHE=off`
+   turns it all off.

@@ -68,11 +68,11 @@ with a cache on, the 200 response also says whether the whole answer came from m
     "cache": {"response": "miss"}
     "cache": {"response": "hit"}
 
-and nothing else (changed the same day, after a review): not how old the answer is, not what the
-run that made it took or used, not how many searches or picks a run reused. Those would
-tell one visitor about another's recent run; they are in the function log only. On a
-``hit`` the top-level ``timing_ms`` (``{"total": 1}``) and ``usage`` (no calls) are this
-request's own.
+and nothing else (changed on 20 November 2026, after a review): not how old the answer
+is, not what the run that made it took or used, not how many searches or picks a run
+reused. Those would tell one visitor about another's recent run; they are in the
+function log only. On a ``hit`` the top-level ``timing_ms`` (``{"total": 1}``) and
+``usage`` (no calls) are this request's own.
 
 Error envelope (see :meth:`ServiceError.envelope`)::
 
