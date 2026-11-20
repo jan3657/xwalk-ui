@@ -2418,6 +2418,12 @@ a.partner:hover span {
   width: auto;
 }
 
+/* The agency's mark carries a small caption that must stay readable. */
+.partner-wide img {
+  height: 56px;
+  max-width: 100%;
+}
+
 .footer-title {
   margin: 0 0 6px;
   color: var(--text);
