@@ -20,13 +20,18 @@ With ``NER_SITE_STATS_PASSCODE`` set (site analytics design, sections 3 and 4), 
 no other check) reads the rows back. Unset, neither exists: nothing is built or sent,
 and ``/api/stats`` is the 404 of any unknown path.
 
-The response cache (``ner_site.cache``). A validated request whose text, prompt, model,
-selector, ``top_k`` and payer are those of a recent clean run of this warm instance is
-answered with that run's response: no index is opened, no model is called, and it is
-looked up before admission, so it does not use up one of the visitor's runs. Everything
-that refuses a request before admission still refuses it first, because the lookup
-comes after all of it. The stored value is the response as it was sent, after
-redaction; a hit says so in ``cache`` and reports its own ``timing_ms`` and ``usage``.
+The response cache (``ner_site.cache``). A validated request the site pays for, whose
+text, prompt, model, selector and ``top_k`` are those of a recent clean run of this warm
+instance on the index view it has open, is answered with that run's response: no index
+is opened, no model is called, and it is looked up before admission, so it does not use
+up one of the visitor's runs. Everything that refuses a request before admission still
+refuses it first, because the lookup comes after all of it. A request on a visitor's
+own key is never looked up and never stored: its provider answers it, or refuses it.
+A hit is not served while the operator's Claude is known to be unusable and the request
+names a Claude model (it then proceeds as a fresh request would). The stored value is
+the response as it was sent; a hit says so in ``cache`` (``{"response": "hit"}`` and
+nothing more) and reports its own ``timing_ms`` and ``usage``. How old the answer was,
+and what a run reused of earlier searches and picks, is in the log line only.
 """
 
 from __future__ import annotations
@@ -954,6 +959,7 @@ async def _run_own(
     started: float,
     log: dict[str, Any],
     caches: caching.Caches | None = None,
+    reused: dict[str, int] | None = None,
 ) -> NerResponse:
     """Each constructed stage is closed even if construction of the next stage fails.
     A stage that fails to close is named in `log` and nothing more: the request's
@@ -990,6 +996,7 @@ async def _run_own(
             select_llm=_OwnJSONClient(selector, credential, log) if selector is not None else None,
             extra_secrets=(credential.token(),),
             caches=caches,
+            reused=reused,
         )
 
 
@@ -1006,18 +1013,23 @@ async def _ner(
     claude_factory: ClaudeFactory | None = None,
     recorded: dict[str, Any] | None = None,
     caches: caching.Caches | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     """Build the clients for a validated, admitted request and run it on `indexes`.
+    Returns the response as JSON data and whether it may be kept in the response
+    cache (``service.cacheable``, judged here on the typed response).
 
     A request for a Claude model runs on one fallback chain, started where `admitted`
     says; a Claude selector uses that chain, or one of its own (for selection only) when
     the extraction model is an OpenRouter model. Everything else is built as before."""
     assert valid.model is not None
     model, selector = valid.model, valid.selector or RETRIEVAL_ONLY
+    reused: dict[str, int] = {}
     if credential is not None:
         token = _OWN_RUN.set(True)
         try:
-            response = await _run_own(credential, valid, settings, indexes, started, log, caches)
+            response = await _run_own(
+                credential, valid, settings, indexes, started, log, caches, reused
+            )
         except ServiceError as exc:
             _failed_calls(recorded, exc)
             raise
@@ -1063,6 +1075,7 @@ async def _ner(
                 claude_blocked=None if admitted is None else admitted.blocked,
                 allowance_window="hour" if admitted is None else admitted.window,
                 caches=caches,
+                reused=reused,
             )
         except BaseException as exc:
             _failed_calls(recorded, exc)
@@ -1097,14 +1110,27 @@ async def _ner(
         dense=response.retrieval["dense"].status if "dense" in response.retrieval else None,
         timing_ms=response.timing_ms,
     )
+    storable = False
     if response.cache is not None:
-        log["cache"] = response.cache.model_dump(mode="json")
+        # The counts of what was reused are for the operator: the log line, never the
+        # response.
+        log["cache"] = {
+            "response": response.cache.response,
+            "retrieval_hits": reused.get("retrieval_hits", 0),
+            "pick_hits": reused.get("pick_hits", 0),
+        }
+        # Not one from which the run had to scrub a secret, and not an own-key one.
+        storable = (
+            credential is None
+            and not reused.get("scrubbed")
+            and cacheable(response, indexes, settings=settings)
+        )
     if recorded:  # a run that is being recorded: for its row only, never the log line
         recorded["selector_tokens"] = (
             response.usage.selector_prompt_tokens,
             response.usage.selector_completion_tokens,
         )
-    return response.model_dump(mode="json")
+    return response.model_dump(mode="json"), storable
 
 
 def handle(
@@ -1274,28 +1300,52 @@ def _dispatch(
     log["selector"] = valid.selector
     # The response cache, after every check that can refuse the request and before
     # admission: an answer this instance already has costs nothing and is not counted
-    # as one of the visitor's runs.
+    # as one of the visitor's runs. Only for a request the site pays for: one on a
+    # visitor's own key is never answered from the cache and never stored in it, so
+    # that key's provider is always the one that answers (or refuses).
     caches = caching.caches_for(settings.cache_scope, settings.cache)
-    cache_key: str | None = None
-    if caches is not None and caches.responses.enabled:
-        assert valid.prompt is not None and valid.model is not None
-        cache_key = caching.response_key(
+    own = credential is not None or valid.provider not in (None, providers.SITE)
+    shared = caches is not None and caches.responses.enabled and not own
+
+    def response_key() -> str:
+        assert caches is not None and valid.prompt is not None and valid.model is not None
+        return caching.response_key(
             text=valid.text,
             prompt=valid.prompt,
             model=valid.model,
             selector=valid.selector or RETRIEVAL_ONLY,
             top_k=valid.top_k,
-            provider=valid.provider or providers.SITE,
+            indexes=caches.index_identity,
         )
-        found = caches.responses.get(cache_key)
+
+    if caches is not None and shared and caches.index_identity is not None:
+        found = caches.responses.get(response_key())
+        # A stored answer was made by the models that were asked for. While the
+        # operator's Claude is known to be unusable (a refused key, an exhausted
+        # balance) a request for it is not answered from the cache: it proceeds as a
+        # fresh one would, which routes it to the fallback model and says so. Asked
+        # only once there is an answer to hand out (admission reads the block itself).
+        if (
+            found is not None
+            and settings.claude_offered
+            and any(m and is_claude(m) for m in (valid.model, valid.selector))
+            and fallback.claude_block() is not None
+        ):
+            log["cache_skipped"] = "claude_blocked"
+            found = None
         if found is not None:
             data = _from_cache(found[0], found[1], started, log)
             return 200, _headers(), _json_body(data, settings, extra_secrets)
     # Opened (once per warm instance) before admission: a request that cannot run
     # because the indexes cannot be opened must not have been counted as a visit.
     indexes = get_indexes(settings.index_settings())
+    if caches is not None:
+        # The view this run is answered on names the responses stored from here on; a
+        # view opened anew has another identity, and what was stored under the old
+        # one is not found again.
+        caches.index_identity = caching.index_identity(indexes)
     admitted = _admit(settings, valid, headers, log)  # last: a refused request is not counted
-    data = run_request(
+    data, storable = run_request(
         _ner(
             settings,
             valid,
@@ -1313,12 +1363,12 @@ def _dispatch(
     # Redacted once, here, so that what is kept is exactly what is sent.
     safe = _redact(data, (*extra_secrets, *settings.secrets()))
     body = json.dumps(safe, ensure_ascii=False)
-    if caches is not None and cache_key is not None:
-        stored = cacheable(safe, offline=settings.offline)
-        if stored:
-            caches.responses.put(cache_key, body)
+    if caches is not None:
+        # Whether it may be kept was judged on the typed response, before redaction
+        # (`_ner`); a response that redaction changed held a secret and is not kept.
+        stored = shared and storable and safe == data and caches.responses.put(response_key(), body)
         if "cache" in log:
-            log["cache"]["stored"] = stored
+            log["cache"]["stored"] = bool(stored)
     return 200, _headers(), body.encode("utf-8")
 
 
@@ -1326,19 +1376,14 @@ def _from_cache(stored: str, age: float, started: float, log: dict[str, Any]) ->
     """The response of a request answered from the response cache: the stored answer,
     parsed anew (so nothing a request does to it reaches the next one), with what is
     this request's own put in place of the original run's. ``usage`` says that no
-    call was made and ``timing_ms`` how long the lookup took; the original run's
-    figures move under ``cache.original``. The log line gets the same counts as a run's,
-    with zero calls."""
+    call was made and ``timing_ms`` how long the lookup took. ``cache`` says that it
+    was a hit and nothing more: how old the answer is, and what the run that made it
+    took and used, would tell one visitor about another's run. The age goes to the log
+    line, which gets the same counts as a run's, with zero calls."""
     data: dict[str, Any] = json.loads(stored)
     entities = data.get("entities") or []
     timing = {"total": round((time.monotonic() - started) * 1000)}
-    data["cache"] = {
-        "response": "hit",
-        "retrieval_hits": 0,
-        "pick_hits": 0,
-        "age_s": int(age),
-        "original": {"timing_ms": data.get("timing_ms"), "usage": data.get("usage")},
-    }
+    data["cache"] = {"response": "hit"}
     data["usage"] = {
         "llm_calls": 0,
         "prompt_tokens": None,

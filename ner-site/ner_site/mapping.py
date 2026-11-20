@@ -23,10 +23,16 @@ in the background and its result goes nowhere (see ``ner_site.http``).
 The retrieval cache (``ner_site.cache``): with `cache`, an entity whose ontology, query
 and retrievers were answered cleanly before gets those fused candidates again without a
 search, an embedding or a database round trip (``stats.cache_hits`` counts them). Only a
-clean answer is stored: every retriever answered, none failed, timed out or was cut off.
-A hit asked no retriever anything, so it is in neither ``dense_entities`` nor
-``embedding_requests``. Two entities with the same mention in one request both search
-the first time: in-flight work is not shared.
+clean answer is stored: every retriever configured for the ontology was there
+(``OntologyIndex.whole``; an ontology that lost its dense index stores nothing, its
+BM25-only candidates are a degraded answer), every one answered, and none failed, timed
+out or was cut off. Nor is anything stored in which `sensitive` finds a secret. The
+candidates are copied on the way in and on the way out (``cache.copy_candidates``), so
+nothing a request does to a record's fields reaches the next one. ``stats.degraded``
+names the entities whose candidates are not such a clean answer; the selection keeps
+no pick made on them. A hit asked no retriever anything, so it is in neither
+``dense_entities`` nor ``embedding_requests``. Two entities with the same mention in
+one request both search the first time: in-flight work is not shared.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ from xwalk.retrieval.dense import DenseRetriever
 from xwalk.retrieval.postgres import PgVectorRetriever
 from xwalk.retrieve import retrieve
 
-from ner_site.cache import TTLCache, retrieval_key
+from ner_site.cache import TTLCache, candidates_text, copy_candidates, retrieval_key
 from ner_site.indexes import OntologyIndex, PrefetchEncoder
 from ner_site.ontologies import TEMPLATES, route, term_url
 from ner_site.schema import Entity, EntityResult, Match
@@ -80,6 +86,10 @@ class MapStats:
     dense_failed: dict[str, str] = field(default_factory=dict)
     # Entities whose candidates came from the retrieval cache: no search was made.
     cache_hits: int = 0
+    # Entities whose candidates were searched for and are not a clean answer: a
+    # retriever configured for the ontology was unavailable, or one failed, timed out
+    # or was cut off. Nothing made from them is kept for another request.
+    degraded: set[str] = field(default_factory=set)
 
 
 class _CutOff(Exception):
@@ -190,6 +200,7 @@ async def map_entities(
     clean: Callable[[str], str] | None = None,
     routes: Mapping[str, str] | None = None,
     cache: TTLCache[tuple[Candidate, ...]] | None = None,
+    sensitive: Callable[[str], bool] | None = None,
 ) -> list[EntityResult]:
     """One `EntityResult` per entity, in the order given. `timeout` bounds each
     retriever call; `deadline` (seconds from now) bounds the whole call (see the module
@@ -198,7 +209,9 @@ async def map_entities(
     service scrubs secrets and caps the length there). `routes` maps entity types to
     ontology slugs (``ontologies.ROUTES`` by default; the full catalogs use
     ``FULL_ROUTES``). `cache` is the retrieval cache (module docstring); None: every
-    entity is searched for."""
+    entity is searched for. `sensitive` says whether a text holds something that must
+    not be kept (the service looks for its secrets); candidates or a mention it finds
+    one in are not stored."""
     if top_k < 1:
         raise ValueError(f"top_k must be at least 1, got {top_k}")
     stats = stats if stats is not None else MapStats()
@@ -256,8 +269,9 @@ async def map_entities(
         key, hit = remembered.get(entity.id, (None, None))
         if hit is not None:
             stats.cache_hits += 1
-            stats.candidates[entity.id] = list(hit)
-            return listed(entity, slug, hit, [])
+            mine = copy_candidates(hit)
+            stats.candidates[entity.id] = list(mine)
+            return listed(entity, slug, mine, [])
         bounded = [
             _Bounded(
                 r,
@@ -296,13 +310,13 @@ async def map_entities(
         entity_notes = list(notes)
         if all_failed:
             entity_notes.append(ALL_FAILED_NOTE)
-        if (
-            cache is not None
-            and key is not None
-            and not entity_notes
-            and all(b.failure is None for b in bounded)
-        ):
-            cache.put(key, tuple(candidates))
+        clean_answer = index.whole and not entity_notes and all(b.failure is None for b in bounded)
+        if not clean_answer:
+            stats.degraded.add(entity.id)
+        elif cache is not None and key is not None:
+            kept = copy_candidates(candidates)
+            if sensitive is None or not sensitive(f"{query}\n{candidates_text(kept)}"):
+                cache.put(key, kept)
         return listed(entity, slug, candidates, entity_notes)
 
     searched = [e for e in entities if remembered.get(e.id, (None, None))[1] is None]

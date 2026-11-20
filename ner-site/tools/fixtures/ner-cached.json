@@ -432,27 +432,6 @@
     "total": 1
   },
   "cache": {
-    "response": "hit",
-    "retrieval_hits": 0,
-    "pick_hits": 0,
-    "age_s": 245,
-    "original": {
-      "timing_ms": {
-        "extract": 6400,
-        "map": 620,
-        "select": 9800,
-        "total": 16850
-      },
-      "usage": {
-        "llm_calls": 1,
-        "prompt_tokens": 1240,
-        "completion_tokens": 610,
-        "embedding_requests": 10,
-        "selector_calls": 10,
-        "selector_prompt_tokens": 8000,
-        "selector_completion_tokens": 1700,
-        "selector_cost_usd": null
-      }
-    }
+    "response": "hit"
   }
 }

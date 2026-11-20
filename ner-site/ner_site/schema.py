@@ -63,14 +63,16 @@ where the site meters Claude. ``ner_site.http`` adds the operator key probes.
 Token counts are ``null`` when the provider did not report them, never 0.
 
 Addition of 19 November 2026 (the in-memory caches, ``ner_site.cache``). On a deployment
-with a cache on, the 200 response also says what the caches did::
+with a cache on, the 200 response also says whether the whole answer came from memory::
 
-    "cache": {"response": "miss", "retrieval_hits": 3, "pick_hits": 2}
-    "cache": {"response": "hit", "retrieval_hits": 0, "pick_hits": 0, "age_s": 240,
-              "original": {"timing_ms": {...}, "usage": {...}}}
+    "cache": {"response": "miss"}
+    "cache": {"response": "hit"}
 
-On a ``hit`` the top-level ``timing_ms`` (``{"total": 1}``) and ``usage`` (no calls) are
-this request's own; the figures of the run that made the answer are in ``original``.
+and nothing else (changed the same day, after a review): not how old the answer is, not what the
+run that made it took or used, not how many searches or picks a run reused. Those would
+tell one visitor about another's recent run; they are in the function log only. On a
+``hit`` the top-level ``timing_ms`` (``{"total": 1}``) and ``usage`` (no calls) are this
+request's own.
 
 Error envelope (see :meth:`ServiceError.envelope`)::
 
@@ -218,30 +220,19 @@ class FallbackNote(BaseModel):
 
 
 class CacheInfo(BaseModel):
-    """What the in-memory caches (``ner_site.cache``) did for one request.
+    """Whether the whole answer came from the in-memory response cache
+    (``ner_site.cache``), and nothing else.
 
-    ``response`` is ``hit`` when the whole answer came from a recent identical run
-    (no model, no search), ``miss`` when the request ran, and ``off`` when the response
-    cache is off while another cache is on. ``retrieval_hits`` and ``pick_hits`` count
-    the mentions whose candidates, and whose pick, a run reused (0 on a response hit:
-    nothing was looked up). ``age_s`` (a response hit only) is how long ago the answer
-    was made, in whole seconds, and ``original`` holds that run's own ``timing_ms`` and
-    ``usage``, which the top-level fields of a hit no longer are. Both are omitted
-    when they do not apply."""
+    ``response`` is ``hit`` when it did (no model, no search), ``miss`` when the
+    request ran, and ``off`` when the response cache was not used for this request
+    while another cache is on (it is switched off, or the request ran on a visitor's
+    own key, which is never answered from the cache). There is no other field, and an
+    unknown one is refused: the age of a stored answer, the original run's timings and
+    usage and the counts of reused searches and picks are kept out of the response."""
+
+    model_config = ConfigDict(extra="forbid")
 
     response: Literal["hit", "miss", "off"]
-    retrieval_hits: int = 0
-    pick_hits: int = 0
-    age_s: int | None = None
-    original: dict[str, Any] | None = None
-
-    @model_serializer(mode="wrap")
-    def _drop_unset(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        data: dict[str, Any] = handler(self)
-        for name in ("age_s", "original"):
-            if data.get(name) is None:
-                data.pop(name, None)
-        return data
 
 
 class NerResponse(BaseModel):

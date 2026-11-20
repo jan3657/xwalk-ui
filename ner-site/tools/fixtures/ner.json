@@ -435,8 +435,6 @@
     "total": 16850
   },
   "cache": {
-    "response": "miss",
-    "retrieval_hits": 0,
-    "pick_hits": 0
+    "response": "miss"
   }
 }
