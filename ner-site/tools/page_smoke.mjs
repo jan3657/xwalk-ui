@@ -775,7 +775,7 @@ const STATES = {
     await s.expectText("#run-hint", /^Free, no sign-up, usually 10 to 30 seconds\. Use public or de-identified text: it is sent to the model provider\.$/, "the hint under Run");
     const footer = await s.text("#privacy");
     s.check(!/not saved|stores no|kept for one day|writes no text|Each run is recorded/i.test(footer), "the footer still promises more than the site does");
-    s.check(footer.includes("When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings. The server may keep recent mentions, search results and answers in memory so that it does not compute them twice: normally for a few hours, and at most until the server instance is recycled. None of that is written to its database, and an answer served from memory sends no text to a model provider."), "the footer's line about what the server keeps in memory is not the agreed one");
+    s.check(footer.includes("When embedding search is used, the mentions found in your text are sent to OpenRouter to compute search embeddings, and the server may keep recently embedded mentions in memory. It may also keep recent answers in memory so that an identical request is not run twice: normally for a few hours, and at most until the server instance is recycled. None of that is written to its database, and an answer served from memory sends no text to a model provider."), "the footer's line about what the server keeps in memory is not the agreed one");
     s.check(footer.includes("This site is built not to keep your text, prompt or results: its logs and its database are designed to hold run metadata only, for example time, model, token counts and country, and a visitor hash that changes every day."), "the footer's line about logs and the database is not the agreed one");
     s.check(/When run recording is enabled, this site attempts to save/.test(footer), "the footer says runs are recorded without its condition");
     s.check(/Runs on this site's own models are limited per network/.test(footer), "the footer's line about limits has no condition");
@@ -3167,6 +3167,40 @@ const STATES = {
     await s.expectVisible("#text-error", "the error of a text that is too long");
     await s.expectHidden("#recorded-note", "the line about the recorded result for a form that would not run");
     s.check(s.posts.length === 0, `a text over the limit sent ${s.posts.length} request(s)`);
+
+    // The effective prompt is what is checked. The deployment takes ten characters of
+    // prompt and the editor is empty, which means its default prompt: the server would
+    // answer prompt_too_long, so the recording is not shown and nothing is sent.
+    s.posts.length = 0;
+    s.health = productionHealth();
+    s.health.limits = { ...s.health.limits, max_prompt_chars: 10 };
+    await s.open();
+    await s.expectExample("on arrival, a prompt limit below the default prompt");
+    await s.page.evaluate(() => {
+      const prompt = document.querySelector("#prompt");
+      prompt.value = "";
+      prompt.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await s.run();
+    await s.page.waitForTimeout(300);
+    await s.expectVisible("#prompt-error", "the error of a default prompt over the deployment's limit");
+    const refused = await s.page.textContent("#prompt-error");
+    s.check(/^The default prompt is [\d,]+ characters; the limit is 10\.$/.test(refused || ""), `the prompt error reads ${JSON.stringify(refused)}`);
+    await s.expectHidden("#recorded-note", "the line about the recorded result when the default prompt is over the limit");
+    s.check(s.posts.length === 0, `an empty editor over the prompt limit sent ${s.posts.length} request(s)`);
+    // With the limit as it was, the same emptied editor is the untouched example again.
+    s.posts.length = 0;
+    s.health = productionHealth();
+    await s.open();
+    await s.expectExample("on arrival, the usual limits");
+    await s.page.evaluate(() => {
+      const prompt = document.querySelector("#prompt");
+      prompt.value = "";
+      prompt.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await s.run();
+    await s.expectVisible("#recorded-note", "the line about the recorded result for an emptied editor within the limits");
+    s.check(s.posts.length === 0, `the untouched example with an emptied editor sent ${s.posts.length} request(s)`);
   },
 };
 

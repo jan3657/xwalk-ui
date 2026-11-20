@@ -2964,6 +2964,13 @@
     releaseRuns();
   }
 
+  // The prompt a run started now would be read with: what is in the editor, or the
+  // deployment's default when the editor is empty (the server resolves it the same way).
+  function effectivePrompt() {
+    const typed = el.prompt.value;
+    return typed.trim() ? typed : state.defaultPrompt;
+  }
+
   // Whether a run started now would ask for exactly what the recorded example already
   // answers: the example's text, the site paying, and every option as it comes (the
   // prompt, the reading model, the selector, five candidates). Only once health has
@@ -2981,8 +2988,13 @@
     const asked = example.request;
     if (!asked || state.defaultPrompt !== asked.prompt) return false;
     if (state.limits.max_entities !== asked.max_entities) return false;
-    const prompt = el.prompt.value;
-    if (prompt.trim() && prompt !== asked.prompt) return false;
+    // The effective prompt, and within this deployment's limits: a recording is not
+    // the answer to a request the server would refuse.
+    const prompt = effectivePrompt();
+    if (prompt !== asked.prompt) return false;
+    if (codePointLength(prompt) > state.limits.max_prompt_chars) return false;
+    if (codePointLength(example.text) > state.limits.max_chars) return false;
+    if (asked.top_k > state.limits.top_k_max) return false;
     if ((el.model.value || health.default_model) !== health.default_model) return false;
     const selector = el.selectorField.hidden ? health.default_selector : el.selector.value || health.default_selector;
     if (selector !== health.default_selector) return false;
@@ -3030,9 +3042,14 @@
     }
     if (state.textError === "server") clearTextError();
     const promptValue = el.prompt.value;
-    const promptLength = codePointLength(promptValue);
+    // The prompt a run would use is what is held to the limit, as the server does it:
+    // an empty editor means the deployment's default prompt, not "no prompt". Checked
+    // before the recorded example may stand in for a run, so the recording is never
+    // shown for a form that the server would refuse.
+    const typedPrompt = Boolean(promptValue.trim());
+    const promptLength = codePointLength(effectivePrompt());
     if (promptLength > state.limits.max_prompt_chars) {
-      showPromptError(`The prompt is ${promptLength.toLocaleString("en")} characters; the limit is ${state.limits.max_prompt_chars.toLocaleString("en")}.`);
+      showPromptError(`The ${typedPrompt ? "prompt" : "default prompt"} is ${promptLength.toLocaleString("en")} characters; the limit is ${state.limits.max_prompt_chars.toLocaleString("en")}.`);
       openOptions();
       el.promptEditor.open = true;
       el.prompt.focus();

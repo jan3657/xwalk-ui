@@ -22,16 +22,19 @@ and ``/api/stats`` is the 404 of any unknown path.
 
 The response cache (``ner_site.cache``). A validated request the site pays for, whose
 text, prompt, model, selector and ``top_k`` are those of a recent clean run of this warm
-instance on the index view it has open, is answered with that run's response: no index
-is opened, no model is called, and it is looked up before admission, so it does not use
-up one of the visitor's runs. Everything that refuses a request before admission still
-refuses it first, because the lookup comes after all of it. A request on a visitor's
-own key is never looked up and never stored: its provider answers it, or refuses it.
-A hit is not served while the operator's Claude is known to be unusable and the request
-names a Claude model (it then proceeds as a fresh request would). The stored value is
-the response as it was sent; a hit says so in ``cache`` (``{"response": "hit"}`` and
-nothing more) and reports its own ``timing_ms`` and ``usage``. How old the answer was,
-and what a run reused of earlier searches and picks, is in the log line only.
+instance on the same index view, is answered with that run's response: no model is
+called, nothing is searched or embedded, and it is looked up before admission, so it
+does not use up one of the visitor's runs. Everything that refuses a request before
+admission still refuses it first, because the lookup comes after all of it. The key is
+built once per request, from the indexes that request opened (remembered by a warm
+instance, so a hit pays nothing for them), and the same value is used to look the answer
+up and to store it. A request on a visitor's own key is never looked up and never
+stored: its provider answers it, or refuses it. A hit is not served while a provider the
+stored answer needs is known to refuse the operator's key (``service.known_refusal``;
+the request then proceeds as a fresh one would). Only the response of a wholly clean run
+is stored (``service.cacheable``), as it was sent; a hit says so in ``cache``
+(``{"response": "hit"}`` and nothing more) and reports its own ``timing_ms`` and
+``usage``. How old the answer was is in the log line only.
 """
 
 from __future__ import annotations
@@ -94,6 +97,7 @@ from ner_site.service import (
     chain_models,
     check_claude_key,
     check_key,
+    known_refusal,
     make_chain,
     make_decider,
     make_llm,
@@ -1013,10 +1017,13 @@ async def _ner(
     claude_factory: ClaudeFactory | None = None,
     recorded: dict[str, Any] | None = None,
     caches: caching.Caches | None = None,
+    private: Sequence[str] = (),
 ) -> tuple[dict[str, Any], bool]:
     """Build the clients for a validated, admitted request and run it on `indexes`.
     Returns the response as JSON data and whether it may be kept in the response
-    cache (``service.cacheable``, judged here on the typed response).
+    cache (``service.cacheable``, the one rule, judged here on the typed response and
+    on what the run counted). `private` holds what belongs to this request and must
+    not occur in a stored response (:func:`_private`).
 
     A request for a Claude model runs on one fallback chain, started where `admitted`
     says; a Claude selector uses that chain, or one of its own (for selection only) when
@@ -1119,11 +1126,9 @@ async def _ner(
             "retrieval_hits": reused.get("retrieval_hits", 0),
             "pick_hits": reused.get("pick_hits", 0),
         }
-        # Not one from which the run had to scrub a secret, and not an own-key one.
-        storable = (
-            credential is None
-            and not reused.get("scrubbed")
-            and cacheable(response, indexes, settings=settings)
+        # The whole run was clean (the one rule), and it was not an own-key one.
+        storable = credential is None and cacheable(
+            response, indexes, settings=settings, extra_secrets=private, run=reused
         )
     if recorded:  # a run that is being recorded: for its row only, never the log line
         recorded["selector_tokens"] = (
@@ -1303,47 +1308,49 @@ def _dispatch(
     # as one of the visitor's runs. Only for a request the site pays for: one on a
     # visitor's own key is never answered from the cache and never stored in it, so
     # that key's provider is always the one that answers (or refuses).
-    caches = caching.caches_for(settings.cache_scope, settings.cache)
+    caches = caching.caches_for(settings.cache_scope, settings.cache, family=settings.cache_family)
     own = credential is not None or valid.provider not in (None, providers.SITE)
     shared = caches is not None and caches.responses.enabled and not own
-
-    def response_key() -> str:
-        assert caches is not None and valid.prompt is not None and valid.model is not None
-        return caching.response_key(
+    # Opened once per warm instance and remembered, so this costs a stored answer
+    # nothing; before admission, because a request that cannot run for want of its
+    # indexes must not have been counted as a visit.
+    indexes = get_indexes(settings.index_settings())
+    # The key of this request, built once, from the indexes this request opened, and
+    # kept here: the lookup below and the store after the run use this value. Nothing
+    # shared is read again when the answer is stored, so a request that ran on one
+    # view cannot leave its answer under the view another request opened meanwhile.
+    key: str | None = None
+    if caches is not None and shared:
+        assert valid.prompt is not None and valid.model is not None
+        key = caching.response_key(
             text=valid.text,
             prompt=valid.prompt,
             model=valid.model,
             selector=valid.selector or RETRIEVAL_ONLY,
             top_k=valid.top_k,
-            indexes=caches.index_identity,
+            indexes=caching.index_identity(indexes),
         )
-
-    if caches is not None and shared and caches.index_identity is not None:
-        found = caches.responses.get(response_key())
-        # A stored answer was made by the models that were asked for. While the
-        # operator's Claude is known to be unusable (a refused key, an exhausted
-        # balance) a request for it is not answered from the cache: it proceeds as a
-        # fresh one would, which routes it to the fallback model and says so. Asked
-        # only once there is an answer to hand out (admission reads the block itself).
-        if (
-            found is not None
-            and settings.claude_offered
-            and any(m and is_claude(m) for m in (valid.model, valid.selector))
-            and fallback.claude_block() is not None
-        ):
-            log["cache_skipped"] = "claude_blocked"
-            found = None
+        found = caches.responses.get(key)
         if found is not None:
-            data = _from_cache(found[0], found[1], started, log)
-            return 200, _headers(), _json_body(data, settings, extra_secrets)
-    # Opened (once per warm instance) before admission: a request that cannot run
-    # because the indexes cannot be opened must not have been counted as a visit.
-    indexes = get_indexes(settings.index_settings())
-    if caches is not None:
-        # The view this run is answered on names the responses stored from here on; a
-        # view opened anew has another identity, and what was stored under the old
-        # one is not found again.
-        caches.index_identity = caching.index_identity(indexes)
+            # A stored answer was made by the models that were asked for. While a
+            # provider it needs is known to refuse the operator's key (a refused key,
+            # an exhausted balance) the request is not answered from the cache: it
+            # proceeds as a fresh one would, which fails or falls back and says so.
+            # Read from what this instance already remembers, no provider is asked;
+            # and only once there is an answer to hand out (admission reads the block
+            # itself).
+            assert valid.model is not None
+            refused = known_refusal(
+                settings,
+                valid.model,
+                valid.selector,
+                embeds=any(index.encoder is not None for index in indexes.values()),
+            )
+            if refused is not None:
+                log["cache_skipped"] = refused
+            else:
+                data = _from_cache(found[0], found[1], started, log)
+                return 200, _headers(), _json_body(data, settings, extra_secrets)
     admitted = _admit(settings, valid, headers, log)  # last: a refused request is not counted
     data, storable = run_request(
         _ner(
@@ -1358,6 +1365,7 @@ def _dispatch(
             claude_factory=claude_factory,
             recorded=recorded,
             caches=caches,
+            private=_private(headers, raw_headers),
         )
     )
     # Redacted once, here, so that what is kept is exactly what is sent.
@@ -1365,11 +1373,33 @@ def _dispatch(
     body = json.dumps(safe, ensure_ascii=False)
     if caches is not None:
         # Whether it may be kept was judged on the typed response, before redaction
-        # (`_ner`); a response that redaction changed held a secret and is not kept.
-        stored = shared and storable and safe == data and caches.responses.put(response_key(), body)
+        # (`_ner`, ``service.cacheable``). Behind that rule, a response that redaction
+        # changed held a secret and is not kept either.
+        stored = key is not None and storable and safe == data and caches.responses.put(key, body)
         if "cache" in log:
             log["cache"]["stored"] = bool(stored)
     return 200, _headers(), body.encode("utf-8")
+
+
+def _private(
+    headers: Mapping[str, str], raw_headers: Mapping[str, str | Sequence[str]]
+) -> tuple[str, ...]:
+    """What belongs to one request and must not occur in a stored response: the client
+    address in each address header (for ``x-forwarded-for`` every entry), the passcode
+    the request sent, and whatever came in an ``Authorization`` header (a key this
+    deployment did not use: a request that runs on a visitor's key is never stored at
+    all), with and without its scheme. A response in which one of them occurs is
+    served as it is and not kept."""
+    values: list[str] = []
+    for name in limits.ADDRESS_HEADERS:
+        values += [part.strip() for part in (headers.get(name) or "").split(",")]
+    values.append((headers.get("x-passcode") or "").strip())
+    for name, given in raw_headers.items():  # names in any case, one value or several
+        if name.lower() != "authorization":
+            continue
+        for value in (given,) if isinstance(given, str) else given:
+            values += [value.strip(), value.strip().partition(" ")[2].strip()]
+    return tuple(dict.fromkeys(v for v in values if v))
 
 
 def _from_cache(stored: str, age: float, started: float, log: dict[str, Any]) -> dict[str, Any]:
@@ -1491,6 +1521,12 @@ def _shim_response(request: BaseHTTPRequestHandler, settings: Settings) -> Respo
     headers: dict[str, str | Sequence[str]] = {
         k.lower(): request.headers[k] for k in request.headers if k.lower() != "authorization"
     }
+    # Every line of a repeated X-Forwarded-For, in order (`handle` joins them with a
+    # comma, as a proxy would have): the visitor is still its first entry, and the
+    # storage check (`_private`) sees every address the request carried.
+    forwarded = request.headers.get_all("X-Forwarded-For", [])
+    if len(forwarded) > 1:
+        headers["x-forwarded-for"] = forwarded
     if method == "POST" and urlsplit(request.path).path == NER_PATH:
         headers["authorization"] = request.headers.get_all("Authorization", [])
 

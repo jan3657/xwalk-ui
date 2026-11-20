@@ -47,8 +47,8 @@ from xwalk.llm.openai_compat import OpenAICompatClient
 from xwalk.records import Usage as XwalkUsage
 
 from ner_site import providers
+from ner_site.cache import MAX_TTL_S, Caches, CacheSettings
 from ner_site.cache import ON as CACHE_ON
-from ner_site.cache import Caches, CacheSettings
 from ner_site.claude import (
     CLAUDE_MODELS,
     DISPLAY_NAMES,
@@ -62,14 +62,15 @@ from ner_site.claude import (
     is_claude,
     key_status,
 )
-from ner_site.extract import MAX_TOKENS, TEMPERATURE, extract, render_default_prompt
-from ner_site.fallback import ChainView, FallbackLLM, Step
+from ner_site.extract import MAX_TOKENS, TEMPERATURE, FinishWatch, extract, render_default_prompt
+from ner_site.fallback import ChainView, FallbackLLM, Step, claude_block
 from ner_site.indexes import (
     NEON_DIMENSIONS,
     NEON_SCHEMA,
     Backend,
     Catalog,
     OntologyIndex,
+    dense_disabled,
     summarise_status,
 )
 from ner_site.limits import Allowance
@@ -177,11 +178,12 @@ _OWN_MODELS = {
 # (env name, CacheSettings field, highest). 0 turns that cache off (for the time limit:
 # all three). The highest values keep a warm instance's memory within reason: a stored
 # response is about 100 KB, the candidates of one mention about 40 KB, a pick under 1 KB.
+# The time limit goes up to a day: the page says "normally for a few hours".
 _CACHE_ENV: tuple[tuple[str, str, int], ...] = (
     ("NER_SITE_CACHE_RESPONSES", "responses", 2000),
     ("NER_SITE_CACHE_RETRIEVAL", "retrieval", 20000),
     ("NER_SITE_CACHE_PICKS", "picks", 100000),
-    ("NER_SITE_CACHE_TTL_S", "ttl_s", 7 * 86400),
+    ("NER_SITE_CACHE_TTL_S", "ttl_s", MAX_TTL_S),
 )
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
@@ -216,6 +218,30 @@ ENV_NAMES = (
 
 class SettingsError(ValueError):
     """A bad environment value. The message names the variable, never a secret."""
+
+
+BASE_URL_HELP = (
+    "NER_SITE_BASE_URL must be an http(s) URL such as https://openrouter.ai/api/v1, with "
+    "no user name or password before the host and no query string after the path; a "
+    "credential belongs in OPENROUTER_API_KEY"
+)
+
+
+def _check_base_url(base_url: str) -> None:
+    """Refuse a base URL that is not http(s), or that carries user information or a
+    query string. Either may hold a credential, and the base URL is not a secret to
+    this code: it is neither scrubbed from a response nor kept out of what the caches
+    store. The message never quotes the value."""
+    try:
+        parts = urlsplit(base_url)
+        host = parts.hostname
+        user, password = parts.username, parts.password
+    except ValueError:
+        raise SettingsError(BASE_URL_HELP) from None
+    if parts.scheme not in {"http", "https"} or not host:
+        raise SettingsError(BASE_URL_HELP)
+    if user is not None or password is not None or "@" in parts.netloc or "?" in base_url:
+        raise SettingsError(BASE_URL_HELP)
 
 
 def _listed_own(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -354,14 +380,16 @@ class Settings:
     # Set: runs are recorded and GET /api/stats answers to it. Unset: neither exists.
     stats_passcode: str | None = field(default=None, repr=False)
     # The in-memory caches (``ner_site.cache``). Off for a ``Settings`` built in code;
-    # ``from_env`` turns them on with the default sizes unless the environment says
-    # otherwise (``NER_SITE_CACHE=off``, or a size of 0).
+    # ``from_env`` turns the response cache on with its default size, and leaves the
+    # two experimental ones off, unless the environment says otherwise
+    # (``NER_SITE_CACHE=off``, or a size).
     cache: CacheSettings = CacheSettings()
 
     # Own keys are off unless the operator lists providers (NER_SITE_OWN_PROVIDERS).
     own_providers: tuple[providers.ProviderInfo, ...] = ()
 
     def __post_init__(self) -> None:
+        _check_base_url(self.base_url)  # also for a Settings built in code
         if self.offline:
             object.__setattr__(self, "own_providers", ())
 
@@ -373,11 +401,7 @@ class Settings:
             return (env.get(name) or "").strip()
 
         base_url = get("NER_SITE_BASE_URL") or DEFAULT_BASE_URL
-        parts = urlsplit(base_url)
-        if parts.scheme not in {"http", "https"} or not parts.hostname:
-            raise SettingsError(
-                "NER_SITE_BASE_URL must be an http(s) URL such as https://openrouter.ai/api/v1"
-            )
+        _check_base_url(base_url)
 
         def known_claude(name: str, ids: tuple[str, ...]) -> None:
             unknown = [m for m in ids if is_claude(m) and m not in CLAUDE_MODELS]
@@ -615,17 +639,8 @@ class Settings:
         (OpenRouter's or Anthropic's)."""
         return self.offline or self.api_key is not None or self.anthropic_api_key is not None
 
-    @property
-    def cache_scope(self) -> str:
-        """What tells this deployment's answers from another's in the same process, for
-        ``cache.caches_for``: two settings that differ in any of these never share a
-        cached value. One SHA-256 digest of them all, so that nothing of the
-        configuration is held as it is: not the base URL (which may carry user
-        information or a query), not the database URL, not a path. The operator's
-        keys are part of what is digested, so another key (another account) is another
-        scope. The passcodes and the visitor salt are not: they do not change an
-        answer, and a short passcode could be guessed from a digest."""
-        parts = [
+    def _scope_parts(self) -> list[Any]:
+        return [
             self.mode,
             self.base_url,
             list(self.models),
@@ -643,8 +658,40 @@ class Settings:
             self.api_key or "",
             self.anthropic_api_key or "",
         ]
+
+    @staticmethod
+    def _scope_digest(parts: list[Any]) -> str:
         document = json.dumps(parts, ensure_ascii=False, separators=(",", ":"), default=str)
         return hashlib.sha256(document.encode("utf-8", "surrogatepass")).hexdigest()
+
+    @property
+    def cache_family(self) -> str:
+        """Everything of :attr:`cache_scope` but the passcodes and the visitor salt:
+        two settings of one family differ only in one of those. ``cache.caches_for``
+        empties the caches of a family's earlier scope when a new one is first used."""
+        return self._scope_digest(["family", *self._scope_parts()])
+
+    @property
+    def cache_scope(self) -> str:
+        """What tells this deployment's answers from another's in the same process, for
+        ``cache.caches_for``: two settings that differ in any of these never share a
+        cached value. One SHA-256 digest of them all, so that nothing of the
+        configuration is held as it is: not the database URL, not a path. The
+        operator's keys are part of what is digested, so another key (another account)
+        is another scope. So are the two passcodes and the visitor salt: what may be
+        stored depends on them (nothing in which one of them occurs is), so a changed
+        passcode or salt starts with empty caches instead of inheriting what the old
+        rule let in. The digest is a name inside this process only: it is not logged
+        and not sent anywhere."""
+        return self._scope_digest(
+            [
+                "scope",
+                *self._scope_parts(),
+                self.passcode or "",
+                self.stats_passcode or "",
+                self.visitor_salt or "",
+            ]
+        )
 
     @property
     def claude_offered(self) -> bool:
@@ -666,19 +713,8 @@ class Settings:
             dense_off=self.offline,
         )
 
-    def unstorable(self, extra_secrets: Sequence[str] = ()) -> tuple[str, ...]:
-        """What must not occur in anything the in-memory caches keep: every scrubbed
-        secret, the passcodes whatever their length (a short one is not scrubbed from
-        a response, see :meth:`secrets`, so a result that holds it is simply not
-        stored), and `extra_secrets` (a visitor's key)."""
-        values = (*extra_secrets, self.passcode, self.stats_passcode, *self.secrets())
-        return tuple(dict.fromkeys(v for v in values if v))
-
-    def secrets(self) -> tuple[str, ...]:
-        """Values scrubbed from every response and log line as a last line of defence
-        (nothing echoes them in the first place). Values shorter than
-        ``MIN_SCRUBBED_CHARS`` are left alone: replacing a passcode like ``ok`` would
-        corrupt ordinary JSON, and so short a value cannot be hidden anyway."""
+    def _sensitive(self) -> tuple[str, ...]:
+        """Every configured sensitive value, whatever its length."""
         values: list[str | None] = [
             self.api_key,
             self.anthropic_api_key,
@@ -688,10 +724,30 @@ class Settings:
             self.stats_passcode,
         ]
         if self.database_url:
-            password = urlsplit(self.database_url).password
+            try:
+                password = urlsplit(self.database_url).password
+            except ValueError:
+                password = None
             if password:
                 values += [password, unquote(password)]
-        return tuple(dict.fromkeys(s for s in values if s and len(s) >= MIN_SCRUBBED_CHARS))
+        return tuple(dict.fromkeys(s for s in values if s))
+
+    def unstorable(self, extra_secrets: Sequence[str] = ()) -> tuple[str, ...]:
+        """What must not occur in anything the in-memory caches keep: every configured
+        sensitive value whatever its length (the operator's keys, both passcodes, the
+        visitor salt, the database URL and its password) and `extra_secrets` (what
+        belongs to the request: a visitor's key, the passcode it sent, the address it
+        came from). Apart from display redaction (:meth:`secrets`), which leaves a
+        value under ``MIN_SCRUBBED_CHARS`` alone: such a value cannot be scrubbed from
+        a response, so a result that holds it is simply not stored."""
+        return tuple(dict.fromkeys(v for v in (*extra_secrets, *self._sensitive()) if v))
+
+    def secrets(self) -> tuple[str, ...]:
+        """Values scrubbed from every response and log line as a last line of defence
+        (nothing echoes them in the first place). Values shorter than
+        ``MIN_SCRUBBED_CHARS`` are left alone: replacing a passcode like ``ok`` would
+        corrupt ordinary JSON, and so short a value cannot be hidden anyway."""
+        return tuple(s for s in self._sensitive() if len(s) >= MIN_SCRUBBED_CHARS)
 
 
 def scrub(message: str, settings: Settings, extra_secrets: Sequence[str] = ()) -> str:
@@ -1112,6 +1168,61 @@ def _key_status(settings: Settings, transport: httpx.BaseTransport | None) -> Re
     return RetrieverStatus(status="ok")
 
 
+def _key_slot(api_key: str, *, claude: bool = False) -> str:
+    return ("claude:" if claude else "") + hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _refusal_remembered(slot: str, now: float) -> bool:
+    """Whether the key-health memo holds an unexpired ``unavailable`` for `slot`. Only
+    a definitive answer is remembered as that: a key the provider refused, or (for
+    OpenRouter) a spending limit that is used up. A check that could not be completed
+    is remembered as ``ok``."""
+    with _KEY_LOCK:
+        cached = _KEY_CACHE.get(slot)
+    return cached is not None and cached[0] > now and cached[1].status == "unavailable"
+
+
+def known_refusal(
+    settings: Settings,
+    model: str,
+    selector: str | None,
+    *,
+    embeds: bool = False,
+    now: float | None = None,
+) -> str | None:
+    """Why a stored answer for `model` and `selector` must not be handed out now, or
+    None: a provider that the reading or the picking of that answer needs is known,
+    in this warm instance and at this moment, to refuse the operator's key.
+
+    - ``claude_blocked``: a request met an exhausted balance or a refused key on
+      Anthropic in the last minutes (``fallback.claude_block``).
+    - ``claude_key_refused``: the health probe's free call was refused
+      (:func:`check_claude_key`), and that answer has not expired.
+    - ``openrouter_key_refused``: OpenRouter's key check answered that the key is
+      refused or its spending limit used up (:func:`check_key`), unexpired. OpenRouter
+      is needed by a model or selector that is not Claude's, by Jev, and (`embeds`) by
+      an index view with dense retrieval, whose fresh run would embed its mentions.
+
+    Nothing is asked of a provider here: only what is already remembered is read. So a
+    refusal nobody has met yet is not known, and a fresh run is what finds it. Offline
+    mode needs no provider. `now` is a ``time.monotonic()`` reading (tests)."""
+    if settings.offline:
+        return None
+    moment = time.monotonic() if now is None else now
+    chosen = selector or RETRIEVAL_ONLY
+    if settings.anthropic_api_key and any(is_claude(m) for m in (model, chosen)):
+        if claude_block(now=now) is not None:
+            return "claude_blocked"
+        if _refusal_remembered(_key_slot(settings.anthropic_api_key, claude=True), moment):
+            return "claude_key_refused"
+    openrouter = (
+        embeds or not is_claude(model) or (chosen != RETRIEVAL_ONLY and not is_claude(chosen))
+    )
+    if openrouter and settings.api_key and _refusal_remembered(_key_slot(settings.api_key), moment):
+        return "openrouter_key_refused"
+    return None
+
+
 def check_key(
     settings: Settings, *, transport: httpx.BaseTransport | None = None
 ) -> RetrieverStatus | None:
@@ -1121,7 +1232,7 @@ def check_key(
     ``KEY_OK_TTL_S`` (``KEY_REFUSED_TTL_S`` when refused), per key."""
     if not settings.api_key:
         return None
-    slot = hashlib.sha256(settings.api_key.encode()).hexdigest()
+    slot = _key_slot(settings.api_key)
     now = time.monotonic()
     with _KEY_LOCK:
         cached = _KEY_CACHE.get(slot)
@@ -1144,7 +1255,7 @@ def check_claude_key(settings: Settings, *, client: Any | None = None) -> Retrie
     tests."""
     if not settings.anthropic_api_key:
         return None
-    slot = "claude:" + hashlib.sha256(settings.anthropic_api_key.encode()).hexdigest()
+    slot = _key_slot(settings.anthropic_api_key, claude=True)
     now = time.monotonic()
     with _KEY_LOCK:
         cached = _KEY_CACHE.get(slot)
@@ -1246,9 +1357,14 @@ def wire_usage(
 def retrieval_status(
     indexes: Mapping[str, OntologyIndex], settings: Settings
 ) -> dict[str, RetrieverStatus]:
-    """``summarise_status``; when offline mode is what keeps a configured key from dense
-    retrieval, the reason says so instead of claiming the key is missing."""
+    """``summarise_status``, with a reason every ontology shares said once. When the
+    mode switched dense retrieval off (offline: it was not opened and not checked) the
+    dense status is that one status, exactly (``indexes.dense_disabled``)."""
     summary = summarise_status(indexes)
+    disabled = dense_disabled()
+    dense_off = bool(indexes) and all(
+        i.dense_off and i.status.get("dense") == disabled for i in indexes.values()
+    )
     for kind, status in summary.items():
         reasons = {
             index.status[kind].reason
@@ -1259,18 +1375,14 @@ def retrieval_status(
             1 for i in indexes.values() if kind not in i.status or i.status[kind].status != "ok"
         )
         # One reason shared by every ontology: say it once, not four times.
-        if status.status != "ok" and len(reasons) == 1 and failing == len(indexes) > 1:
+        if kind == "dense" and dense_off:
+            summary[kind] = disabled
+        elif status.status != "ok" and len(reasons) == 1 and failing == len(indexes) > 1:
             (reason,) = reasons
             if reason:
                 summary[kind] = RetrieverStatus(
                     status="unavailable", reason=f"{reason} (all {len(indexes)} ontologies)"
                 )
-    dense = summary.get("dense")
-    if settings.offline and settings.api_key and dense is not None and dense.status != "ok":
-        summary["dense"] = RetrieverStatus(
-            status="unavailable",
-            reason="offline mode (NER_SITE_OFFLINE=1) requests no query embeddings; BM25 only",
-        )
     return summary
 
 
@@ -1331,12 +1443,18 @@ async def run(
 ) -> NerResponse:
     """One request: validate, extract with ``llm`` (one call), map, select, report.
 
-    With ``caches`` (``ner_site.cache``) the mapping reuses what this instance has
-    already retrieved and, for a request the site pays for, the selection reuses what
-    it has already picked; a request on a visitor's own key neither reads nor writes a
-    pick. How often is counted into ``reused`` (``retrieval_hits``, ``pick_hits``) for
-    the log line, never into the response; ``reused["scrubbed"]`` counts what held a
-    secret before it was scrubbed (such a response is not kept). The response's
+    With ``caches`` (``ner_site.cache``) whose experimental retrieval or pick cache
+    has a size, the mapping reuses what this instance has already retrieved and, for a
+    request the site pays for, the selection reuses what it has already picked; a
+    request on a visitor's own key neither reads nor writes a pick. By default both
+    are off and a run does all its work. How often something was reused is counted
+    into ``reused`` (``retrieval_hits``, ``pick_hits``) for the log line, never into
+    the response. ``reused`` also gets what :func:`cacheable` needs to know of the run
+    and the response does not say: ``scrubbed`` (what held a secret before it was
+    scrubbed), ``unfinished`` (replies of the reader or the selector that the provider
+    did not confirm as normally completed), ``served_elsewhere`` (picks another
+    model served in a server-side refusal fallback) and ``degraded`` (entities whose
+    candidates were not a clean answer). A run with any of them is not kept. The response's
     ``cache`` says only that this was a run (``miss``, or ``off`` when the response
     cache was not used for it). The whole-response cache is the handler's
     (``ner_site.http``).
@@ -1372,11 +1490,13 @@ async def run(
     enter_stage(chain, EXTRACT)
     # A view remembers which model its answer came from; the chain may move on later.
     reader = llm if chain is None else chain.view()
+    # Remembers a reply the provider did not confirm as finished; for `reused` only.
+    watched = FinishWatch(reader)
     started = time.monotonic()
     try:
         entities, warnings, usage = await asyncio.wait_for(
             extract(
-                reader,
+                watched,
                 req.text,
                 req.prompt,
                 max_entities=settings.limits.max_entities,
@@ -1557,6 +1677,9 @@ async def run(
             retrieval_hits=stats.cache_hits,
             pick_hits=0 if picked is None else picked.cache_hits,
             scrubbed=len(held),
+            unfinished=int(watched.unfinished) + (0 if picked is None else len(picked.unfinished)),
+            served_elsewhere=0 if picked is None else len(picked.served_elsewhere),
+            degraded=len(stats.degraded),
         )
     answered_by = None if own else getattr(reader, "answered_by", None)
     return NerResponse(
@@ -1597,29 +1720,56 @@ def cacheable(
     *,
     settings: Settings,
     extra_secrets: Sequence[str] = (),
+    run: Mapping[str, int] | None = None,
 ) -> bool:
-    """Whether a run's response may be kept in the response cache: only when a fresh
-    identical run would be allowed to return the same thing. Judged on the response as
-    the run made it, before redaction (which rewrites strings and dictionary keys and
-    could hide a field from this check).
+    """Whether a run's response may be kept in the response cache: only when the whole
+    run was clean, so that a fresh identical run would be allowed to return the same
+    thing. This is the one rule, judged on the response as the run made it, before
+    redaction (which rewrites strings and dictionary keys and could hide a field from
+    this check), and on what the run counted beside it (`run`, the ``reused`` of
+    :func:`run`).
 
-    Never: a request on a visitor's own key; a step-down or a notice; a warning; a
-    pick that failed; a retriever that was not ``ok``; a routed entity that carries a
-    note (a search that failed, timed out or was cut off); an unrouted entity with any
-    note but the one for type ``other``; a response in which a secret, the passcode
-    (of any length) or the visitor's key occurs.
+    Never:
+
+    - a request on a visitor's own key;
+    - a step-down or a fallback anywhere in the run, a server-side refusal fallback
+      on any pick included (``fallbacks``, ``notices``, ``run["served_elsewhere"]``);
+    - a warning, the reader's included (an entity it dropped, a list it cut);
+    - a reply of the reader or the selector that its provider did not confirm as
+      normally completed (``run["unfinished"]``; ``extract.FINISHED_REASONS`` is the
+      allowlist): it may parse and still be incomplete;
+    - a pick that failed;
+    - degraded retrieval: a retriever that was not ``ok``, a routed entity that
+      carries a note (a search that failed, timed out or was cut off), an entity whose
+      candidates were not a clean answer (``run["degraded"]``), an unrouted entity with
+      any note but the one for type ``other``;
+    - a response in which a secret, a passcode (of any length) or one of
+      `extra_secrets` occurs (the visitor's key, the passcode the request sent, the
+      address it came from), or from which the run had to scrub one
+      (``run["scrubbed"]``).
 
     One exception, for the offline stand-in only, and only in its explicit form:
     every index says that dense retrieval was switched off by the mode
-    (``OntologyIndex.dense_off``, set where offline settings open the indexes) and is
-    otherwise whole. Dense retrieval is then ``unavailable`` in the response and its
-    one fixed warning is there, by design, and a fresh run would say the same. A dense
-    index that is unavailable for any other reason keeps a response out, offline too."""
+    (``OntologyIndex.dense_off`` with the one status ``indexes.dense_disabled()``, set
+    where offline settings open the indexes, which then neither open nor check dense
+    retrieval) and is otherwise whole, and the response's dense status is that same
+    status. Its one fixed warning is then there by design, and a fresh run would say
+    the same. A dense index that is unavailable for any other reason keeps a response
+    out, offline too."""
     if response.credential_source != "site" or response.provider != providers.SITE:
         return False
     if response.fallbacks or response.notices:
         return False
-    dense_off = bool(indexes) and all(i.dense_off and i.whole for i in indexes.values())
+    if run is not None and any(
+        run.get(name) for name in ("scrubbed", "unfinished", "served_elsewhere", "degraded")
+    ):
+        return False
+    disabled = dense_disabled()
+    dense_off = (
+        bool(indexes)
+        and all(i.dense_off and i.whole for i in indexes.values())
+        and response.retrieval.get("dense") == disabled
+    )
     allowed = {_unavailable_note("dense")} if dense_off else set()
     if any(warning not in allowed for warning in response.warnings):
         return False
@@ -1674,6 +1824,7 @@ __all__ = [
     "check_key",
     "display_name",
     "enter_stage",
+    "known_refusal",
     "make_chain",
     "make_claude",
     "make_decider",

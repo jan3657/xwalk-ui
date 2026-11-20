@@ -475,6 +475,24 @@ def test_neon_without_a_key_runs_bm25_only(loaded: FakeNeon) -> None:
         assert "OPENROUTER_API_KEY is not set" in (index.status["dense"].reason or "")
 
 
+def test_neon_offline_neither_opens_nor_checks_the_vector_index(loaded: FakeNeon) -> None:
+    """Offline mode requests no embeddings: the vector index is not opened, no encoder
+    is made, and every ontology says the one status for that."""
+
+    def never() -> Any:
+        pytest.fail("an encoder was made in offline mode")
+
+    opened = _open(loaded, dense_off=True, encoder_factory=never)
+    for index in opened.values():
+        assert index.status["bm25"].status == "ok"
+        assert index.status["dense"] == indexes_mod.dense_disabled()
+        assert [r.name for r in index.retrievers] == ["bm25"] and index.encoder is None
+        assert index.dense_off and index.whole
+    # A database that cannot be read is not excused by the mode.
+    broken = _open(FakeNeon(), dense_off=True, encoder_factory=never)
+    assert not any(index.whole for index in broken.values())
+
+
 def test_neon_reasons_for_missing_incomplete_and_stale_indexes(loaded: FakeNeon) -> None:
     fake = FakeNeon()
     fake.meta = {k: dict(v) for k, v in loaded.meta.items()}

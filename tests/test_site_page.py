@@ -102,6 +102,16 @@ def test_the_page_checks_the_form_and_the_recorded_settings_before_the_shortcut(
     ]
     assert "state.defaultPrompt !== asked.prompt" in asked
     assert "state.limits.max_entities !== asked.max_entities" in asked
+    # The prompt held to the limit is the effective one: an empty editor means the
+    # deployment's default, as on the server (service.validate_request), both in the
+    # form check and in the shortcut itself.
+    effective = source[
+        source.index("  function effectivePrompt() {") : source.index("  function exampleAsked() {")
+    ]
+    assert "return typed.trim() ? typed : state.defaultPrompt;" in effective
+    assert run.index("codePointLength(effectivePrompt())") < shortcut
+    assert "const prompt = effectivePrompt();" in asked
+    assert "codePointLength(prompt) > state.limits.max_prompt_chars" in asked
     # No age and no figures of another run are read from the response.
     for gone in ("age_s", "cache.original", "retrieval_hits", "pick_hits"):
         assert gone not in source, gone
@@ -167,12 +177,23 @@ def test_the_footer_states_its_conditions() -> None:
     ) in text
     assert (
         "<li>When embedding search is used, the mentions found in your text are sent to OpenRouter "
-        "to compute search embeddings. The server may keep recent mentions, search results and "
-        "answers in memory so that it does not compute them twice: normally for a few hours, and "
-        "at most until the server instance is recycled. None of that is written to its database, "
-        "and an answer served from memory sends no text to a model provider.</li>"
+        "to compute search embeddings, and the server may keep recently embedded mentions in "
+        "memory. It may also keep recent answers in memory so that an identical request is not "
+        "run twice: normally for a few hours, and at most until the server instance is recycled. "
+        "None of that is written to its database, and an answer served from memory sends no "
+        "text to a model provider.</li>"
     ) in text
     assert "<li>When run recording is enabled, this site attempts to save" in text
     assert "<li>Runs on this site's own models are limited per network" in text
     for promise in ("writes no text", "Each run is recorded", "stores no", "not saved"):
         assert promise not in text
+    # Only whole answers are kept by default: the footer no longer speaks of search
+    # results, and "a few hours" cannot become days (the variable ends at one day).
+    assert "search results" not in text
+    from ner_site import cache as caching
+    from ner_site.service import Settings, SettingsError
+
+    assert caching.MAX_TTL_S == 24 * 3600 >= caching.DEFAULT_TTL_S
+    assert Settings.from_env({"NER_SITE_CACHE_TTL_S": "86400"}).cache.ttl_s == 86400
+    with pytest.raises(SettingsError, match="from 0 to 86400"):
+        Settings.from_env({"NER_SITE_CACHE_TTL_S": "86401"})
